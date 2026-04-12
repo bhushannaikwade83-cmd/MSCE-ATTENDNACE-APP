@@ -42,8 +42,7 @@ void main() async {
 
   SessionManager.initialize();
 
-  // MobileFaceNet (flutter_litert) is not initialized on iOS/web in FaceRecognitionService
-  // (avoids EXC_BAD_ACCESS in DartWorker). Neural matching: use Android.
+  // MobileFaceNet loads lazily via FaceRecognitionService (tflite_flutter on iOS/Android).
   runApp(const SmartAttendanceApp());
 }
 

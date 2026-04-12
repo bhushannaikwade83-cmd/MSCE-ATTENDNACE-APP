@@ -68,6 +68,16 @@
 	</array>
 	<key>NSFaceIDUsageDescription</key>
 	<string>Use Face ID to unlock the app and sign in quickly when you allow it.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Camera is used to capture your photo for attendance and face enrollment.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Microphone may be used when recording video for attendance, if enabled.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Your location is used to verify you are within the institute area when marking attendance.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Photo library access lets you choose a profile or attendance image when you pick from gallery.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>Saved images may be stored to your library when you export or save from the app.</string>
 	<key>CFBundleLocalizations</key>
 	<array>
 		<string>en</string>

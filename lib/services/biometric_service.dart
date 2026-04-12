@@ -110,6 +110,9 @@ class BiometricService {
   /// [requirePreferenceEnabled]: when false, used for first-time setup so the OS
   /// can show Face ID / fingerprint permission and the user can confirm before
   /// we save [enableBiometric].
+  ///
+  /// [useErrorDialogs] is kept for call-site compatibility; local_auth 3.x does
+  /// not expose this flag (the plugin uses fixed dialog behavior).
   static Future<bool> authenticate({
     String reason = 'Authenticate to continue',
     bool useErrorDialogs = true,
@@ -131,14 +134,12 @@ class BiometricService {
         }
       }
 
+      // local_auth 3.x: options are top-level parameters (no AuthenticationOptions here).
       final didAuthenticate = await _localAuth.authenticate(
         localizedReason: reason,
-        options: AuthenticationOptions(
-          useErrorDialogs: useErrorDialogs,
-          stickyAuth: stickyAuth,
-          sensitiveTransaction: false,
-          biometricOnly: true,
-        ),
+        biometricOnly: true,
+        sensitiveTransaction: false,
+        persistAcrossBackgrounding: stickyAuth,
       );
 
       if (didAuthenticate) {

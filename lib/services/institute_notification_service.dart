@@ -1,7 +1,6 @@
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:workmanager/workmanager.dart';
 import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
-import 'package:intl/intl.dart';
 import 'package:timezone/timezone.dart' as tz;
 import 'package:timezone/data/latest.dart' as tz;
 import 'institute_status_service.dart';
@@ -33,7 +32,7 @@ class InstituteNotificationService {
     );
 
     await _notifications.initialize(
-      initSettings,
+      settings: initSettings,
       onDidReceiveNotificationResponse: _onNotificationTapped,
     );
 
@@ -227,13 +226,12 @@ class InstituteNotificationService {
       );
 
       await _notifications.zonedSchedule(
-        id,
-        title,
-        body,
-        _convertToTZDateTime(scheduledDate),
-        details,
+        id: id,
+        title: title,
+        body: body,
+        scheduledDate: _convertToTZDateTime(scheduledDate),
+        notificationDetails: details,
         androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
-        uiLocalNotificationDateInterpretation: UILocalNotificationDateInterpretation.absoluteTime,
         payload: payload,
       );
 
@@ -264,7 +262,7 @@ class InstituteNotificationService {
       final types = ['open_1h', 'open_30m', 'open_5m', 'close', 'auto_close'];
       for (var type in types) {
         final id = _getNotificationId(instituteId, type);
-        await _notifications.cancel(id);
+        await _notifications.cancel(id: id);
       }
 
       // Cancel workmanager tasks
@@ -302,10 +300,10 @@ class InstituteNotificationService {
     );
 
     await _notifications.show(
-      DateTime.now().millisecondsSinceEpoch % 2147483647,
-      title,
-      body,
-      details,
+      id: DateTime.now().millisecondsSinceEpoch % 2147483647,
+      title: title,
+      body: body,
+      notificationDetails: details,
       payload: payload,
     );
   }

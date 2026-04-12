@@ -1,11 +1,10 @@
 import 'dart:io';
 import 'dart:math' as math;
-import 'package:flutter/foundation.dart'
-    show kDebugMode, debugPrint, kIsWeb, defaultTargetPlatform, TargetPlatform;
+import 'package:flutter/foundation.dart' show kDebugMode, debugPrint, kIsWeb;
 import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 import '../core/app_db.dart';
 import 'package:image/image.dart' as img;
-import 'package:flutter_litert/flutter_litert.dart';
+import 'package:tflite_flutter/tflite_flutter.dart';
 
 /// Face Recognition Service
 ///
@@ -50,10 +49,8 @@ class FaceRecognitionService {
   static Interpreter? _interpreter;
   static bool _isInitialized = false;
 
-  /// LiteRT / flutter_litert has caused EXC_BAD_ACCESS on iOS (DartWorker). Skip neural
-  /// inference there; ML Kit face detection still runs. Use Android for full matching.
-  static bool get _skipMobileFaceNetNative =>
-      kIsWeb || defaultTargetPlatform == TargetPlatform.iOS;
+  /// Web has no FFI TFLite; iOS/Android use [tflite_flutter] (standard TFLite runtime).
+  static bool get _skipMobileFaceNetNative => kIsWeb;
 
   // Similarity thresholds for neural embeddings (192-dim)
   // Lower numbers are MORE strict with neural embeddings because
@@ -74,10 +71,7 @@ class FaceRecognitionService {
     if (_isInitialized) return;
     if (_skipMobileFaceNetNative) {
       if (kDebugMode) {
-        debugPrint(
-          'ℹ️ MobileFaceNet (flutter_litert) skipped on '
-          '${kIsWeb ? "web" : "iOS"} — avoids native crashes; neural face match needs Android.',
-        );
+        debugPrint('ℹ️ MobileFaceNet skipped on web (no on-device TFLite FFI).');
       }
       return;
     }
@@ -276,9 +270,7 @@ class FaceRecognitionService {
     Map<String, dynamic> faceFeatures,
   ) async {
     if (_skipMobileFaceNetNative) {
-      if (kDebugMode) {
-        debugPrint('❌ Neural embedding unavailable on this platform (web/iOS).');
-      }
+      if (kDebugMode) debugPrint('❌ Neural embedding unavailable on web.');
       return null;
     }
     await initialize();
