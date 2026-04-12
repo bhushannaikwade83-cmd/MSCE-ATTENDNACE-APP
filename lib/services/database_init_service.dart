@@ -1,0 +1,23 @@
+import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
+import 'package:supabase_flutter/supabase_flutter.dart';
+
+/// Verifies Supabase connectivity at startup (replaces FirestoreInitService).
+class DatabaseInitService {
+  static bool _initialized = false;
+
+  /// Runs once per app launch to ensure DB is reachable before writes.
+  static Future<void> ensureInitialized() async {
+    if (_initialized) return;
+    await initializeAll();
+    _initialized = true;
+  }
+
+  static Future<void> initializeAll() async {
+    try {
+      await Supabase.instance.client.from('institutes').select('id').limit(1);
+      if (kDebugMode) debugPrint('✅ Database (Supabase) reachable');
+    } catch (e) {
+      if (kDebugMode) debugPrint('⚠️ Database init: $e');
+    }
+  }
+}

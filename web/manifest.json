@@ -1,0 +1,35 @@
+{
+    "name": "EduSetu By Digitrix Media",
+    "short_name": "EduSetu",
+    "start_url": ".",
+    "display": "standalone",
+    "background_color": "#0F9D58",
+    "theme_color": "#0F9D58",
+    "description": "Powered Attendance for Smart Institutes",
+    "orientation": "portrait-primary",
+    "prefer_related_applications": false,
+    "icons": [
+        {
+            "src": "icons/Icon-192.png",
+            "sizes": "192x192",
+            "type": "image/png"
+        },
+        {
+            "src": "icons/Icon-512.png",
+            "sizes": "512x512",
+            "type": "image/png"
+        },
+        {
+            "src": "icons/Icon-maskable-192.png",
+            "sizes": "192x192",
+            "type": "image/png",
+            "purpose": "maskable"
+        },
+        {
+            "src": "icons/Icon-maskable-512.png",
+            "sizes": "512x512",
+            "type": "image/png",
+            "purpose": "maskable"
+        }
+    ]
+}

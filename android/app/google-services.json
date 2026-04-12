@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "719857616327",
+    "project_id": "msce-attendace-app",
+    "storage_bucket": "msce-attendace-app.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:719857616327:android:0639dc706728cb171345e2",
+        "android_client_info": {
+          "package_name": "com.digitrixmedia.msceattendace"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyB4h39tV1qPXOpDF8b07ueqU6jLnUk60zQ"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
