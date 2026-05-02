@@ -1418,8 +1418,13 @@ class InlineStudentAttendanceService {
           final duration = currentTime.difference(entryTime);
           final rawH = duration.inSeconds / 3600.0;
           attendanceData['hoursRaw'] = double.parse(rawH.toStringAsFixed(6));
-          attendanceData['hours'] =
-              attendanceAllocatedHoursForSubjectCount(enrolledSubjects.length);
+          final maxH = attendanceAllowedWindowHoursForSubjectCount(enrolledSubjects.length);
+          final credited = rawH > maxH ? maxH : rawH;
+          attendanceData['hours'] = double.parse(credited.toStringAsFixed(6));
+          attendanceData['attendanceReason'] = attendanceCompletedWithinWindowNote(
+            creditedHours: double.parse(credited.toStringAsFixed(6)),
+            allowedHours: maxH,
+          );
         }
       }
 

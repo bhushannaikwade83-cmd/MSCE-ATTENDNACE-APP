@@ -95,6 +95,7 @@ class PdfExportService {
     DateTime? latestTs;
     var autoClosedMissingExit = false;
     String? autoClosedNote;
+    String? attendanceReason;
 
     for (final data in list) {
       final add = _additional(data['additional']);
@@ -133,6 +134,10 @@ class PdfExportService {
         autoClosedMissingExit = true;
         final n = add['autoClosedNote']?.toString().trim();
         if (n != null && n.isNotEmpty) autoClosedNote = n;
+      }
+      final reasonText = add['attendanceReason']?.toString().trim();
+      if (reasonText != null && reasonText.isNotEmpty) {
+        attendanceReason = reasonText;
       }
 
       final etAdd = parseAnyTimestamp(add['entryTime']);
@@ -217,6 +222,7 @@ class PdfExportService {
       'type': 'session',
       'autoClosedMissingExit': autoClosedMissingExit,
       if (autoClosedNote != null && autoClosedNote.isNotEmpty) 'autoClosedNote': autoClosedNote,
+      if (attendanceReason != null && attendanceReason.isNotEmpty) 'attendanceReason': attendanceReason,
     };
   }
 
@@ -873,6 +879,7 @@ class PdfExportService {
 
                   final seatedDur = seatedDurationFromMergedAttendanceDay(record);
                   final hc = record['hours'];
+                  final attendanceReason = record['attendanceReason'] as String?;
                   final String seatedStr;
                   if (autoClosed) {
                     final h = record['hours'];
@@ -881,8 +888,11 @@ class PdfExportService {
                     seatedStr =
                         'Student did not exit$tail${policyNote != null ? '. $policyNote' : ''}';
                   } else if (hc is num && hc > 0) {
-                    seatedStr =
+                    final base =
                         '${hc.toStringAsFixed(2)} h credited${seatedDur != null && seatedDur > Duration.zero ? ' (${formatSeatedDurationHuman(seatedDur)} seated)' : ''}';
+                    seatedStr = attendanceReason == null || attendanceReason.isEmpty
+                        ? base
+                        : '$base. $attendanceReason';
                   } else if (seatedDur != null && seatedDur > Duration.zero) {
                     seatedStr = formatSeatedDurationHuman(seatedDur);
                   } else {

@@ -24,6 +24,13 @@ bool isPastAttendanceExitDeadline(DateTime entryUtc, DateTime nowUtc, int subjec
 String autoClosedMissingExitNote(double creditedHours) =>
     'No exit within allowed window — credited ${creditedHours}h without exit photo.';
 
+String attendanceCompletedWithinWindowNote({
+  required double creditedHours,
+  required double allowedHours,
+}) =>
+    'Exit taken within allowed ${allowedHours.toStringAsFixed(0)}h window — '
+    'credited actual ${creditedHours.toStringAsFixed(2)}h.';
+
 /// Prefer subjects whose name mentions 30, then 40, then 50 (word boundary).
 int subjectAutoClosePriority(String subjectName) {
   if (RegExp(r'\b30\b').hasMatch(subjectName)) return 0;

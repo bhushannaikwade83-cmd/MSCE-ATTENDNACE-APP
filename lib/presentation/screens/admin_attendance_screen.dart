@@ -3130,6 +3130,10 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
           final maxH = attendanceAllowedWindowHoursForSubjectCount(studentEnrolledSubjects.length);
           final credited = rawH > maxH ? maxH : rawH;
           attendanceData['hours'] = double.parse(credited.toStringAsFixed(6));
+          attendanceData['attendanceReason'] = attendanceCompletedWithinWindowNote(
+            creditedHours: double.parse(credited.toStringAsFixed(6)),
+            allowedHours: maxH,
+          );
         }
       }
 
@@ -4745,7 +4749,7 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
     String? line2;
     String? line3;
     if (storedHours is num) {
-      line2 = 'Credited (max 2.5h/day): ${storedHours.toStringAsFixed(2)} hours';
+      line2 = 'Credited: ${storedHours.toStringAsFixed(2)} hours';
     }
     if (storedRaw is num) {
       final r = storedRaw.toDouble();
