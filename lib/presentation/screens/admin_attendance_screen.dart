@@ -1355,6 +1355,33 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
     return null;
   }
 
+  String? _nextUnlockedSubjectFromPayload(Map<String, dynamic>? payload) {
+    if (_legacyDayAttendance || studentEnrolledSubjects.isEmpty) return null;
+    final sessions = _mapSubjectSessions(payload);
+
+    final pending = _pendingSubjectFromPayload(payload);
+    if (pending != null && pending.trim().isNotEmpty) {
+      return pending;
+    }
+
+    final active = activeAttendanceSubject?.trim();
+    if (active != null &&
+        active.isNotEmpty &&
+        studentEnrolledSubjects.contains(active) &&
+        !_sessionCompleteMap(_sessionForSubject(sessions, active))) {
+      return active;
+    }
+
+    for (final subject in studentEnrolledSubjects) {
+      final sess = _sessionForSubject(sessions, subject);
+      if (!_sessionHasEntryMap(sess) || !_sessionCompleteMap(sess)) {
+        return subject;
+      }
+    }
+
+    return studentEnrolledSubjects.isNotEmpty ? studentEnrolledSubjects.first : null;
+  }
+
   /// Subjects must be finished in list order: no [entry] on a later subject until all prior have entry+exit.
   String? _sequentialPriorIncomplete(
     List<String> enrolledOrder,
@@ -1383,6 +1410,80 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
     return hasTop;
   }
 
+  Map<String, dynamic> _flattenSubjectSessionsToDailyPayload(
+    Map<String, dynamic> payload,
+  ) {
+    final sessions = _mapSubjectSessions(payload);
+    if (sessions.isEmpty) return Map<String, dynamic>.from(payload);
+
+    final out = Map<String, dynamic>.from(payload)..remove(_kSubjectSessionsKey);
+    DateTime? earliestEntry;
+    DateTime? latestExit;
+    Map<String, dynamic>? entrySource;
+    Map<String, dynamic>? exitSource;
+    double totalHours = 0;
+    bool hasHours = false;
+
+    for (final subject in studentEnrolledSubjects.isEmpty
+        ? sessions.keys
+        : studentEnrolledSubjects) {
+      final sess = _sessionForSubject(sessions, subject);
+      if (sess.isEmpty) continue;
+
+      final entryAt = _asDateTime(sess['entryTime']) ??
+          _asDateTime(sess['timestamp']) ??
+          _asDateTime(sess['entry_time']);
+      if (entryAt != null &&
+          (earliestEntry == null || entryAt.isBefore(earliestEntry))) {
+        earliestEntry = entryAt;
+        entrySource = sess;
+      }
+
+      final exitAt = _asDateTime(sess['exitTime']) ?? _asDateTime(sess['exit_time']);
+      if (exitAt != null && (latestExit == null || exitAt.isAfter(latestExit))) {
+        latestExit = exitAt;
+        exitSource = sess;
+      }
+
+      final h = (sess['hours'] as num?)?.toDouble();
+      if (h != null) {
+        totalHours += h;
+        hasHours = true;
+      }
+    }
+
+    if (entrySource != null) {
+      out['entryPhoto'] = _sessionEntryPhotoUrl(entrySource!);
+      out['entryPhotoPath'] = _sessionEntryPhotoPath(entrySource!);
+      out['entryPhotoFileId'] = entrySource!['entryPhotoFileId'];
+      out['photoUrl'] = _sessionEntryPhotoUrl(entrySource!);
+      out['storagePath'] = _sessionEntryPhotoPath(entrySource!);
+      if (earliestEntry != null) {
+        final iso = earliestEntry.toUtc().toIso8601String();
+        out['entryTime'] = iso;
+        out['timestamp'] = iso;
+      }
+    }
+
+    if (exitSource != null) {
+      out['exitPhoto'] = _sessionExitPhotoUrl(exitSource!);
+      out['exitPhotoPath'] = _sessionExitPhotoPath(exitSource!);
+      out['exitPhotoFileId'] = exitSource!['exitPhotoFileId'];
+      if (latestExit != null) {
+        out['exitTime'] = latestExit.toUtc().toIso8601String();
+      }
+    }
+
+    if (hasHours) out['hours'] = double.parse(totalHours.toStringAsFixed(6));
+    if (out['entryPhoto'] != null && out['exitPhoto'] != null) {
+      out['status'] = 'present';
+    } else if (out['entryPhoto'] != null) {
+      out['status'] = 'pending';
+    }
+
+    return out;
+  }
+
   bool _allSubjectsCompleteInPayload(Map<String, dynamic>? payload, List<String> subjects) {
     if (subjects.isEmpty) return false;
     final m = _mapSubjectSessions(payload);
@@ -1402,16 +1503,11 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
   }
 
   bool canMark() {
-    final needsPick = !_legacyDayAttendance &&
-        studentEnrolledSubjects.isNotEmpty &&
-        activeAttendanceSubject == null &&
-        isAlreadyMarked != true;
     return !isLoading &&
         isLocationValid &&
         instituteId != null &&
         selectedRollNumber != null &&
-        isAlreadyMarked != true &&
-        !needsPick;
+        isAlreadyMarked != true;
   }
 
   bool _hasEntryPhoto() {
@@ -1579,9 +1675,8 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
   /// Exit window: 25 minutes after lecture end (e.g., 11:25-11:50)
   /// Returns map with 'valid' (bool) and 'message' (String?)
   Map<String, dynamic> _validateLectureTime(DateTime currentTime, List<Map<String, TimeOfDay>> lectures, bool isEntry) {
-    if (lectures.isEmpty) {
-      return {'valid': true, 'message': null};
-    }
+    // Daily policy: entry/exit is allowed any time during the day; midnight finalizes.
+    return {'valid': true, 'message': null};
     
     final currentHour = currentTime.hour;
     final currentMinute = currentTime.minute;
@@ -1804,8 +1899,18 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
 
     try {
       final today = DateFormat('yyyy-MM-dd').format(DateTime.now());
-      final data = await _getTeacherAttendanceDoc(selectedRollNumber!, today);
+      var data = await _getTeacherAttendanceDoc(selectedRollNumber!, today);
       if (!mounted) return;
+
+      if (data != null && !_isLegacyAttendanceDoc(data)) {
+        data = _flattenSubjectSessionsToDailyPayload(data);
+        await _upsertTeacherAttendanceDoc(
+          roll: selectedRollNumber!,
+          date: today,
+          payload: data,
+          status: data['status']?.toString(),
+        );
+      }
 
       if (data != null) {
         final currentStatus = data['status']?.toString();
@@ -1823,9 +1928,7 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
           return;
         }
 
-        final legacy = _isLegacyAttendanceDoc(data);
-
-        if (legacy) {
+        if (_isLegacyAttendanceDoc(data)) {
           final ts = _asDateTime(data['entryTime']) ?? _asDateTime(data['timestamp']);
           String? timeStr;
           if (ts != null) timeStr = DateFormat('HH:mm').format(ts);
@@ -1885,68 +1988,10 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
           });
           return;
         }
-
-        // Per-subject: strict — finish pending exit before another subject; list order for new entries.
-        final sessions = _mapSubjectSessions(data);
-        final pending = _pendingSubjectFromPayload(data);
-        final allDone = studentEnrolledSubjects.isNotEmpty &&
-            _allSubjectsCompleteInPayload(data, studentEnrolledSubjects);
-
-        String? active = activeAttendanceSubject;
-        if (pending != null) {
-          active = pending;
-        } else if (active != null &&
-            _sessionCompleteMap(_sessionForSubject(sessions, active))) {
-          active = null;
-        }
-
-        if (active == null &&
-            pending == null &&
-            studentEnrolledSubjects.length == 1 &&
-            !_allSubjectsCompleteInPayload(data, studentEnrolledSubjects)) {
-          active = studentEnrolledSubjects.first;
-        }
-
-        DateTime? entryForActive;
-        if (active != null) {
-          final sess = _sessionForSubject(sessions, active);
-          entryForActive = _asDateTime(sess['entryTime']) ??
-              _asDateTime(sess['timestamp']) ??
-              _asDateTime(sess['entry_time']);
-        }
-
-        setState(() {
-          _legacyDayAttendance = false;
-          activeAttendanceSubject = active;
-          isAlreadyMarked = allDone;
-          existingAttendanceData = data;
-          currentLectureIndex = null;
-          existingMarkTime =
-              entryForActive != null ? DateFormat('HH:mm').format(entryForActive) : null;
-
-          if (active != null) {
-            final sess = _sessionForSubject(sessions, active);
-            if (!_sessionHasEntryMap(sess)) {
-              attendanceMode = 'entry';
-              isEntryPhoto = true;
-            } else if (!_sessionCompleteMap(sess)) {
-              attendanceMode = 'exit';
-              isEntryPhoto = false;
-            } else {
-              attendanceMode = 'entry';
-              isEntryPhoto = true;
-            }
-          } else {
-            attendanceMode = 'entry';
-            isEntryPhoto = true;
-          }
-        });
       } else {
         setState(() {
-          _legacyDayAttendance = false;
-          activeAttendanceSubject = (studentEnrolledSubjects.length == 1)
-              ? studentEnrolledSubjects.first
-              : null;
+          _legacyDayAttendance = true;
+          activeAttendanceSubject = null;
           isAlreadyMarked = false;
           existingMarkTime = null;
           existingAttendanceData = null;
@@ -1982,39 +2027,7 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
   Future<void> _markAttendance({String? photoIntent}) async {
     setState(() => isLoading = true);
 
-    // Block attendance if institute is not open
-    if (instituteId != null) {
-      final statusService = InstituteStatusService();
-      final blockMessage = await statusService.attendanceBlockMessage(instituteId!);
-      if (!mounted) return;
-      if (blockMessage != null) {
-        setState(() => isLoading = false);
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-            content: Text(blockMessage),
-            backgroundColor: Colors.red,
-            duration: const Duration(seconds: 4),
-          ));
-        }
-        return;
-      }
-      final todayStatus = await statusService.getTodayStatus(instituteId!);
-      if (!mounted) return;
-      final instStatus = todayStatus?['status'] as String? ?? '';
-      if (instStatus != 'open') {
-        setState(() => isLoading = false);
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-            content: Text(instStatus == 'closed'
-                ? '🔴 Institute is closed. Attendance cannot be marked.'
-                : '⚠️ Institute has not been opened yet. Ask the admin to open it first.'),
-            backgroundColor: Colors.red,
-            duration: const Duration(seconds: 4),
-          ));
-        }
-        return;
-      }
-    }
+    // Attendance is available every day; do not block on institute open/holiday/close status.
 
     try {
       final markingTime = DateTime.now();
@@ -2543,6 +2556,21 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
 
       if (!mounted) return;
 
+      if (existingPayload != null && !_isLegacyAttendanceDoc(existingPayload)) {
+        existingPayload = _flattenSubjectSessionsToDailyPayload(existingPayload);
+        await FirestoreRetryService.executeWithRetry(
+          operation: () async {
+            await _upsertTeacherAttendanceDoc(
+              roll: selectedRollNumber!,
+              date: today,
+              payload: existingPayload!,
+              status: existingPayload!['status']?.toString(),
+            );
+          },
+          operationName: 'Migrate daily attendance payload',
+        );
+      }
+
       final currentTime = DateTime.now();
       final serverTs = _encodeSv();
 
@@ -2562,39 +2590,8 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
         );
         return;
       }
-      final useSubjects =
-          studentEnrolledSubjects.isNotEmpty && (ex == null || !_isLegacyAttendanceDoc(ex));
-
-      if (useSubjects) {
-        if (activeAttendanceSubject == null ||
-            !studentEnrolledSubjects.contains(activeAttendanceSubject)) {
-          setState(() => isLoading = false);
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text(
-                'Select a subject first, then take entry or exit photo.',
-              ),
-              backgroundColor: Colors.orange,
-              duration: Duration(seconds: 4),
-            ),
-          );
-          return;
-        }
-        final pend = _pendingSubjectFromPayload(ex);
-        if (pend != null && pend != activeAttendanceSubject) {
-          setState(() => isLoading = false);
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text(
-                'Finish exit photo for "$pend" first, then mark another subject.',
-              ),
-              backgroundColor: Colors.orange,
-              duration: const Duration(seconds: 5),
-            ),
-          );
-          return;
-        }
-      }
+      const useSubjects = false;
+      activeAttendanceSubject = null;
 
       late final bool hasEntry;
       late final bool hasExit;
@@ -2808,8 +2805,8 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
               SnackBar(
                 content: Text(
                   useSubjects && activeAttendanceSubject != null
-                      ? 'Session auto-closed (${kAttendanceExitDeadlineHours}h rule): "${activeAttendanceSubject!}". No exit photo — 1 h credit.'
-                      : 'Session auto-closed (${kAttendanceExitDeadlineHours}h rule). No exit photo — 1 h credit.',
+                      ? 'Session auto-closed after midnight: "${activeAttendanceSubject!}". No exit photo — 1 h credit.'
+                      : 'Session auto-closed after midnight. No exit photo — 1 h credit.',
                 ),
                 backgroundColor: Colors.orange,
                 duration: const Duration(seconds: 6),
@@ -2819,8 +2816,8 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
             setState(() => isLoading = false);
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(
-                content: Text(
-                  'Exit not allowed: more than ${kAttendanceExitDeadlineHours}h since entry.',
+                content: const Text(
+                  'Exit is no longer available because the day has already rolled over.',
                 ),
                 backgroundColor: Colors.orange,
                 duration: const Duration(seconds: 6),
@@ -3102,7 +3099,8 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
           final duration = exitDateTime.difference(entryDateTime);
           final rawH = duration.inSeconds / 3600.0;
           attendanceData['hoursRaw'] = double.parse(rawH.toStringAsFixed(6));
-          attendanceData['hours'] = attendanceCreditedHours(duration);
+          attendanceData['hours'] =
+              attendanceAllocatedHoursForSubjectCount(studentEnrolledSubjects.length);
         }
       }
 
@@ -3120,7 +3118,9 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
         operationName: 'Save attendance record',
       );
 
-      final syncSubject = useSubjects ? activeAttendanceSubject : selectedSubject;
+      // New policy: one Entry + one Exit per calendar day (not per subject).
+      // We still display allotted subjects, and credit hours based on their count.
+      final syncSubject = useSubjects ? activeAttendanceSubject : 'all';
 
       if (isMarkingEntry) {
         await _syncAttendanceInOut(
@@ -3567,7 +3567,7 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
                           ] else
                             const SizedBox(height: 0),
 
-                          // Subjects allotted — tap one to mark attendance for that subject today.
+                          // Subjects allotted — shown directly; attendance uses the next valid subject automatically.
                           if (studentEnrolledSubjects.isNotEmpty) ...[
                             Container(
                               padding: const EdgeInsets.all(16),
@@ -3594,7 +3594,7 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
                                       ),
                                       const SizedBox(width: 8),
                                       Text(
-                                        'Your subjects — finish pending exit before switching',
+                                        'Allotted subjects',
                                         style: TextStyle(
                                           fontSize: 14,
                                           fontWeight: FontWeight.w600,
@@ -3608,126 +3608,32 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
                                     spacing: 8,
                                     runSpacing: 8,
                                     children: studentEnrolledSubjects.map((subject) {
-                                      final sessions =
-                                          _mapSubjectSessions(existingAttendanceData);
-                                      final sess = _sessionForSubject(sessions, subject);
-                                      final done = _sessionCompleteMap(sess);
-                                      final started = _sessionHasEntryMap(sess);
-                                      final pendingOther =
-                                          _pendingSubjectFromPayload(existingAttendanceData);
-                                      final locked =
-                                          pendingOther != null && pendingOther != subject;
-                                      final selected = activeAttendanceSubject == subject;
-                                      var suffix = '';
-                                      if (done) {
-                                        suffix = ' ✓';
-                                      } else if (started) {
-                                        suffix = ' …';
-                                      }
-
-                                      return FilterChip(
-                                        label: Text('$subject$suffix'),
-                                        selected: selected,
-                                        showCheckmark: false,
-                                        onSelected: isAlreadyMarked == true
-                                            ? (_) {}
-                                            : (_) {
-                                                if (done) {
-                                                  ScaffoldMessenger.of(context).showSnackBar(
-                                                    SnackBar(
-                                                      content: Text(
-                                                        '"$subject" is already complete for today. After midnight you can mark again.',
-                                                      ),
-                                                      backgroundColor: Colors.orange,
-                                                    ),
-                                                  );
-                                                  return;
-                                                }
-                                                if (locked) {
-                                                  ScaffoldMessenger.of(context).showSnackBar(
-                                                    SnackBar(
-                                                      content: Text(
-                                                        'Finish exit for "$pendingOther" first, then choose another subject.',
-                                                      ),
-                                                      backgroundColor: Colors.orange,
-                                                    ),
-                                                  );
-                                                  return;
-                                                }
-                                                final seqPrior = _sequentialPriorIncomplete(
-                                                  studentEnrolledSubjects,
-                                                  sessions,
-                                                  subject,
-                                                );
-                                                if (seqPrior != null && !started && !done) {
-                                                  ScaffoldMessenger.of(context).showSnackBar(
-                                                    SnackBar(
-                                                      content: Text(
-                                                        'Complete entry and exit for "$seqPrior" first. '
-                                                        'Then you can mark "$subject".',
-                                                      ),
-                                                      backgroundColor: Colors.orange,
-                                                      duration: const Duration(seconds: 5),
-                                                    ),
-                                                  );
-                                                  return;
-                                                }
-                                                setState(() => activeAttendanceSubject = subject);
-                                                _checkAttendanceStatus();
-                                              },
-                                        selectedColor:
-                                            AppTheme.primaryBlue.withValues(alpha: 0.35),
-                                        checkmarkColor: Colors.white,
-                                        labelStyle: TextStyle(
-                                          fontSize: 13,
-                                          fontWeight: FontWeight.w500,
-                                          color: isDark ? Colors.white : AppTheme.textDark,
+                                      return Container(
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 12,
+                                          vertical: 9,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          color: isDark
+                                              ? Colors.white.withValues(alpha: 0.08)
+                                              : Colors.white,
+                                          borderRadius: BorderRadius.circular(12),
+                                          border: Border.all(
+                                            color: isDark
+                                                ? Colors.white.withValues(alpha: 0.18)
+                                                : AppTheme.primaryBlue.withValues(alpha: 0.18),
+                                          ),
+                                        ),
+                                        child: Text(
+                                          subject,
+                                          style: TextStyle(
+                                            fontSize: 13,
+                                            fontWeight: FontWeight.w600,
+                                            color: isDark ? Colors.white : AppTheme.textDark,
+                                          ),
                                         ),
                                       );
                                     }).toList(),
-                                  ),
-                                  const SizedBox(height: 8),
-                                  Text(
-                                    'Subjects are in strict list order after any pending exit is closed. '
-                                    '✓ = done · … = exit still needed.',
-                                    style: TextStyle(
-                                      fontSize: 11,
-                                      color: isDark 
-                                          ? Colors.white.withValues(alpha: 0.6)
-                                          : AppTheme.textGray,
-                                      fontStyle: FontStyle.italic,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ] else if (selectedSubject != null) ...[
-                            Container(
-                              padding: const EdgeInsets.all(16),
-                              decoration: BoxDecoration(
-                                color: isDark 
-                                    ? Colors.white.withValues(alpha: 0.1)
-                                    : AppTheme.primaryBlueLight.withValues(alpha: 0.1),
-                                borderRadius: BorderRadius.circular(12),
-                                border: Border.all(
-                                  color: isDark 
-                                      ? Colors.white.withValues(alpha: 0.2)
-                                      : AppTheme.primaryBlue.withValues(alpha: 0.3),
-                                ),
-                              ),
-                              child: Row(
-                                children: [
-                                  Icon(Icons.book_outlined, size: 20, color: isDark ? Colors.white70 : AppTheme.primaryBlue),
-                                  const SizedBox(width: 8),
-                                  Expanded(
-                                    child: Text(
-                                      'Subject: $selectedSubject',
-                                      style: TextStyle(
-                                        fontSize: 14,
-                                        fontWeight: FontWeight.w500,
-                                        color: isDark ? Colors.white : AppTheme.textDark,
-                                      ),
-                                    ),
                                   ),
                                 ],
                               ),
@@ -3771,7 +3677,6 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
               if (selectedRollNumber != null &&
                   studentEnrolledSubjects.length > 1 &&
                   !_legacyDayAttendance &&
-                  activeAttendanceSubject == null &&
                   isAlreadyMarked != true) ...[
                 Container(
                   width: double.infinity,
@@ -3783,12 +3688,11 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
                   ),
                   child: Row(
                     children: [
-                      Icon(Icons.touch_app, color: Colors.orange.shade800, size: 22),
+                      Icon(Icons.info_outline, color: Colors.orange.shade800, size: 22),
                       const SizedBox(width: 10),
                       Expanded(
                         child: Text(
-                          'Pick subjects in list order once no session is waiting for exit. '
-                          'Full entry + exit for each chip before advancing.',
+                          'Attendance is daily: take 1 Entry photo + 1 Exit photo. Credited hours are based on allotted subject count.',
                           style: TextStyle(
                             fontSize: 13,
                             fontWeight: FontWeight.w600,
@@ -4528,7 +4432,7 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
           Expanded(
             child: Text(
               (!_legacyDayAttendance && studentEnrolledSubjects.isNotEmpty)
-                  ? 'Choose a subject, then take entry and exit photos for that subject. Other subjects stay locked until the current one is finished. Everything resets after midnight.'
+                  ? 'The app uses the current allotted subject automatically. Take entry and exit photos in order, and the next subject unlocks after the current one is finished. Everything resets after midnight.'
                   : 'Attendance not marked yet. You can proceed to mark attendance.',
               style: TextStyle(
                 color: Colors.white,
@@ -4544,9 +4448,6 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
 
   Widget _buildEntryExitStatusCard() {
     if (selectedRollNumber == null) {
-      return const SizedBox.shrink();
-    }
-    if (studentEnrolledSubjects.isEmpty && selectedSubject == null) {
       return const SizedBox.shrink();
     }
 
@@ -4756,7 +4657,7 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
                   Expanded(
                     child: Text(
                       !_legacyDayAttendance
-                          ? 'Use Entry photo for this subject, then Exit the same day. Other subjects unlock after this pair is done.'
+                          ? 'Use Entry photo for the current allotted subject, then Exit the same day. The next subject unlocks after this pair is done.'
                           : 'Start with “Entry photo”, then “Exit photo” the same day. After midnight, records belong to the new calendar day.',
                       style: TextStyle(
                         fontSize: 11.sp,

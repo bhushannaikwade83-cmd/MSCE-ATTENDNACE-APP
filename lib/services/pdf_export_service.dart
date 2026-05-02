@@ -879,16 +879,17 @@ class PdfExportService {
                   }
 
                   var exitTimeStr = '-';
+                  final autoClosed = record['autoClosedMissingExit'] == true;
+                  final policyNote = record['autoClosedNote'] as String?;
                   if (exitTime != null) {
                     exitTimeStr = _formatPdfLocalTime(exitTime);
+                  } else if (autoClosed) {
+                    exitTimeStr = 'No Exit';
                   } else if (status == 'absent') {
                     exitTimeStr = 'No Exit';
                   } else if (status == 'holiday') {
                     exitTimeStr = reason == null || reason.isEmpty ? 'Holiday' : reason;
                   }
-
-                  final autoClosed = record['autoClosedMissingExit'] == true;
-                  final policyNote = record['autoClosedNote'] as String?;
 
                   final seatedDur = seatedDurationFromMergedAttendanceDay(record);
                   final hc = record['hours'];
@@ -898,7 +899,7 @@ class PdfExportService {
                     final tail =
                         h is num ? ' (${h.toStringAsFixed(2)} h credited)' : '';
                     seatedStr =
-                        'No exit photo$tail${policyNote != null ? '. $policyNote' : ''}';
+                        'Student did not exit$tail${policyNote != null ? '. $policyNote' : ''}';
                   } else if (hc is num && hc > 0) {
                     seatedStr =
                         '${hc.toStringAsFixed(2)} h credited${seatedDur != null && seatedDur > Duration.zero ? ' (${formatSeatedDurationHuman(seatedDur)} seated)' : ''}';

@@ -163,4 +163,44 @@ class StaleAttendanceReconciliationService {
 
     return applied.payload;
   }
+
+  /// Midnight job: auto-close missing exits (1h credit) for all rows on [dateKey],
+  /// and sync an `attendance_in_out` exit marker for reporting.
+  static Future<void> ensureInstituteDateReconciled({
+    required String instituteId,
+    required String dateKey,
+  }) async {
+    final rows = await appDb
+        .from('teacher_attendance')
+        .select('student_id,payload')
+        .eq('institute_id', instituteId)
+        .eq('date', dateKey);
+
+    for (final r in rows) {
+      final roll = (r['student_id'] as String?)?.trim() ?? '';
+      if (roll.isEmpty) continue;
+      final raw = r['payload'];
+      Map<String, dynamic>? payload;
+      if (raw is Map<String, dynamic>) {
+        payload = Map<String, dynamic>.from(raw);
+      } else if (raw is Map) {
+        payload = raw.map((k, v) => MapEntry(k.toString(), v));
+      }
+      if (payload == null || payload.isEmpty) continue;
+
+      // Daily policy: reconcile legacy top-level entry/exit; subject sessions are ignored in new flow.
+      final applied = applyMissingExitAutoClose(
+        payload: payload,
+        enrolledSubjects: const ['all'],
+        nowUtc: DateTime.now().toUtc(),
+      );
+      if (!applied.changed) continue;
+
+      await _upsertTeacherPayload(appDb, instituteId, roll, dateKey, applied.payload);
+
+      for (final h in applied.syncHints) {
+        await _syncAutoClosedExit(instituteId: instituteId, roll: roll, date: dateKey, hint: h);
+      }
+    }
+  }
 }

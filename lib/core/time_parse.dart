@@ -57,6 +57,13 @@ double attendanceCreditedHours(Duration seated, {double maxHours = 2.5}) {
   return double.parse(capped.toStringAsFixed(6));
 }
 
+double attendanceAllocatedHoursForSubjectCount(int subjectCount) {
+  if (subjectCount <= 1) return 1.0;
+  if (subjectCount == 2) return 2.5;
+  if (subjectCount == 3) return 3.5;
+  return 4.5;
+}
+
 /// Seated time for one merged calendar-day attendance row (`entryTime` / `exitTime` / `hours`).
 Duration? seatedDurationFromMergedAttendanceDay(Map<String, dynamic> record) {
   final entry = record['entryTime'] as DateTime?;

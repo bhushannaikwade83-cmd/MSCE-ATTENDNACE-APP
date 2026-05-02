@@ -3,14 +3,18 @@ import 'package:workmanager/workmanager.dart';
 import 'package:flutter/foundation.dart' show kDebugMode, kIsWeb, debugPrint;
 import 'package:timezone/timezone.dart' as tz;
 import 'package:timezone/data/latest.dart' as tz;
-import '../core/attendance_auto_close_policy.dart';
 import 'institute_status_service.dart';
 import 'notification_handler.dart';
+import 'stale_attendance_reconciliation_service.dart';
 
 /// Service for managing institute open/close notifications
 class InstituteNotificationService {
   static final FlutterLocalNotificationsPlugin _notifications = FlutterLocalNotificationsPlugin();
   static final InstituteStatusService _statusService = InstituteStatusService();
+
+  // Attendance should remain open for the full calendar day; after midnight we
+  // auto-close missing exits (credits 1h, note "no exit") for reporting.
+  static const String _kMidnightReconcileTaskName = 'midnight_reconcile_attendance';
 
   /// Initialize notification service
   static Future<void> initialize() async {
@@ -83,22 +87,19 @@ class InstituteNotificationService {
       final timing = await _statusService.getInstituteTiming(instituteId);
       if (timing == null) {
         if (kDebugMode) debugPrint('⚠️ No timing found for institute: $instituteId');
+        // Even without institute timing, attendance should reconcile at midnight.
+        await scheduleMidnightAttendanceReconcile(instituteId: instituteId);
         return;
       }
 
       final openHour = timing['openTime']?['hour'] ?? 8;
       final openMinute = timing['openTime']?['minute'] ?? 0;
-      final closeHour = timing['closeTime']?['hour'] ?? 22;
-      final closeMinute = timing['closeTime']?['minute'] ?? 0;
-
       // Schedule open notifications (1 hour, 30 min, 5 min before)
       await _scheduleOpenNotifications(instituteId, openHour, openMinute);
+      // Attendance is not blocked by institute close/holiday; do not schedule close/auto-close.
 
-      // Schedule close notification
-      await _scheduleCloseNotification(instituteId, closeHour, closeMinute);
-
-      // Schedule auto-close check (30 minutes after close time)
-      await _scheduleAutoCloseCheck(instituteId, closeHour, closeMinute);
+      // Schedule midnight reconciliation for missing exits.
+      await scheduleMidnightAttendanceReconcile(instituteId: instituteId);
 
       if (kDebugMode) debugPrint('✅ Scheduled notifications for institute: $instituteId');
     } catch (e) {
@@ -266,7 +267,7 @@ class InstituteNotificationService {
   /// Cancel all notifications for an institute
   static Future<void> cancelNotifications(String instituteId) async {
     try {
-      final types = ['open_1h', 'open_30m', 'open_5m', 'close', 'auto_close'];
+      final types = ['open_1h', 'open_30m', 'open_5m'];
       for (var type in types) {
         final id = _getNotificationId(instituteId, type);
         await _notifications.cancel(id: id);
@@ -274,6 +275,7 @@ class InstituteNotificationService {
 
       // Cancel workmanager tasks
       await Workmanager().cancelByUniqueName('auto_close_$instituteId');
+      await Workmanager().cancelByUniqueName('$_kMidnightReconcileTaskName|$instituteId');
 
       if (kDebugMode) debugPrint('✅ Cancelled notifications for institute: $instituteId');
     } catch (e) {
@@ -281,7 +283,42 @@ class InstituteNotificationService {
     }
   }
 
-  /// Two hours after entry: remind staff to mark exit before the auto-close window.
+  /// Registers a periodic background task that runs shortly after midnight
+  /// (best-effort; OS may delay) to auto-close missing exits for yesterday.
+  static Future<void> scheduleMidnightAttendanceReconcile({
+    required String instituteId,
+  }) async {
+    if (kIsWeb) return;
+    try {
+      final uniqueName = '$_kMidnightReconcileTaskName|$instituteId';
+      await Workmanager().cancelByUniqueName(uniqueName);
+
+      final now = DateTime.now();
+      final nextMidnightLocal = DateTime(now.year, now.month, now.day + 1, 0, 5);
+      final delay = nextMidnightLocal.isAfter(now)
+          ? nextMidnightLocal.difference(now)
+          : const Duration(minutes: 1);
+
+      // Periodic tasks are not exact; this is best-effort and will run once per day.
+      await Workmanager().registerPeriodicTask(
+        uniqueName,
+        _kMidnightReconcileTaskName,
+        frequency: const Duration(hours: 24),
+        initialDelay: delay,
+        inputData: {
+          'instituteId': instituteId,
+        },
+      );
+
+      if (kDebugMode) {
+        debugPrint('📅 Scheduled midnight attendance reconcile for institute $instituteId at ${nextMidnightLocal.toIso8601String()}');
+      }
+    } catch (e) {
+      if (kDebugMode) debugPrint('⚠️ scheduleMidnightAttendanceReconcile failed: $e');
+    }
+  }
+
+  /// Two hours after entry: remind staff to mark exit before midnight.
   static const Duration attendanceExitReminderDelay = Duration(hours: 2);
 
   static int attendanceExitReminderNotificationId({
@@ -308,8 +345,14 @@ class InstituteNotificationService {
       final nowUtc = DateTime.now().toUtc();
       if (!fireUtc.isAfter(nowUtc)) return;
 
-      final deadlineUtc = entryAtUtc.toUtc().add(kAttendanceExitDeadlineDuration);
-      if (!fireUtc.isBefore(deadlineUtc.subtract(const Duration(minutes: 1)))) {
+      final entryLocal = entryAtUtc.toLocal();
+      final midnightNextLocal = DateTime(
+        entryLocal.year,
+        entryLocal.month,
+        entryLocal.day + 1,
+      );
+      final lastReminderLocal = midnightNextLocal.subtract(const Duration(minutes: 1));
+      if (!fireUtc.toLocal().isBefore(lastReminderLocal)) {
         return;
       }
 
@@ -327,7 +370,7 @@ class InstituteNotificationService {
         id: id,
         title: 'Complete attendance',
         body:
-            'Roll $rollKey$subjHint: mark exit soon (within ${kAttendanceExitDeadlineHours}h of entry).',
+            'Roll $rollKey$subjHint: mark exit before midnight.',
         scheduledDate: fireLocal,
         payload: 'pending_exit|$instituteId|$rollKey|$dateKey|$subjectTag',
       );
@@ -459,6 +502,22 @@ void callbackDispatcher() {
             payload: 'auto_closed|$instituteId',
           );
         }
+      }
+    }
+
+    if (task == InstituteNotificationService._kMidnightReconcileTaskName) {
+      final instituteId = inputData?['instituteId'] as String?;
+      if (instituteId != null && instituteId.isNotEmpty) {
+        // Reconcile yesterday (local calendar day).
+        final now = DateTime.now();
+        final y = DateTime(now.year, now.month, now.day).subtract(const Duration(days: 1));
+        final dateKey =
+            '${y.year.toString().padLeft(4, '0')}-${y.month.toString().padLeft(2, '0')}-${y.day.toString().padLeft(2, '0')}';
+        await StaleAttendanceReconciliationService.ensureInstituteDateReconciled(
+          instituteId: instituteId,
+          dateKey: dateKey,
+        );
+        if (kDebugMode) debugPrint('✅ Midnight reconcile complete: institute=$instituteId date=$dateKey');
       }
     }
 

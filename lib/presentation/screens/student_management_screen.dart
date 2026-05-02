@@ -67,7 +67,6 @@ class _StudentManagementScreenState extends State<StudentManagementScreen>
   Map<String, Map<String, dynamic>> _todayPayloadByRoll = {};
 
   /// Selected subject on each row for per-subject entry / exit.
-  final Map<String, String> _markSubjectByStudentId = {};
 
   static const Color _exitAttendanceMarkColor = Color(0xFFFFC107);
 
@@ -1065,30 +1064,6 @@ class _StudentManagementScreenState extends State<StudentManagementScreen>
     return deduplicated;
   }
 
-  String? _effectiveMarkSubject(String studentId, List<String> subjects) {
-    final stored = _markSubjectByStudentId[studentId];
-    if (stored != null && subjects.contains(stored)) return stored;
-    return subjects.isNotEmpty ? subjects.first : null;
-  }
-
-  Map<String, dynamic>? _payloadSliceForSubject(
-    Map<String, dynamic>? payload,
-    String? subject,
-    List<String> enrolledSubjects,
-  ) {
-    if (payload == null || subject == null) return null;
-    final m = payload['subjectSessions'];
-    if (m is Map && m.isNotEmpty) {
-      final s = m[subject];
-      if (s is Map) return Map<String, dynamic>.from(s.cast<String, dynamic>());
-      return null;
-    }
-    if (enrolledSubjects.length == 1 && enrolledSubjects.first == subject) {
-      return payload;
-    }
-    return null;
-  }
-
   bool _sliceHasEntry(Map<String, dynamic>? slice) {
     if (slice == null) return false;
     return slice['entryPhoto'] != null ||
@@ -1104,7 +1079,6 @@ class _StudentManagementScreenState extends State<StudentManagementScreen>
   Future<void> _markAttendanceForSubject(
     BuildContext context, {
     required String rollKey,
-    required String subject,
     required String step,
   }) async {
     if (_instituteId == null || rollKey.isEmpty) return;
@@ -1112,7 +1086,6 @@ class _StudentManagementScreenState extends State<StudentManagementScreen>
       context,
       instituteId: _instituteId!,
       rollNumber: rollKey,
-      chosenSubject: subject,
       explicitStep: step,
     );
     if (!mounted) return;
@@ -1443,11 +1416,10 @@ class _StudentManagementScreenState extends State<StudentManagementScreen>
     final subjectsList = rawSubs is List
         ? rawSubs.map((e) => e.toString().trim()).where((s) => s.isNotEmpty).toList()
         : <String>[];
-    final sel = _effectiveMarkSubject(studentId, subjectsList);
-    final slice = _payloadSliceForSubject(payload, sel, subjectsList);
+    final slice = payload;
     final hasEntryForSubject = _sliceHasEntry(slice);
     final subjectComplete = _sliceComplete(slice);
-    final canMark = hasFaceEmbedding && sel != null && subjectsList.isNotEmpty;
+    final canMark = hasFaceEmbedding;
     final entryEnabled = canMark && !subjectComplete;
     final exitEnabled = canMark && hasEntryForSubject && !subjectComplete;
 
@@ -1518,53 +1490,89 @@ class _StudentManagementScreenState extends State<StudentManagementScreen>
                           fontWeight: FontWeight.w600,
                         ),
                       ),
-                      if (subjectsList.isEmpty && subject.toString().trim().isNotEmpty) ...[
-                        const SizedBox(height: 2),
-                        Text(
-                          'Subject: $subject',
-                          style: TextStyle(
-                            color: isDark ? Colors.lightBlueAccent : AppTheme.primaryBlue,
-                            fontSize: 11,
-                            fontWeight: FontWeight.w600,
-                          ),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                      ],
                       if (subjectsList.isNotEmpty) ...[
                         const SizedBox(height: 6),
                         Text(
-                          'Mark attendance',
+                          'Subjects',
                           style: TextStyle(
                             fontSize: 11,
                             fontWeight: FontWeight.w700,
                             color: isDark ? Colors.white70 : AppTheme.textGray,
                           ),
                         ),
-                        const SizedBox(height: 2),
-                        DropdownButtonHideUnderline(
-                          child: DropdownButton<String>(
-                            isDense: true,
-                            isExpanded: true,
-                            value: sel,
-                            hint: const Text('Subject'),
-                            items: subjectsList
-                                .map(
-                                  (s) => DropdownMenuItem<String>(
-                                    value: s,
-                                    child: Text(s, maxLines: 2, overflow: TextOverflow.ellipsis),
+                        const SizedBox(height: 4),
+                        Wrap(
+                          spacing: 6,
+                          runSpacing: 6,
+                          children: subjectsList
+                              .map(
+                                (s) => Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 10,
+                                    vertical: 6,
                                   ),
-                                )
-                                .toList(),
-                            onChanged: !hasFaceEmbedding
-                                ? null
-                                : (v) {
-                                    if (v == null) return;
-                                    setState(() => _markSubjectByStudentId[studentId] = v);
-                                  },
+                                  decoration: BoxDecoration(
+                                    color: isDark
+                                        ? Colors.white.withValues(alpha: 0.08)
+                                        : AppTheme.primaryBlueLight.withValues(alpha: 0.2),
+                                    borderRadius: BorderRadius.circular(10),
+                                    border: Border.all(
+                                      color: isDark
+                                          ? Colors.white.withValues(alpha: 0.16)
+                                          : AppTheme.primaryBlue.withValues(alpha: 0.16),
+                                    ),
+                                  ),
+                                  child: Text(
+                                    s,
+                                    style: TextStyle(
+                                      color: isDark ? Colors.white : AppTheme.textDark,
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                ),
+                              )
+                              .toList(),
+                        ),
+                      ] else if (subject.toString().trim().isNotEmpty) ...[
+                        const SizedBox(height: 6),
+                        Text(
+                          'Subject',
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w700,
+                            color: isDark ? Colors.white70 : AppTheme.textGray,
                           ),
                         ),
-                      ] else if (subject.toString().trim().isEmpty) ...[
+                        const SizedBox(height: 4),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 6,
+                          ),
+                          decoration: BoxDecoration(
+                            color: isDark
+                                ? Colors.white.withValues(alpha: 0.08)
+                                : AppTheme.primaryBlueLight.withValues(alpha: 0.2),
+                            borderRadius: BorderRadius.circular(10),
+                            border: Border.all(
+                              color: isDark
+                                  ? Colors.white.withValues(alpha: 0.16)
+                                  : AppTheme.primaryBlue.withValues(alpha: 0.16),
+                            ),
+                          ),
+                          child: Text(
+                            subject.toString().trim(),
+                            style: TextStyle(
+                              color: isDark ? Colors.white : AppTheme.textDark,
+                              fontSize: 11,
+                              fontWeight: FontWeight.w600,
+                            ),
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                      ] else ...[
                         const SizedBox(height: 4),
                         Text(
                           'No subjects — edit student to assign subjects.',
@@ -1589,7 +1597,6 @@ class _StudentManagementScreenState extends State<StudentManagementScreen>
                                 ? () => _markAttendanceForSubject(
                                       context,
                                       rollKey: rollKey,
-                                      subject: sel,
                                       step: 'entry',
                                     )
                                 : null,
@@ -1606,7 +1613,6 @@ class _StudentManagementScreenState extends State<StudentManagementScreen>
                                 ? () => _markAttendanceForSubject(
                                       context,
                                       rollKey: rollKey,
-                                      subject: sel,
                                       step: 'exit',
                                     )
                                 : null,

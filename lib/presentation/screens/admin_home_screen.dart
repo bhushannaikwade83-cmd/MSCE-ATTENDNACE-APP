@@ -32,6 +32,7 @@ import '../../services/institute_lecture_timing_service.dart';
 import '../../services/b2b_storage_service.dart';
 import '../../services/institute_realtime_sync_service.dart';
 import '../../services/institute_status_service.dart';
+import '../../services/stale_attendance_reconciliation_service.dart';
 import '../../services/geofence_service.dart';
 
 class AdminHomeScreen extends StatefulWidget {
@@ -257,9 +258,14 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> with TickerProviderSt
   Future<void> _performMidnightAutoClose() async {
     if (!mounted) return;
     if (_instituteId == null) return;
-    if (kDebugMode) debugPrint('🕛 Midnight reached — refreshing day status');
-    // New day should start in default "closed" mode until admin chooses Open/Holiday.
-    // Do not auto-mark absences for the new day at midnight.
+    final now = DateTime.now();
+    final justEnded = DateFormat('yyyy-MM-dd').format(now.subtract(const Duration(days: 1)));
+    if (kDebugMode) debugPrint('🕛 Midnight reached — finalizing day $justEnded');
+    await _runAutoMarkAbsent(reason: 'midnight auto-absent', dateKey: justEnded);
+    await StaleAttendanceReconciliationService.ensureInstituteDateReconciled(
+      instituteId: _instituteId!,
+      dateKey: justEnded,
+    );
     if (mounted) await _loadTodayStatus();
     if (!mounted) return;
     _scheduleMidnightAutoClose();
@@ -267,12 +273,12 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> with TickerProviderSt
 
   // ── Auto-mark absent on close ─────────────────────────────────────────────
 
-  Future<void> _runAutoMarkAbsent({String reason = 'institute closed'}) async {
+  Future<void> _runAutoMarkAbsent({String reason = 'institute closed', String? dateKey}) async {
     if (_instituteId == null) return;
     if (mounted) setState(() => _isAutoMarkingAbsent = true);
     try {
       final result = await _statusService
-          .markAbsentAllUnmarkedStudents(_instituteId!);
+          .markAbsentAllUnmarkedStudents(_instituteId!, dateKey: dateKey);
       if (kDebugMode) {
         debugPrint(
             '✅ Auto-absent ($reason): total=${result['total']}');

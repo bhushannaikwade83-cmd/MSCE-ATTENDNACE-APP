@@ -180,25 +180,7 @@ class _TeacherAttendanceScreenState extends State<TeacherAttendanceScreen> {
   }
 
   Future<void> _captureAndMarkPresent(String studentId, String studentName) async {
-    // Block if institute is not open or it's a holiday
-    if (_instituteId != null) {
-      final todayStatus = await InstituteStatusService().getTodayStatus(_instituteId!);
-      if (!mounted) return;
-      final instStatus = todayStatus?['status'] as String? ?? '';
-      if (instStatus == 'holiday') {
-        if (mounted) _showErrorDialog('Holiday', 'Today is a holiday. Attendance is not counted on holidays.');
-        return;
-      }
-      if (instStatus != 'open') {
-        if (mounted) _showErrorDialog(
-          'Institute Not Open',
-          instStatus == 'closed'
-              ? 'The institute is closed. Attendance cannot be marked.'
-              : 'The institute has not been opened yet. Ask the admin to open it first.',
-        );
-        return;
-      }
-    }
+    // Attendance is available every day; do not block on institute open/holiday/close status.
 
     bool isAllowed = await _isWithinSchoolPremises();
     if (!mounted) return;

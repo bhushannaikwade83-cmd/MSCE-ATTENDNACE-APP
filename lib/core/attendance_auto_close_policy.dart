@@ -3,17 +3,22 @@ import 'time_parse.dart';
 /// Subject buckets in teacher_attendance.payload (`subjectSessions`).
 const String kSubjectSessionsPayloadKey = 'subjectSessions';
 
-/// Student must mark exit within this wall-clock window after entry.
-const double kAttendanceExitDeadlineHours = 2.5;
+/// Exit remains open until the calendar day changes locally.
+const double kAttendanceExitDeadlineHours = 24;
 
-/// Same deadline as a [Duration] for comparisons with entry/exit timestamps.
-Duration get kAttendanceExitDeadlineDuration =>
-    Duration(milliseconds: (kAttendanceExitDeadlineHours * 3600000).round());
+/// Legacy helper constant used by some notification codepaths.
+///
+/// The actual deadline rule is "until the calendar day changes locally"
+/// (see [isPastAttendanceExitDeadline]). This duration is kept only to
+/// satisfy older callers that add a fixed duration to an entry timestamp.
+const Duration kAttendanceExitDeadlineDuration = Duration(hours: 24);
 
-/// True when [nowUtc] is at or after the missing-exit deadline from [entryUtc] (strict manual-exit cutoff).
 bool isPastAttendanceExitDeadline(DateTime entryUtc, DateTime nowUtc) {
-  final diff = nowUtc.difference(entryUtc);
-  return !diff.isNegative && diff >= kAttendanceExitDeadlineDuration;
+  final entryLocal = entryUtc.toLocal();
+  final nowLocal = nowUtc.toLocal();
+  final entryDay = DateTime(entryLocal.year, entryLocal.month, entryLocal.day);
+  final nowDay = DateTime(nowLocal.year, nowLocal.month, nowLocal.day);
+  return nowDay.isAfter(entryDay);
 }
 
 /// When exit is missing past [kAttendanceExitDeadlineHours], each affected session is
@@ -21,8 +26,8 @@ bool isPastAttendanceExitDeadline(DateTime entryUtc, DateTime nowUtc) {
 const double kMissingExitCreditedHours = 1.0;
 
 String autoClosedMissingExitNote() =>
-    'No exit within ${kAttendanceExitDeadlineHours}h — credited '
-    '${kMissingExitCreditedHours}h without exit photo (hours-based rule).';
+    'No exit before midnight — credited '
+    '${kMissingExitCreditedHours}h without exit photo.';
 
 /// Prefer subjects whose name mentions 30, then 40, then 50 (word boundary).
 int subjectAutoClosePriority(String subjectName) {
@@ -142,10 +147,6 @@ AttendanceAutoCloseApplyResult _applySubjectSessions(
     mutable[e.key] = Map<String, dynamic>.from(e.value);
   }
 
-  final deadline = Duration(
-    milliseconds: (kAttendanceExitDeadlineHours * 3600000).round(),
-  );
-
   final stale = <String>[];
   for (final sub in enrolledSubjects) {
     final sess = Map<String, dynamic>.from(mutable[sub] ?? {});
@@ -154,7 +155,7 @@ AttendanceAutoCloseApplyResult _applySubjectSessions(
     if (sessionHasExitMap(sess)) continue;
     final entry = parseAnyTimestamp(sess['entryTime']) ?? parseAnyTimestamp(sess['timestamp']);
     if (entry == null) continue;
-    if (nowUtc.difference(entry) < deadline) continue;
+    if (!isPastAttendanceExitDeadline(entry, nowUtc)) continue;
     stale.add(sub);
   }
 
@@ -174,12 +175,11 @@ AttendanceAutoCloseApplyResult _applySubjectSessions(
     final entry = parseAnyTimestamp(sess['entryTime']) ?? parseAnyTimestamp(sess['timestamp']);
     if (entry == null) continue;
 
-    final syntheticExit = entry.add(deadline);
     final elapsed = nowUtc.difference(entry);
     final rawH = elapsed.inSeconds / 3600.0;
 
     final entryIso = entry.toUtc().toIso8601String();
-    sess['exitTime'] = syntheticExit.toUtc().toIso8601String();
+    sess.remove('exitTime');
     sess.remove('exitPhoto');
     sess.remove('exitPhotoPath');
     sess.remove('exitPhotoFileId');
@@ -194,7 +194,7 @@ AttendanceAutoCloseApplyResult _applySubjectSessions(
       AutoCloseSyncHint(
         subjectLabel: sub,
         sessionEntryUtc: entryIso,
-        syntheticExitUtc: sess['exitTime']!.toString(),
+        syntheticExitUtc: nowUtc.toIso8601String(),
       ),
     );
   }
@@ -235,10 +235,7 @@ AttendanceAutoCloseApplyResult _applyLegacyTopLevel(
     return AttendanceAutoCloseApplyResult(payload: out, changed: false, syncHints: const []);
   }
 
-  final deadline = Duration(
-    milliseconds: (kAttendanceExitDeadlineHours * 3600000).round(),
-  );
-  if (nowUtc.difference(entry) < deadline) {
+  if (!isPastAttendanceExitDeadline(entry, nowUtc)) {
     return AttendanceAutoCloseApplyResult(payload: out, changed: false, syncHints: const []);
   }
 
@@ -247,13 +244,11 @@ AttendanceAutoCloseApplyResult _applyLegacyTopLevel(
     return AttendanceAutoCloseApplyResult(payload: out, changed: false, syncHints: const []);
   }
 
-  final syntheticExit = entry.add(deadline);
   final elapsed = nowUtc.difference(entry);
   final rawH = elapsed.inSeconds / 3600.0;
   final entryIso = entry.toUtc().toIso8601String();
-  final exitIso = syntheticExit.toUtc().toIso8601String();
 
-  out['exitTime'] = exitIso;
+  out.remove('exitTime');
   out.remove('exitPhoto');
   out.remove('exitPhotoPath');
   out.remove('exitPhotoFileId');
@@ -270,7 +265,7 @@ AttendanceAutoCloseApplyResult _applyLegacyTopLevel(
       AutoCloseSyncHint(
         subjectLabel: chosen,
         sessionEntryUtc: entryIso,
-        syntheticExitUtc: exitIso,
+        syntheticExitUtc: nowUtc.toIso8601String(),
       ),
     ],
   );

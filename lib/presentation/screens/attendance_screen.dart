@@ -186,23 +186,7 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
 
     setState(() => _isLoading = true);
 
-    // Check institute is open before allowing attendance
-    final todayStatus = await InstituteStatusService().getTodayStatus(_instituteId!);
-    if (!mounted) return;
-    final instStatus = todayStatus?['status'] as String? ?? '';
-    if (instStatus == 'holiday') {
-      _showError("Holiday", "Today is a holiday. Attendance is not counted on holidays.");
-      setState(() => _isLoading = false);
-      return;
-    }
-    if (instStatus != 'open') {
-      _showError("Institute Not Open",
-          instStatus == 'closed'
-              ? "The institute is closed for today. Attendance cannot be marked."
-              : "The institute has not been opened yet. Please wait for the admin to open it.");
-      setState(() => _isLoading = false);
-      return;
-    }
+    // Attendance is available every day; do not block on institute open/holiday/close status.
 
     if (!kIsWeb) {
       final ok = await _checkLocation();

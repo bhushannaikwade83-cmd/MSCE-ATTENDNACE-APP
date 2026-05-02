@@ -304,7 +304,7 @@ String? _sequentialPriorIncompleteSubject(
   return null;
 }
 
-/// After [kAttendanceExitDeadlineHours] from entry, manual exit photo is never allowed (reconcile auto-close only).
+/// After the calendar day changes, manual exit photo is never allowed (reconcile auto-close only).
 Future<bool> _inlineAbortManualExitIfDeadlinePassed({
   required ScaffoldMessengerState messenger,
   required SupabaseClient db,
@@ -347,8 +347,8 @@ Future<bool> _inlineAbortManualExitIfDeadlinePassed({
   if (red.mode != 'exit') {
     final msg = red.mode == 'complete'
         ? (useSubjects && activeSubject != null
-            ? 'Exit window ended (${kAttendanceExitDeadlineHours}h). "$activeSubject" was auto-closed (no exit photo; 1 h credit).'
-            : 'Exit window ended (${kAttendanceExitDeadlineHours}h). Session auto-closed (no exit photo; 1 h credit).')
+            ? 'Exit window ended at midnight. "$activeSubject" was auto-closed (no exit photo; 1 h credit).'
+            : 'Exit window ended at midnight. Session auto-closed (no exit photo; 1 h credit).')
         : 'Attendance was updated — try again.';
     messenger.showSnackBar(
       SnackBar(
@@ -363,7 +363,7 @@ Future<bool> _inlineAbortManualExitIfDeadlinePassed({
   messenger.showSnackBar(
     SnackBar(
       content: Text(
-        'Exit not allowed: more than ${kAttendanceExitDeadlineHours}h since entry.',
+        'Exit is no longer available because the day has already rolled over.',
       ),
       backgroundColor: Colors.orange,
       duration: const Duration(seconds: 6),
@@ -842,19 +842,6 @@ class InlineStudentAttendanceService {
         forcedStep = stepNorm;
       }
 
-      if (enrolledSubjects.isEmpty) {
-        messenger.showSnackBar(
-          SnackBar(
-            content: Text(
-              'Cannot mark attendance: Roll $roll has no subjects. Edit the student and add subjects.',
-            ),
-            backgroundColor: Colors.orange,
-            duration: const Duration(seconds: 6),
-          ),
-        );
-        return;
-      }
-
       final instituteSlots = await InstituteLectureTimingService().buildLectureTimingString(instituteId);
       final timing = (studentStoredSlots != null && studentStoredSlots.trim().isNotEmpty)
           ? studentStoredSlots.trim()
@@ -887,108 +874,14 @@ class InlineStudentAttendanceService {
         existingPayload: existingPayload,
       );
 
-      final bool useSubjects;
-      if (enrolledSubjects.isEmpty) {
-        useSubjects = false;
-      } else if (existingPayload == null || !_isLegacyAttendanceDoc(existingPayload)) {
-        useSubjects = true;
-      } else {
-        useSubjects = false;
-      }
-
-      if (!useSubjects &&
-          enrolledSubjects.length > 1 &&
-          existingPayload != null &&
-          _isLegacyAttendanceDoc(existingPayload)) {
-        messenger.showSnackBar(
-          SnackBar(
-            content: Text(
-              'Roll $roll has multiple subjects and today\'s attendance is in an old format that could not be updated automatically. '
-              'Ask your institute admin for help.',
-            ),
-            backgroundColor: Colors.orange,
-            duration: const Duration(seconds: 8),
-          ),
-        );
-        return;
-      }
-
-      if (useSubjects &&
-          existingPayload != null &&
-          _allSubjectsCompleteInPayload(existingPayload, enrolledSubjects)) {
-        messenger.showSnackBar(
-          SnackBar(
-            content: Text(
-              'All subjects are complete today for Roll $roll. After midnight you can mark again.',
-            ),
-            backgroundColor: Colors.orange,
-            duration: const Duration(seconds: 5),
-          ),
-        );
-        return;
-      }
-
-      String? activeSubject;
-      if (useSubjects) {
-        final chosenRaw = chosenSubject?.trim();
-        if (chosenRaw != null && chosenRaw.isNotEmpty) {
-          final canon = _canonicalSubjectFromEnrollment(enrolledSubjects, chosenRaw);
-          if (canon == null) {
-            messenger.showSnackBar(
-              SnackBar(
-                content: Text('"$chosenRaw" is not assigned to this student.'),
-                backgroundColor: Colors.orange,
-                duration: const Duration(seconds: 5),
-              ),
-            );
-            return;
-          }
-          activeSubject = canon;
-        } else {
-          final pending = _pendingSubjectFromPayload(existingPayload);
-          if (pending != null) {
-            activeSubject = pending;
-          } else if (enrolledSubjects.length == 1) {
-            activeSubject = enrolledSubjects.first;
-          } else {
-            if (!context.mounted) return;
-            activeSubject = await _pickAttendanceSubjectSheet(
-              context,
-              enrolledSubjects,
-              existingPayload,
-            );
-            if (activeSubject == null || !context.mounted) return;
-            if (!enrolledSubjects.contains(activeSubject)) return;
-          }
-        }
-        final pend2 = _pendingSubjectFromPayload(existingPayload);
-        if (pend2 != null && pend2 != activeSubject) {
-          messenger.showSnackBar(
-            SnackBar(
-              content: Text('Finish exit for "$pend2" first, then pick another subject.'),
-              backgroundColor: Colors.orange,
-              duration: const Duration(seconds: 5),
-            ),
-          );
-          return;
-        }
-      }
-
-      final _QuickMarkDecision decision;
-      if (useSubjects && activeSubject != null) {
-        decision = _decideNextMarkSubject(existingPayload, activeSubject);
-      } else {
-        decision = _decideNextMark(existingPayload, timing);
-      }
+      const bool useSubjects = false;
+      final String? activeSubject = null;
+      final _QuickMarkDecision decision = _decideNextMark(existingPayload, timing);
 
       if (decision.mode == 'complete') {
         messenger.showSnackBar(
           SnackBar(
-            content: Text(
-              (useSubjects && activeSubject != null)
-                  ? '"$activeSubject" is already complete today for Roll $roll.'
-                  : 'Attendance already complete today for Roll $roll (entry & exit).',
-            ),
+            content: Text('Attendance already complete today for Roll $roll (entry & exit).'),
             backgroundColor: Colors.orange,
             duration: const Duration(seconds: 4),
           ),
@@ -1050,32 +943,6 @@ class InlineStudentAttendanceService {
           timing: timing,
         );
         if (abort) return;
-      }
-
-      if (useSubjects &&
-          activeSubject != null &&
-          decision.mode == 'entry') {
-        final sm = _mapSubjectSessions(existingPayload);
-        final s = _sessionForSubject(sm, activeSubject);
-        if (!_sessionHasEntryMap(s)) {
-          final seq = _sequentialPriorIncompleteSubject(
-            enrolledSubjects,
-            sm,
-            activeSubject,
-          );
-          if (seq != null) {
-            messenger.showSnackBar(
-              SnackBar(
-                content: Text(
-                  'Finish entry and exit for "$seq" first, then mark "$activeSubject".',
-                ),
-                backgroundColor: Colors.orange,
-                duration: const Duration(seconds: 6),
-              ),
-            );
-            return;
-          }
-        }
       }
 
       if (!kIsWeb) {
@@ -1294,62 +1161,34 @@ class InlineStudentAttendanceService {
       int? currentLectureIndex = decision.lectureIndex;
 
       if (freshPayload != null) {
-        if (useSubjects && activeSubject != null) {
-          if (_allSubjectsCompleteInPayload(freshPayload, enrolledSubjects)) {
-            if (context.mounted) {
-              messenger.showSnackBar(
-                SnackBar(
-                  content: Text('All subjects complete today for Roll $roll.'),
-                  backgroundColor: Colors.orange,
-                ),
-              );
-            }
-            return;
+        final hasEntry =
+            freshPayload['entryPhoto'] != null || freshPayload['photoUrl'] != null;
+        final hasExit =
+            freshPayload['exitPhoto'] != null || freshPayload['exitTime'] != null;
+        if (hasEntry && hasExit) {
+          if (context.mounted) {
+            messenger.showSnackBar(
+              SnackBar(
+                content: Text('Attendance already complete today for Roll $roll.'),
+                backgroundColor: Colors.orange,
+              ),
+            );
           }
-          final d2 = _decideNextMarkSubject(freshPayload, activeSubject);
-          mode = d2.mode;
-          currentLectureIndex = null;
-          if (mode == 'complete') {
-            if (context.mounted) {
-              messenger.showSnackBar(
-                SnackBar(
-                  content: Text('"$activeSubject" is already complete for Roll $roll.'),
-                  backgroundColor: Colors.orange,
-                ),
-              );
-            }
-            return;
+          return;
+        }
+        final d2 = _decideNextMark(freshPayload, timing);
+        mode = d2.mode;
+        currentLectureIndex = d2.lectureIndex;
+        if (mode == 'complete') {
+          if (context.mounted) {
+            messenger.showSnackBar(
+              const SnackBar(
+                content: Text('Already marked complete.'),
+                backgroundColor: Colors.orange,
+              ),
+            );
           }
-        } else {
-          final hasEntry =
-              freshPayload['entryPhoto'] != null || freshPayload['photoUrl'] != null;
-          final hasExit =
-              freshPayload['exitPhoto'] != null || freshPayload['exitTime'] != null;
-          if (hasEntry && hasExit) {
-            if (context.mounted) {
-              messenger.showSnackBar(
-                SnackBar(
-                  content: Text('Attendance already complete today for Roll $roll.'),
-                  backgroundColor: Colors.orange,
-                ),
-              );
-            }
-            return;
-          }
-          final d2 = _decideNextMark(freshPayload, timing);
-          mode = d2.mode;
-          currentLectureIndex = d2.lectureIndex;
-          if (mode == 'complete') {
-            if (context.mounted) {
-              messenger.showSnackBar(
-                const SnackBar(
-                  content: Text('Already marked complete.'),
-                  backgroundColor: Colors.orange,
-                ),
-              );
-            }
-            return;
-          }
+          return;
         }
       }
 
@@ -1406,34 +1245,6 @@ class InlineStudentAttendanceService {
         if (abort) return;
       }
 
-      if (useSubjects &&
-          activeSubject != null &&
-          mode == 'entry') {
-        final sm = _mapSubjectSessions(freshPayload);
-        final s = _sessionForSubject(sm, activeSubject);
-        if (!_sessionHasEntryMap(s)) {
-          final seq = _sequentialPriorIncompleteSubject(
-            enrolledSubjects,
-            sm,
-            activeSubject,
-          );
-          if (seq != null) {
-            if (context.mounted) {
-              messenger.showSnackBar(
-                SnackBar(
-                  content: Text(
-                    'Finish entry and exit for "$seq" first, then mark "$activeSubject".',
-                  ),
-                  backgroundColor: Colors.orange,
-                  duration: const Duration(seconds: 6),
-                ),
-              );
-            }
-            return;
-          }
-        }
-      }
-
       final isMarkingEntry = mode == 'entry';
       final isMarkingExit = mode == 'exit';
       final isLectureScan = !useSubjects && mode == 'lecture_scan';
@@ -1472,9 +1283,7 @@ class InlineStudentAttendanceService {
         instituteId: instituteId,
         folderYear: folderYear,
         rollNumber: roll,
-        subject: (useSubjects && activeSubject != null)
-            ? activeSubject.trim()
-            : 'all',
+        subject: 'all',
         date: today,
         photoBytes: bytes,
         photoType: photoType,
@@ -1498,56 +1307,7 @@ class InlineStudentAttendanceService {
         'subjects': enrolledSubjects,
       };
 
-      if (useSubjects && activeSubject != null) {
-        if (!isMarkingEntry && !isMarkingExit) {
-          if (context.mounted) {
-            messenger.showSnackBar(
-              const SnackBar(
-                content: Text(
-                  'Something went wrong with subject-based marking. Contact your institute admin.',
-                ),
-                backgroundColor: Colors.orange,
-              ),
-            );
-          }
-          return;
-        }
-        final sub = activeSubject;
-        final sessions = <String, Map<String, dynamic>>{};
-        for (final e in _mapSubjectSessions(existingData).entries) {
-          sessions[e.key] = Map<String, dynamic>.from(e.value);
-        }
-        var sess = Map<String, dynamic>.from(sessions[sub] ?? {});
-        if (isMarkingEntry) {
-          sess['entryPhoto'] = url;
-          sess['entryTime'] = serverTs;
-          sess['entryPhotoPath'] = storagePath;
-          if (fileId != null && fileId.isNotEmpty) {
-            sess['entryPhotoFileId'] = fileId;
-          }
-          sess['photoUrl'] = url;
-          sess['timestamp'] = serverTs;
-          sess['status'] = 'pending';
-          sess['subjectName'] = sub;
-        } else if (isMarkingExit) {
-          sess['exitPhoto'] = url;
-          sess['exitTime'] = serverTs;
-          sess['exitPhotoPath'] = storagePath;
-          if (fileId != null && fileId.isNotEmpty) {
-            sess['exitPhotoFileId'] = fileId;
-          }
-          final entryTime = _asDateTime(sess['entryTime']) ?? _asDateTime(sess['timestamp']);
-          if (entryTime != null) {
-            final duration = currentTime.difference(entryTime);
-            final rawH = duration.inSeconds / 3600.0;
-            sess['hoursRaw'] = double.parse(rawH.toStringAsFixed(6));
-            sess['hours'] = attendanceCreditedHours(duration);
-          }
-          sess['status'] = 'present';
-        }
-        sessions[sub] = sess;
-        attendanceData[_kSubjectSessionsKey] = sessions;
-      } else if (isMarkingEntry) {
+      if (isMarkingEntry) {
         attendanceData['entryPhoto'] = url;
         attendanceData['entryTime'] = serverTs;
         attendanceData['entryPhotoPath'] = storagePath;
@@ -1655,7 +1415,8 @@ class InlineStudentAttendanceService {
           final duration = currentTime.difference(entryTime);
           final rawH = duration.inSeconds / 3600.0;
           attendanceData['hoursRaw'] = double.parse(rawH.toStringAsFixed(6));
-          attendanceData['hours'] = attendanceCreditedHours(duration);
+          attendanceData['hours'] =
+              attendanceAllocatedHoursForSubjectCount(enrolledSubjects.length);
         }
       }
 
@@ -1666,11 +1427,9 @@ class InlineStudentAttendanceService {
         operationName: 'Save attendance record',
       );
 
-      final subjectLabel = (useSubjects && activeSubject != null)
-          ? activeSubject
-          : (enrolledSubjects.isEmpty
-              ? null
-              : enrolledSubjects.map((e) => e.toString()).join(', '));
+      final subjectLabel = enrolledSubjects.isEmpty
+          ? null
+          : enrolledSubjects.map((e) => e.toString()).join(', ');
 
       if (isMarkingEntry) {
         await _syncAttendanceInOut(
@@ -1690,22 +1449,13 @@ class InlineStudentAttendanceService {
           instituteId: instituteId,
           rollKey: roll,
           dateKey: today,
-          subjectTag: !useSubjects || activeSubject == null ? 'all' : activeSubject,
+          subjectTag: 'all',
           entryAtUtc: DateTime.parse(serverTs.toString()).toUtc(),
         );
       } else if (isMarkingExit) {
-        String? entryUtc;
-        double? hrs;
-        if (useSubjects && activeSubject != null) {
-          final sess =
-              _sessionForSubject(_mapSubjectSessions(mergedPayload), activeSubject);
-          entryUtc = sess['entryTime']?.toString() ?? sess['timestamp']?.toString();
-          hrs = (sess['hours'] as num?)?.toDouble();
-        } else {
-          entryUtc =
-              mergedPayload['entryTime']?.toString() ?? mergedPayload['timestamp']?.toString();
-          hrs = (mergedPayload['hours'] as num?)?.toDouble();
-        }
+        final entryUtc =
+            mergedPayload['entryTime']?.toString() ?? mergedPayload['timestamp']?.toString();
+        final hrs = (mergedPayload['hours'] as num?)?.toDouble();
         await _syncAttendanceInOut(
           instituteId: instituteId,
           roll: roll,
@@ -1725,40 +1475,25 @@ class InlineStudentAttendanceService {
           instituteId: instituteId,
           rollKey: roll,
           dateKey: today,
-          subjectTag: !useSubjects || activeSubject == null ? 'all' : activeSubject,
+          subjectTag: 'all',
         );
       }
 
       String successMessage;
       if (isMarkingEntry) {
-        successMessage = (useSubjects && activeSubject != null)
-            ? '✅ Entry for "$activeSubject" — Roll $roll\nTake exit photo for this subject next.'
-            : '✅ Entry recorded for $roll\nTake exit photo later to complete attendance.';
+        successMessage = '✅ Entry recorded for $roll\nTake exit photo later to complete attendance.';
       } else if (isMarkingExit) {
-        double credited;
-        double rawH;
-        if (useSubjects && activeSubject != null) {
-          final sessions = _mapSubjectSessions(attendanceData);
-          final sess = _sessionForSubject(sessions, activeSubject);
-          credited = (sess['hours'] as num?)?.toDouble() ?? 0.0;
-          rawH = (sess['hoursRaw'] as num?)?.toDouble() ?? credited;
-        } else {
-          credited = attendanceData['hours'] as double? ?? 0.0;
-          rawH = (attendanceData['hoursRaw'] as num?)?.toDouble() ?? credited;
-        }
+        final credited = attendanceData['hours'] as double? ?? 0.0;
+        final rawH = (attendanceData['hoursRaw'] as num?)?.toDouble() ?? credited;
         final seatedLabel = formatSeatedDurationHuman(
           Duration(seconds: (rawH * 3600).round()),
         );
         if (rawH > credited + 1e-6) {
-          successMessage = (useSubjects && activeSubject != null)
-              ? '✅ Exit for "$activeSubject" — Roll $roll\n'
-                  '⏰ Credited: ${credited.toStringAsFixed(2)} h (max 2.5 h/subject). Seated: $seatedLabel'
-              : '✅ Exit marked for $roll\n'
-                  '⏰ Credited: ${credited.toStringAsFixed(2)} h (max 2.5 h/day). Seated: $seatedLabel';
+          successMessage = '✅ Exit marked for $roll\n'
+              '⏰ Credited: ${credited.toStringAsFixed(2)} h. Seated: $seatedLabel';
         } else {
-          successMessage = (useSubjects && activeSubject != null)
-              ? '✅ Exit for "$activeSubject" — Roll $roll\n⏰ Credited: ${credited.toStringAsFixed(2)} h ($seatedLabel)'
-              : '✅ Exit marked for $roll\n⏰ Credited: ${credited.toStringAsFixed(2)} h ($seatedLabel)';
+          successMessage =
+              '✅ Exit marked for $roll\n⏰ Credited: ${credited.toStringAsFixed(2)} h ($seatedLabel)';
         }
       } else if (isLectureScan && currentLectureIndex != null) {
         successMessage = '✅ Lecture ${currentLectureIndex + 1} scan done for $roll';

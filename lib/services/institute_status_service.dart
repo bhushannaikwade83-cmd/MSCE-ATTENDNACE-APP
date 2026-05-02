@@ -236,13 +236,6 @@ class InstituteStatusService {
   }
 
   Future<String?> attendanceBlockMessage(String instituteId) async {
-    final status = (await getTodayStatus(instituteId))?['status']?.toString();
-    if (status == 'holiday') {
-      return 'Today is a holiday. Attendance cannot be marked.';
-    }
-    if (status == 'closed') {
-      return 'Institute is closed. Attendance cannot be marked.';
-    }
     return null;
   }
 
@@ -251,9 +244,11 @@ class InstituteStatusService {
   /// Called automatically when the institute is closed for the day.
   /// Returns { 'success', 'updated', 'inserted', 'total' }.
   Future<Map<String, dynamic>> markAbsentAllUnmarkedStudents(
-      String instituteId) async {
+    String instituteId, {
+    String? dateKey,
+  }) async {
     try {
-      final today = DateFormat('yyyy-MM-dd').format(DateTime.now());
+      final today = dateKey ?? DateFormat('yyyy-MM-dd').format(DateTime.now());
       final now = DateTime.now().toUtc().toIso8601String();
 
       // All students in the institute
