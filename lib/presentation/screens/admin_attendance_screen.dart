@@ -2571,8 +2571,9 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
         );
       }
 
-      final currentTime = DateTime.now();
-      final serverTs = _encodeSv();
+      final photoCapturedAt = timeAtPhotoCapture.toUtc();
+      final currentTime = photoCapturedAt.toLocal();
+      final serverTs = photoCapturedAt.toIso8601String();
 
       final ex = existingPayload;
       final existingStatus = ex?['status']?.toString();

@@ -329,7 +329,7 @@ Future<bool> _inlineAbortManualExitIfDeadlinePassed({
   }
   if (entryUtc == null) return false;
 
-  if (!isPastAttendanceExitDeadline(entryUtc, nowUtc)) return false;
+  if (!isPastAttendanceExitDeadline(entryUtc, nowUtc, enrolledSubjects.length)) return false;
 
   final repaired = await StaleAttendanceReconciliationService.ensureReconciled(
     db: db,
@@ -1155,8 +1155,11 @@ class InlineStudentAttendanceService {
         operationName: 'Check existing attendance',
       );
 
-      final currentTime = DateTime.now();
-      final serverTs = _encodeSv();
+      // Freeze the attendance timestamp at the actual photo handling moment so
+      // later verification/upload work does not shift the saved time.
+      final photoCapturedAt = DateTime.now().toUtc();
+      final currentTime = photoCapturedAt.toLocal();
+      final serverTs = photoCapturedAt.toIso8601String();
       var mode = decision.mode;
       int? currentLectureIndex = decision.lectureIndex;
 
