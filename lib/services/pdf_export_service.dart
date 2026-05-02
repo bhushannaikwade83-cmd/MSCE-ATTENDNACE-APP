@@ -11,7 +11,7 @@ import 'package:intl/intl.dart';
 import '../core/app_db.dart';
 import '../core/supabase_maps.dart';
 import '../core/time_parse.dart';
-import 'institute_status_service.dart';
+// Institute holiday/open/close system removed.
 
 class PdfExportService {
   static final DateFormat _pdfTimeFmt = DateFormat('HH:mm');
@@ -36,28 +36,8 @@ class PdfExportService {
     required String startDate,
     required String endDate,
   }) async {
-    final rows = await appDb
-        .from('institute_daily_status')
-        .select('date_key,payload')
-        .eq('institute_id', instituteId)
-        .eq('student_id', InstituteStatusService.kInstituteStatusStudentId)
-        .gte('date_key', startDate)
-        .lte('date_key', endDate);
-
-    final out = <String, String>{};
-    for (final raw in rows) {
-      final row = raw as Map<String, dynamic>;
-      final date = row['date_key']?.toString() ?? '';
-      if (date.isEmpty) continue;
-      final payload = row['payload'];
-      final map = payload is Map
-          ? payload.map((k, v) => MapEntry(k.toString(), v))
-          : <String, dynamic>{};
-      if (map['status']?.toString() != 'holiday') continue;
-      final reason = map['reason']?.toString().trim();
-      out[date] = reason == null || reason.isEmpty ? 'Holiday' : reason;
-    }
-    return out;
+    // Holiday system removed.
+    return <String, String>{};
   }
 
   static String _rollKey(Map<String, dynamic> s) {

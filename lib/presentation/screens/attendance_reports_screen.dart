@@ -12,7 +12,7 @@ import '../../core/theme/app_theme.dart';
 import '../../core/utils/responsive.dart';
 import '../../services/error_handler.dart';
 import '../../services/institute_realtime_sync_service.dart';
-import '../../services/institute_status_service.dart';
+// Institute open/close/holiday removed.
 import '../../services/pdf_export_service.dart';
 
 class AttendanceReportsScreen extends StatefulWidget {
@@ -177,7 +177,8 @@ class _AttendanceReportsScreenState extends State<AttendanceReportsScreen>
     try {
       final startDateStr = DateFormat('yyyy-MM-dd').format(_selectedStartDate);
       final endDateStr = DateFormat('yyyy-MM-dd').format(_selectedEndDate);
-      final holidayReasons = await _loadHolidayReasons(startDateStr, endDateStr);
+      // Holiday system removed.
+      final holidayReasons = <String, String>{};
 
       // Load ALL students from THIS institute ONLY
       List<Map<String, dynamic>> allStudents = (await appDb
@@ -413,29 +414,8 @@ class _AttendanceReportsScreenState extends State<AttendanceReportsScreen>
   }
 
   Future<Map<String, String>> _loadHolidayReasons(String startDate, String endDate) async {
-    if (_instituteId == null) return {};
-    final rows = await appDb
-        .from('institute_daily_status')
-        .select('date_key,payload')
-        .eq('institute_id', _instituteId!)
-        .eq('student_id', InstituteStatusService.kInstituteStatusStudentId)
-        .gte('date_key', startDate)
-        .lte('date_key', endDate);
-
-    final out = <String, String>{};
-    for (final raw in rows) {
-      final row = raw as Map<String, dynamic>;
-      final date = row['date_key']?.toString() ?? '';
-      if (date.isEmpty) continue;
-      final payload = row['payload'];
-      final map = payload is Map
-          ? payload.map((k, v) => MapEntry(k.toString(), v))
-          : <String, dynamic>{};
-      if (map['status']?.toString() != 'holiday') continue;
-      final reason = map['reason']?.toString().trim();
-      out[date] = reason == null || reason.isEmpty ? 'Holiday' : reason;
-    }
-    return out;
+    // Holiday system removed.
+    return <String, String>{};
   }
 
   @override

@@ -31,7 +31,6 @@ import '../widgets/support_email_footer.dart';
 import '../../services/institute_lecture_timing_service.dart';
 import '../../services/b2b_storage_service.dart';
 import '../../services/institute_realtime_sync_service.dart';
-import '../../services/institute_status_service.dart';
 import '../../services/stale_attendance_reconciliation_service.dart';
 import '../../services/geofence_service.dart';
 
@@ -46,17 +45,12 @@ class AdminHomeScreen extends StatefulWidget {
 class _AdminHomeScreenState extends State<AdminHomeScreen> with TickerProviderStateMixin {
   final AuthService _authService = AuthService();
   final InstituteLectureTimingService _lectureTimingService = InstituteLectureTimingService();
-  final InstituteStatusService _statusService = InstituteStatusService();
   String? _instituteId;
   bool _isLoadingInstitute = true;
   Map<String, dynamic>? _instituteTiming;
   Map<String, dynamic>? _instituteData;
 
-  // Institute open/close/holiday status for today
-  Map<String, dynamic>? _todayStatus;
-  bool _isChangingStatus = false;
-  bool _isAutoMarkingAbsent = false;
-  Timer? _midnightTimer;
+  // Institute open/close/holiday removed: attendance is always available every day.
   StreamSubscription<InstituteSyncEvent>? _syncSubscription;
   Timer? _syncDebounce;
   
@@ -107,7 +101,6 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> with TickerProviderSt
 
   @override
   void dispose() {
-    _midnightTimer?.cancel();
     _syncDebounce?.cancel();
     _syncSubscription?.cancel();
     final iid = _instituteId;
@@ -157,14 +150,10 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> with TickerProviderSt
                 event.type == 'institute') {
               if (!mounted) return;
               await _loadDashboardStats();
-              if (!mounted) return;
-              await _loadTodayStatus();
             }
           });
         });
         _loadInstituteTiming(instituteId);
-        _loadTodayStatus();
-        _scheduleMidnightAutoClose();
       }
       if (mounted) {
         setState(() => _isLoadingInstitute = false);
@@ -221,245 +210,7 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> with TickerProviderSt
     }
   }
 
-  Future<void> _loadTodayStatus() async {
-    if (_instituteId == null) return;
-    try {
-      final status = await _statusService.getTodayStatus(_instituteId!);
-      if (mounted) setState(() => _todayStatus = status);
-
-      // AUTO-OPEN INSTITUTE 3002 (TESTING ONLY)
-      if (_instituteId == '3002' && status?['status'] == 'closed') {
-        print('🟢 Auto-opening institute 3002...');
-        await _changeInstituteStatus('open');
-      }
-    } catch (e) {
-      if (kDebugMode) debugPrint('Error loading today status: $e');
-    }
-  }
-
-  // ── Midnight auto-close ──────────────────────────────────────────────────
-
-  /// Schedule a one-shot timer that fires just after midnight so the institute
-  /// is automatically closed and all unmarked students are marked absent.
-  void _scheduleMidnightAutoClose() {
-    _midnightTimer?.cancel();
-    final now = DateTime.now();
-    // Fire 5 seconds after midnight of the next calendar day
-    final midnight =
-        DateTime(now.year, now.month, now.day + 1, 0, 0, 5);
-    final delay = midnight.difference(now);
-    _midnightTimer = Timer(delay, _performMidnightAutoClose);
-    if (kDebugMode) {
-      debugPrint(
-          '🕛 Midnight auto-close scheduled in ${delay.inMinutes} min');
-    }
-  }
-
-  Future<void> _performMidnightAutoClose() async {
-    if (!mounted) return;
-    if (_instituteId == null) return;
-    final now = DateTime.now();
-    final justEnded = DateFormat('yyyy-MM-dd').format(now.subtract(const Duration(days: 1)));
-    if (kDebugMode) debugPrint('🕛 Midnight reached — finalizing day $justEnded');
-    await _runAutoMarkAbsent(reason: 'midnight auto-absent', dateKey: justEnded);
-    await StaleAttendanceReconciliationService.ensureInstituteDateReconciled(
-      instituteId: _instituteId!,
-      dateKey: justEnded,
-    );
-    if (mounted) await _loadTodayStatus();
-    if (!mounted) return;
-    _scheduleMidnightAutoClose();
-  }
-
-  // ── Auto-mark absent on close ─────────────────────────────────────────────
-
-  Future<void> _runAutoMarkAbsent({String reason = 'institute closed', String? dateKey}) async {
-    if (_instituteId == null) return;
-    if (mounted) setState(() => _isAutoMarkingAbsent = true);
-    try {
-      final result = await _statusService
-          .markAbsentAllUnmarkedStudents(_instituteId!, dateKey: dateKey);
-      if (kDebugMode) {
-        debugPrint(
-            '✅ Auto-absent ($reason): total=${result['total']}');
-      }
-      if (mounted && (result['total'] as int? ?? 0) > 0) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text(
-              '📋 ${result['total']} student(s) automatically marked absent.'),
-          backgroundColor: AppTheme.accentOrange,
-          duration: const Duration(seconds: 4),
-        ));
-      }
-    } catch (e) {
-      if (kDebugMode) debugPrint('❌ Auto-absent error: $e');
-    } finally {
-      if (mounted) setState(() => _isAutoMarkingAbsent = false);
-    }
-  }
-
-  bool _canCloseInstituteNow() {
-    final timing = _instituteTiming;
-    if (timing == null) return true;
-    final close = timing['closeTime'];
-    if (close is! Map) return true;
-    final closeHour = (close['hour'] as int?) ?? 22;
-    final closeMinute = (close['minute'] as int?) ?? 0;
-    final now = DateTime.now();
-    final nowMinutes = now.hour * 60 + now.minute;
-    final closeMinutes = closeHour * 60 + closeMinute;
-    final windowStart = closeMinutes - 5;
-    // Close is allowed from the final 5 minutes onward until day is closed.
-    return nowMinutes >= windowStart;
-  }
-
-  String _closeButtonHelperText() {
-    final timing = _instituteTiming;
-    if (timing == null) return 'Close is available near end of day.';
-    final close = timing['closeTime'];
-    if (close is! Map) return 'Close is available near end of day.';
-    final closeHour = (close['hour'] as int?) ?? 22;
-    final closeMinute = (close['minute'] as int?) ?? 0;
-    final enableMinute = closeMinute - 5;
-    var hour = closeHour;
-    var minute = enableMinute;
-    if (minute < 0) {
-      hour = (hour - 1) % 24;
-      minute += 60;
-    }
-    final hh = hour.toString().padLeft(2, '0');
-    final mm = minute.toString().padLeft(2, '0');
-    return 'Close becomes available at $hh:$mm and stays enabled until institute is closed.';
-  }
-
-  // ── Show confirmation dialog before closing ──────────────────────────────
-
-  Future<void> _confirmCloseInstitute() async {
-    if (_instituteId == null) return;
-    if (!_canCloseInstituteNow()) {
-      ProfessionalMessaging.showWarning(
-        context,
-        title: 'Close Not Available Yet',
-        message: _closeButtonHelperText(),
-      );
-      return;
-    }
-
-    final confirmed = await showDialog<bool>(
-      context: context,
-      barrierDismissible: false,
-      builder: (ctx) => AlertDialog(
-        shape:
-            RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: Row(
-          children: [
-            Icon(Icons.warning_amber_rounded,
-                color: AppTheme.accentRed, size: 28),
-            const SizedBox(width: 10),
-            const Expanded(
-              child: Text(
-                'Close Institute for Today?',
-                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-              ),
-            ),
-          ],
-        ),
-        content: const Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              'Closing the institute will immediately:',
-              style: TextStyle(fontWeight: FontWeight.w600),
-            ),
-            SizedBox(height: 8),
-            Text('• Students with entry but NO exit → marked Absent'),
-            Text('• Students with NO entry at all → marked Absent'),
-            SizedBox(height: 12),
-            Text(
-              'This action cannot be undone for today.',
-              style: TextStyle(color: Colors.red, fontWeight: FontWeight.w500),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(ctx).pop(false),
-            child: const Text('Cancel'),
-          ),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(
-              backgroundColor: AppTheme.accentRed,
-              foregroundColor: Colors.white,
-              shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(10)),
-            ),
-            onPressed: () => Navigator.of(ctx).pop(true),
-            child: const Text('Yes, Close & Mark Absent'),
-          ),
-        ],
-      ),
-    );
-
-    if (confirmed != true) return;
-    await _changeInstituteStatus('closed');
-  }
-
-  // ── Status change ─────────────────────────────────────────────────────────
-
-  Future<void> _changeInstituteStatus(String newStatus, {String? holidayReason}) async {
-    if (_instituteId == null || _isChangingStatus) return;
-    if (mounted) setState(() => _isChangingStatus = true);
-    try {
-      Map<String, dynamic> result;
-      if (newStatus == 'open') {
-        result = await _statusService.markOpen(_instituteId!);
-      } else if (newStatus == 'holiday') {
-        result = await _statusService.markHoliday(_instituteId!, reason: holidayReason ?? 'Holiday');
-      } else {
-        result = await _statusService.markClosed(_instituteId!);
-      }
-      if (!mounted) return;
-      if (result['success'] == true) {
-        await _loadTodayStatus();
-        if (newStatus == 'closed' || newStatus == 'holiday') {
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-              content: Text(newStatus == 'holiday'
-                  ? '🏖️ Today marked as Holiday. No attendance will be marked.'
-                  : '🔴 Institute marked as Closed. Marking absent now...'),
-              backgroundColor: newStatus == 'holiday'
-                  ? AppTheme.accentOrange
-                  : AppTheme.accentRed,
-              duration: const Duration(seconds: 3),
-            ));
-          }
-          // Auto-mark all unmarked students as absent
-          if (newStatus == 'closed') {
-            await _runAutoMarkAbsent();
-          }
-        }
-      } else {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-            content: Text(result['message'] ?? 'Failed to update status'),
-            backgroundColor: AppTheme.accentRed,
-          ));
-        }
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text('Error: ${e.toString()}'),
-          backgroundColor: AppTheme.accentRed,
-        ));
-      }
-    } finally {
-      if (mounted) setState(() => _isChangingStatus = false);
-    }
-  }
-
-  bool _isOpenHolidayDecisionLocked() => _todayStatus?['dayDecisionLocked'] == true;
+  // Institute status (open/close/holiday) removed.
 
   Future<void> _confirmOneWayDecision({
     required String actionLabel,
@@ -645,11 +396,7 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> with TickerProviderSt
                             if (_instituteId != null && _instituteData != null)
                               SizedBox(height: 16.h),
 
-                            // ── Institute Open / Close / Holiday ── FIRST ──
-                            if (_instituteId != null)
-                              _buildInstituteStatusCard(isDark),
-                            if (_instituteId != null)
-                              SizedBox(height: 16.h),
+                            // Institute Open/Close/Holiday removed (attendance always open)
 
                             // Date and Clock Times
                             _buildDateAndClockTimes(isDark),
@@ -1739,6 +1486,8 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> with TickerProviderSt
     );
   }
 
+  /*
+  // Institute open/close/holiday UI removed.
   Widget _buildInstituteStatusCard(bool isDark) {
     final status = _todayStatus?['status'] as String? ?? 'unknown';
     final isDayFinalized = _todayStatus?['dayFinalized'] == true;
@@ -2095,6 +1844,7 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> with TickerProviderSt
       ),
     );
   }
+  */
 
   Widget _buildQuickActions(bool isDark) {
     return LayoutBuilder(

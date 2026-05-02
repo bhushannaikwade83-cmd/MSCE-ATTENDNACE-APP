@@ -58,11 +58,17 @@ double attendanceCreditedHours(Duration seated, {double maxHours = 2.5}) {
 }
 
 double attendanceAllocatedHoursForSubjectCount(int subjectCount) {
-  if (subjectCount <= 1) return 1.0;
-  if (subjectCount == 2) return 2.5;
-  if (subjectCount == 3) return 3.5;
-  return 4.5;
+  // Strict policy: credited hours are based on allotted subject count.
+  // 1 subject = 2h, 2 = 4h, 3 = 6h, 4+ = 8h.
+  if (subjectCount <= 1) return 2.0;
+  if (subjectCount == 2) return 4.0;
+  if (subjectCount == 3) return 6.0;
+  return 8.0;
 }
+
+/// Max allowed time window (in hours) from Entry → Exit.
+double attendanceAllowedWindowHoursForSubjectCount(int subjectCount) =>
+    attendanceAllocatedHoursForSubjectCount(subjectCount);
 
 /// Seated time for one merged calendar-day attendance row (`entryTime` / `exitTime` / `hours`).
 Duration? seatedDurationFromMergedAttendanceDay(Map<String, dynamic> record) {

@@ -2671,6 +2671,27 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
           );
           return;
         }
+        // Strict window: Exit must be within allowed hours from Entry.
+        if (!useSubjects && ex != null) {
+          final entryTime = _asDateTime(ex['entryTime']) ?? _asDateTime(ex['timestamp']);
+          if (entryTime != null) {
+            final allowedH = attendanceAllowedWindowHoursForSubjectCount(studentEnrolledSubjects.length);
+            final deadline = entryTime.toUtc().add(Duration(minutes: (allowedH * 60).round()));
+            if (DateTime.now().toUtc().isAfter(deadline)) {
+              setState(() => isLoading = false);
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text(
+                    '⛔ Exit time window passed (${allowedH.toStringAsFixed(0)}h from entry). Attendance will be auto-credited without exit photo.',
+                  ),
+                  backgroundColor: Colors.orange,
+                  duration: const Duration(seconds: 6),
+                ),
+              );
+              return;
+            }
+          }
+        }
         if (hasExit) {
           setState(() => isLoading = false);
           ScaffoldMessenger.of(context).showSnackBar(
@@ -2765,7 +2786,12 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
         } else if (ex != null) {
           entryUtc = _asDateTime(ex['entryTime']) ?? _asDateTime(ex['timestamp']);
         }
-        if (entryUtc != null && isPastAttendanceExitDeadline(entryUtc.toUtc(), DateTime.now().toUtc())) {
+        if (entryUtc != null &&
+            isPastAttendanceExitDeadline(
+              entryUtc.toUtc(),
+              DateTime.now().toUtc(),
+              studentEnrolledSubjects.length,
+            )) {
           Map<String, dynamic>? repaired = ex;
           if (studentEnrolledSubjects.isNotEmpty) {
             repaired = await StaleAttendanceReconciliationService.ensureReconciled(
@@ -3092,15 +3118,17 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
         attendanceData['lectures'] = lectures;
         attendanceData['status'] = 'present'; // Mark as present when exit photo taken
 
-        // Calculate hours from entry and exit times (raw seated vs credited max 2.5h/day).
+        // Calculate hours from entry and exit times.
+        // Strict rule: credit actual duration if within allowed window (capped to the window).
         if (entryTime != null) {
           final entryDateTime = entryTime;
           final exitDateTime = currentTime;
           final duration = exitDateTime.difference(entryDateTime);
           final rawH = duration.inSeconds / 3600.0;
           attendanceData['hoursRaw'] = double.parse(rawH.toStringAsFixed(6));
-          attendanceData['hours'] =
-              attendanceAllocatedHoursForSubjectCount(studentEnrolledSubjects.length);
+          final maxH = attendanceAllowedWindowHoursForSubjectCount(studentEnrolledSubjects.length);
+          final credited = rawH > maxH ? maxH : rawH;
+          attendanceData['hours'] = double.parse(credited.toStringAsFixed(6));
         }
       }
 

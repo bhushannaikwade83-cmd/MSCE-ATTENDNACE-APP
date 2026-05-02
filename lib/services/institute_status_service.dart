@@ -33,21 +33,13 @@ class InstituteStatusService {
 
   /// Get today's institute status (merged with top-level row fields).
   Future<Map<String, dynamic>?> getTodayStatus(String instituteId) async {
-    try {
-      final today = DateFormat('yyyy-MM-dd').format(DateTime.now());
-      final payload = await _rowPayload(instituteId, today);
-      // New day default: closed until admin explicitly chooses Open or Holiday.
-      return payload ??
-          <String, dynamic>{
-            'status': 'closed',
-            'date': today,
-            'autoDefaultClosed': true,
-            'dayDecisionLocked': false,
-          };
-    } catch (e) {
-      if (kDebugMode) debugPrint('❌ Error getting today status: $e');
-      return null;
-    }
+    // Status system removed: attendance is always available every day.
+    final today = DateFormat('yyyy-MM-dd').format(DateTime.now());
+    return <String, dynamic>{
+      'status': 'open',
+      'date': today,
+      'statusSystemDisabled': true,
+    };
   }
 
   Future<void> _upsertStatus(String instituteId, String today, Map<String, dynamic> payload) async {
@@ -64,175 +56,30 @@ class InstituteStatusService {
 
   /// Mark institute as open for today
   Future<Map<String, dynamic>> markOpen(String instituteId) async {
-    try {
-      final user = _db.auth.currentUser;
-      if (user == null) {
-        return {'success': false, 'message': 'User not authenticated'};
-      }
-
-      final today = DateFormat('yyyy-MM-dd').format(DateTime.now());
-      final now = DateTime.now().toUtc().toIso8601String();
-
-      final prev = await _rowPayload(instituteId, today);
-      final currentStatus = prev?['status']?.toString();
-      final isDecisionLocked = prev?['dayDecisionLocked'] == true;
-      if (isDecisionLocked || currentStatus == 'open' || currentStatus == 'holiday') {
-        return {
-          'success': false,
-          'message': 'Today\'s status is already finalized. Open/Holiday cannot be changed now.'
-        };
-      }
-      await _upsertStatus(instituteId, today, {
-        ...?prev,
-        'status': 'open',
-        'dayDecisionLocked': true,
-        'dayDecisionType': 'open',
-        'dayDecisionAt': now,
-        'openedAt': now,
-        'openedBy': user.id,
-        'date': today,
-        'updatedAt': now,
-      });
-
-      if (kDebugMode) debugPrint('✅ Institute marked as open for $today');
-
-      return {'success': true, 'message': 'Institute marked as open'};
-    } catch (e) {
-      if (kDebugMode) debugPrint('❌ Error marking institute as open: $e');
-      return {'success': false, 'message': 'Error: ${e.toString()}'};
-    }
+    return {'success': true, 'message': 'Status system disabled (always open)'};
   }
 
   /// Mark institute as closed for today
   Future<Map<String, dynamic>> markClosed(String instituteId) async {
-    try {
-      final user = _db.auth.currentUser;
-      if (user == null) {
-        return {'success': false, 'message': 'User not authenticated'};
-      }
-
-      final today = DateFormat('yyyy-MM-dd').format(DateTime.now());
-      final now = DateTime.now().toUtc().toIso8601String();
-
-      final currentStatus = await getTodayStatus(instituteId);
-      final wasOpen = currentStatus?['status'] == 'open';
-
-      final prev = await _rowPayload(instituteId, today);
-      await _upsertStatus(instituteId, today, {
-        ...?prev,
-        'status': 'closed',
-        'closedAt': now,
-        'closedBy': user.id,
-        'dayFinalized': true,
-        'date': today,
-        'wasOpen': wasOpen,
-        'updatedAt': now,
-      });
-
-      if (kDebugMode) debugPrint('✅ Institute marked as closed for $today');
-
-      return {'success': true, 'message': 'Institute marked as closed'};
-    } catch (e) {
-      if (kDebugMode) debugPrint('❌ Error marking institute as closed: $e');
-      return {'success': false, 'message': 'Error: ${e.toString()}'};
-    }
+    return {'success': true, 'message': 'Status system disabled (always open)'};
   }
 
   /// Mark today as holiday
   Future<Map<String, dynamic>> markHoliday(String instituteId, {String? reason}) async {
-    try {
-      final user = _db.auth.currentUser;
-      if (user == null) {
-        return {'success': false, 'message': 'User not authenticated'};
-      }
-
-      final today = DateFormat('yyyy-MM-dd').format(DateTime.now());
-      final now = DateTime.now().toUtc().toIso8601String();
-
-      final prev = await _rowPayload(instituteId, today);
-      final currentStatus = prev?['status']?.toString();
-      final isDecisionLocked = prev?['dayDecisionLocked'] == true;
-      if (isDecisionLocked || currentStatus == 'open' || currentStatus == 'holiday') {
-        return {
-          'success': false,
-          'message': 'Today\'s status is already finalized. Open/Holiday cannot be changed now.'
-        };
-      }
-      await _upsertStatus(instituteId, today, {
-        ...?prev,
-        'status': 'holiday',
-        'dayDecisionLocked': true,
-        'dayDecisionType': 'holiday',
-        'dayDecisionAt': now,
-        'markedAt': now,
-        'markedBy': user.id,
-        'date': today,
-        'reason': reason ?? 'Holiday',
-        'updatedAt': now,
-      });
-
-      if (kDebugMode) debugPrint('✅ Institute marked as holiday for $today');
-
-      return {'success': true, 'message': 'Institute marked as holiday'};
-    } catch (e) {
-      if (kDebugMode) debugPrint('❌ Error marking institute as holiday: $e');
-      return {'success': false, 'message': 'Error: ${e.toString()}'};
-    }
+    return {'success': true, 'message': 'Status system disabled (no holidays)'};
   }
 
   /// Auto-close institute if not manually closed
   Future<Map<String, dynamic>> autoClose(String instituteId) async {
-    try {
-      final today = DateFormat('yyyy-MM-dd').format(DateTime.now());
-      final now = DateTime.now().toUtc().toIso8601String();
-
-      final currentStatus = await getTodayStatus(instituteId);
-      if (currentStatus != null) {
-        final status = currentStatus['status'] as String?;
-        if (status == 'closed' || status == 'holiday') {
-          return {'success': true, 'message': 'Already closed or holiday'};
-        }
-      }
-
-      final prev = await _rowPayload(instituteId, today);
-      await _upsertStatus(instituteId, today, {
-        ...?prev,
-        'status': 'closed',
-        'closedAt': now,
-        'closedBy': 'system',
-        'dayFinalized': true,
-        'autoClosed': true,
-        'date': today,
-        'updatedAt': now,
-      });
-
-      if (kDebugMode) debugPrint('✅ Institute auto-closed for $today');
-
-      return {'success': true, 'message': 'Institute auto-closed'};
-    } catch (e) {
-      if (kDebugMode) debugPrint('❌ Error auto-closing institute: $e');
-      return {'success': false, 'message': 'Error: ${e.toString()}'};
-    }
+    return {'success': true, 'message': 'Status system disabled (no auto-close)'};
   }
 
   Future<bool> isHoliday(String instituteId) async {
-    try {
-      final status = await getTodayStatus(instituteId);
-      return status?['status'] == 'holiday';
-    } catch (e) {
-      if (kDebugMode) debugPrint('❌ Error checking holiday status: $e');
-      return false;
-    }
+    return false;
   }
 
   Future<bool> isOpen(String instituteId) async {
-    try {
-      final status = await getTodayStatus(instituteId);
-      return status?['status'] == 'open';
-    } catch (e) {
-      if (kDebugMode) debugPrint('❌ Error checking open status: $e');
-      return false;
-    }
+    return true;
   }
 
   Future<String?> attendanceBlockMessage(String instituteId) async {

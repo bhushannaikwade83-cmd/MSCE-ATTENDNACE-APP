@@ -3,7 +3,7 @@ import 'time_parse.dart';
 /// Subject buckets in teacher_attendance.payload (`subjectSessions`).
 const String kSubjectSessionsPayloadKey = 'subjectSessions';
 
-/// Exit remains open until the calendar day changes locally.
+/// Legacy constant (kept for compatibility).
 const double kAttendanceExitDeadlineHours = 24;
 
 /// Legacy helper constant used by some notification codepaths.
@@ -13,21 +13,16 @@ const double kAttendanceExitDeadlineHours = 24;
 /// satisfy older callers that add a fixed duration to an entry timestamp.
 const Duration kAttendanceExitDeadlineDuration = Duration(hours: 24);
 
-bool isPastAttendanceExitDeadline(DateTime entryUtc, DateTime nowUtc) {
-  final entryLocal = entryUtc.toLocal();
-  final nowLocal = nowUtc.toLocal();
-  final entryDay = DateTime(entryLocal.year, entryLocal.month, entryLocal.day);
-  final nowDay = DateTime(nowLocal.year, nowLocal.month, nowLocal.day);
-  return nowDay.isAfter(entryDay);
+/// Strict rule: Exit must be taken within a fixed window from Entry based on
+/// allotted subject count (1 subject=2h, 2=4h, 3=6h, 4+=8h).
+bool isPastAttendanceExitDeadline(DateTime entryUtc, DateTime nowUtc, int subjectCount) {
+  final allowedHours = attendanceAllowedWindowHoursForSubjectCount(subjectCount);
+  final allowed = Duration(minutes: (allowedHours * 60).round());
+  return nowUtc.toUtc().isAfter(entryUtc.toUtc().add(allowed));
 }
 
-/// When exit is missing past [kAttendanceExitDeadlineHours], each affected session is
-/// closed administratively with this credited hour value (subject rows are display-only).
-const double kMissingExitCreditedHours = 1.0;
-
-String autoClosedMissingExitNote() =>
-    'No exit before midnight — credited '
-    '${kMissingExitCreditedHours}h without exit photo.';
+String autoClosedMissingExitNote(double creditedHours) =>
+    'No exit within allowed window — credited ${creditedHours}h without exit photo.';
 
 /// Prefer subjects whose name mentions 30, then 40, then 50 (word boundary).
 int subjectAutoClosePriority(String subjectName) {
@@ -155,7 +150,7 @@ AttendanceAutoCloseApplyResult _applySubjectSessions(
     if (sessionHasExitMap(sess)) continue;
     final entry = parseAnyTimestamp(sess['entryTime']) ?? parseAnyTimestamp(sess['timestamp']);
     if (entry == null) continue;
-    if (!isPastAttendanceExitDeadline(entry, nowUtc)) continue;
+    if (!isPastAttendanceExitDeadline(entry, nowUtc, enrolledSubjects.length)) continue;
     stale.add(sub);
   }
 
@@ -184,10 +179,11 @@ AttendanceAutoCloseApplyResult _applySubjectSessions(
     sess.remove('exitPhotoPath');
     sess.remove('exitPhotoFileId');
     sess['hoursRaw'] = double.parse(rawH.toStringAsFixed(6));
-    sess['hours'] = kMissingExitCreditedHours;
+    final creditedHours = attendanceAllocatedHoursForSubjectCount(enrolledSubjects.length);
+    sess['hours'] = creditedHours;
     sess['status'] = 'present';
     sess['autoClosedMissingExit'] = true;
-    sess['autoClosedNote'] = autoClosedMissingExitNote();
+    sess['autoClosedNote'] = autoClosedMissingExitNote(creditedHours);
     mutable[sub] = sess;
 
     hints.add(
@@ -235,7 +231,7 @@ AttendanceAutoCloseApplyResult _applyLegacyTopLevel(
     return AttendanceAutoCloseApplyResult(payload: out, changed: false, syncHints: const []);
   }
 
-  if (!isPastAttendanceExitDeadline(entry, nowUtc)) {
+  if (!isPastAttendanceExitDeadline(entry, nowUtc, enrolledSubjects.length)) {
     return AttendanceAutoCloseApplyResult(payload: out, changed: false, syncHints: const []);
   }
 
@@ -253,10 +249,11 @@ AttendanceAutoCloseApplyResult _applyLegacyTopLevel(
   out.remove('exitPhotoPath');
   out.remove('exitPhotoFileId');
   out['hoursRaw'] = double.parse(rawH.toStringAsFixed(6));
-  out['hours'] = kMissingExitCreditedHours;
+  final creditedHours = attendanceAllocatedHoursForSubjectCount(enrolledSubjects.length);
+  out['hours'] = creditedHours;
   out['status'] = 'present';
   out['autoClosedMissingExit'] = true;
-  out['autoClosedNote'] = autoClosedMissingExitNote();
+  out['autoClosedNote'] = autoClosedMissingExitNote(creditedHours);
 
   return AttendanceAutoCloseApplyResult(
     payload: out,
