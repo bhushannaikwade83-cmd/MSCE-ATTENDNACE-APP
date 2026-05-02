@@ -1,13 +1,14 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_screenutil/flutter_screenutil.dart';
 import '../../core/utils/responsive.dart';
+import '../../core/utils/responsive_page.dart';
 import '../../core/theme/app_theme.dart';
 import '../widgets/enhanced_animations.dart';
+import '../../core/app_db.dart';
 import 'student_management_screen.dart';
 import 'help_desk_screen.dart';
-import 'add_student_screen.dart';
 import 'attendance_reports_screen.dart';
-import 'batch_management_screen.dart';
+import 'add_institute_attendance_user_screen.dart';
 import 'gps_settings_screen.dart';
 import 'attendance_calendar_screen.dart';
 import 'attendance_trend_screen.dart';
@@ -27,10 +28,41 @@ class FeaturesGridScreen extends StatefulWidget {
 }
 
 class _FeaturesGridScreenState extends State<FeaturesGridScreen> {
+  Map<String, dynamic>? instituteData;
+  bool isLoadingInstitute = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadInstituteData();
+  }
+
+  Future<void> _loadInstituteData() async {
+    try {
+      if (widget.instituteId != null) {
+        final instituteId = widget.instituteId!;
+        final data = await appDb
+            .from('institutes')
+            .select()
+            .eq('id', instituteId)
+            .single();
+        setState(() {
+          instituteData = data;
+          isLoadingInstitute = false;
+        });
+      } else {
+        setState(() => isLoadingInstitute = false);
+      }
+    } catch (e) {
+      print('⚠️ Error loading institute data: $e');
+      setState(() => isLoadingInstitute = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
-    
+
     return Scaffold(
       backgroundColor: isDark ? const Color(0xFF0F172A) : AppTheme.backgroundGrey,
       appBar: AppBar(
@@ -51,13 +83,97 @@ class _FeaturesGridScreenState extends State<FeaturesGridScreen> {
           maxLines: 1,
         ),
       ),
-      body: LayoutBuilder(
-        builder: (context, constraints) {
-          return SingleChildScrollView(
+      body: ResponsiveScrollBody(
             padding: Responsive.padding(context),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
+                // 🏢 Institute Information Card
+                if (!isLoadingInstitute && instituteData != null)
+                  Container(
+                    width: double.infinity,
+                    padding: EdgeInsets.all(16.r),
+                    margin: EdgeInsets.only(bottom: 20.h),
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        colors: [
+                          AppTheme.primaryBlue,
+                          AppTheme.primaryBlue.withOpacity(0.8),
+                        ],
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                      ),
+                      borderRadius: BorderRadius.circular(12.r),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withOpacity(0.1),
+                          blurRadius: 8.r,
+                          offset: Offset(0, 2.h),
+                        ),
+                      ],
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Icon(Icons.school, color: Colors.white, size: 24.sp),
+                            SizedBox(width: 12.w),
+                            Expanded(
+                              child: Text(
+                                instituteData?['name'] ?? 'Unknown Institute',
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 18.sp,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                          ],
+                        ),
+                        SizedBox(height: 12.h),
+                        Row(
+                          children: [
+                            Icon(Icons.location_on, color: Colors.white70, size: 16.sp),
+                            SizedBox(width: 8.w),
+                            Expanded(
+                              child: Text(
+                                instituteData?['address'] ?? 'Address not set',
+                                style: TextStyle(
+                                  color: Colors.white70,
+                                  fontSize: 13.sp,
+                                ),
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                          ],
+                        ),
+                        SizedBox(height: 8.h),
+                        Row(
+                          children: [
+                            Icon(Icons.badge, color: Colors.white70, size: 16.sp),
+                            SizedBox(width: 8.w),
+                            Expanded(
+                              child: Text(
+                                'ID: ${instituteData?['id'] ?? 'N/A'}',
+                                style: TextStyle(
+                                  color: Colors.white70,
+                                  fontSize: 12.sp,
+                                  fontFamily: 'monospace',
+                                ),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+
                 // Grid of Features with Staggered Animations
                 GridView.builder(
                   gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
@@ -68,17 +184,16 @@ class _FeaturesGridScreenState extends State<FeaturesGridScreen> {
                   ),
               shrinkWrap: true,
               physics: const NeverScrollableScrollPhysics(),
-              itemCount: 8,
+              itemCount: 7,
               itemBuilder: (context, index) {
                 final features = [
                   {'title': 'Help Desk', 'icon': Icons.support_agent, 'color': AppTheme.primaryBlue, 'screen': const HelpDeskScreen()},
                   {'title': 'Students', 'icon': Icons.school, 'color': AppTheme.primaryGreen, 'screen': const StudentManagementScreen()},
                   {'title': 'Reports', 'icon': Icons.bar_chart, 'color': AppTheme.accentOrange, 'screen': const AttendanceReportsScreen()},
                   {'title': 'Calendar', 'icon': Icons.calendar_today, 'color': AppTheme.primaryBlue, 'screen': widget.instituteId != null ? AttendanceCalendarScreen(instituteId: widget.instituteId!) : null},
-                  {'title': 'Batches', 'icon': Icons.groups, 'color': AppTheme.primaryGreen, 'screen': const BatchManagementScreen()},
+                  {'title': 'Institute instructor', 'icon': Icons.person_add_alt_1, 'color': AppTheme.primaryGreen, 'screen': const AddInstituteAttendanceUserScreen()},
                   {'title': 'Settings', 'icon': Icons.settings, 'color': AppTheme.accentOrange, 'screen': const GpsSettingsScreen()},
                   {'title': 'Trends', 'icon': Icons.show_chart, 'color': AppTheme.primaryBlue, 'screen': widget.instituteId != null ? AttendanceTrendScreen(instituteId: widget.instituteId!) : null},
-                  {'title': 'Add Student', 'icon': Icons.person_add, 'color': AppTheme.primaryGreen, 'screen': const AddStudentScreen()},
                 ];
                 
                 final feature = features[index];
@@ -101,8 +216,6 @@ class _FeaturesGridScreenState extends State<FeaturesGridScreen> {
             ),
               ],
             ),
-          );
-        },
       ),
     );
   }

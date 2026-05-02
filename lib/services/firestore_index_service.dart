@@ -9,22 +9,20 @@ class FirestoreIndexService {
   static const String _indexCheckKey = 'firestore_index_checked';
   static const String _indexCreatedKey = 'firestore_index_created';
 
-  /// Verifies a simple indexed query on `batches` succeeds.
+  /// Verifies a simple indexed query on `students` succeeds.
   static Future<Map<String, dynamic>> checkIndexesNeeded({
     required String instituteId,
   }) async {
     try {
       await appDb
-          .from('batches')
+          .from('students')
           .select('id')
           .eq('institute_id', instituteId)
-          .eq('year', '2026')
-          .eq('timing', '08:00 - 09:00')
           .limit(1)
           .maybeSingle();
 
       if (kDebugMode) {
-        debugPrint('✅ Batch query OK (indexes assumed from SQL migrations)');
+        debugPrint('✅ Students query OK (indexes assumed from SQL migrations)');
       }
 
       return {

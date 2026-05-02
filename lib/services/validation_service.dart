@@ -14,13 +14,24 @@ class ValidationService {
   // Name validation (letters, spaces, dots, max 100 chars)
   static final RegExp _nameRegex = RegExp(r'^[a-zA-Z\s\.]{1,100}$');
 
+  /// First / middle / last name on student registration (all required).
+  static String? validateRequiredNamePart(String? value, String label) {
+    if (value == null || value.trim().isEmpty) {
+      return '$label is required';
+    }
+    final t = value.trim();
+    if (t.length > 80) {
+      return '$label is too long (max 80 characters)';
+    }
+    if (!_nameRegex.hasMatch(t)) {
+      return '$label: use letters, spaces, or dots only';
+    }
+    return null;
+  }
+
   // Institute ID validation (alphanumeric, max 50 chars)
   static final RegExp _instituteIdRegex = RegExp(r'^[A-Za-z0-9_-]{1,50}$');
 
-  // Subject validation (letters, spaces, numbers, max 50 chars)
-  static final RegExp _subjectRegex = RegExp(r'^[A-Za-z0-9\s]{1,50}$');
-
-  /// Validate email format
   static String? validateEmail(String? email) {
     if (email == null || email.isEmpty) {
       return 'Email is required';
@@ -80,6 +91,8 @@ class ValidationService {
       'password',
       'password123',
       '12345678',
+      '87654321',
+      '11111111',
       'qwerty',
       'abc123',
     ];
@@ -151,20 +164,30 @@ class ValidationService {
     return null;
   }
 
-  /// Validate subject name
+  /// Validate subject label for uploads and forms.
+  ///
+  /// Allows Unicode names (e.g. Marathi). Only path-injection characters are blocked.
+  /// [B2BStorageService.generatePhotoPath] normalizes the string for the object key.
   static String? validateSubject(String? subject) {
     if (subject == null || subject.isEmpty) {
       return 'Subject is required';
     }
 
     subject = sanitizeInput(subject);
-
-    if (subject.length > 50) {
-      return 'Subject name is too long (max 50 characters)';
+    if (subject.isEmpty) {
+      return 'Subject is required';
     }
 
-    if (!_subjectRegex.hasMatch(subject)) {
-      return 'Subject name can only contain letters, numbers, and spaces';
+    const maxLen = 120;
+    if (subject.length > maxLen) {
+      return 'Subject name is too long (max $maxLen characters)';
+    }
+
+    if (subject.contains('/') || subject.contains('\\')) {
+      return 'Subject name cannot contain slashes';
+    }
+    if (subject.contains('..')) {
+      return 'Subject name cannot contain ..';
     }
 
     return null;
@@ -348,40 +371,5 @@ class ValidationService {
     }
 
     return false;
-  }
-
-  /// Normalize batch name for case-insensitive matching
-  /// Removes common words like "batch", "class", "group", "section", etc.
-  /// "Morning Batch", "Morning Class", "morning", "Morning Group" all become "morning"
-  static String normalizeBatchName(String batchName) {
-    if (batchName.isEmpty) return batchName;
-    
-    // Convert to lowercase
-    String normalized = batchName.toLowerCase();
-    
-    // Remove extra spaces
-    normalized = normalized.replaceAll(RegExp(r'\s+'), ' ').trim();
-    
-    // Remove common batch-related words (case-insensitive)
-    // This allows "Morning Batch", "Morning Class", "Morning Group", "Morning Section" to all match
-    // All variations like "Morning Batch", "Morning Class", "morning", "Morning Group" become "morning"
-    final commonWords = [
-      'batch', 'class', 'group', 'section', 'division', 'unit',
-    ];
-    
-    // Remove each common word (using Set to get unique words only)
-    for (var word in commonWords.toSet()) {
-      normalized = normalized.replaceAll(RegExp(r'\b' + word + r'\b'), '').trim();
-    }
-    
-    // Remove any remaining extra spaces
-    normalized = normalized.replaceAll(RegExp(r'\s+'), ' ').trim();
-    
-    return normalized;
-  }
-
-  /// Check if two batch names match (case-insensitive, ignoring "batch" word)
-  static bool batchNamesMatch(String batchName1, String batchName2) {
-    return normalizeBatchName(batchName1) == normalizeBatchName(batchName2);
   }
 }

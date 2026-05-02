@@ -2,13 +2,14 @@ import 'package:flutter/material.dart';
 import 'dart:math' as math;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_screenutil/flutter_screenutil.dart';
-import '../../services/biometric_service.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'app_permissions_screen.dart';
 import 'login_screen.dart';
 import 'onboarding_screen.dart';
 import 'biometric_lock_screen.dart';
-import 'main_navigation_screen.dart';
 import '../../core/theme/app_theme.dart';
+import '../../core/utils/responsive.dart';
+import '../../services/app_permissions_service.dart';
 import 'package:smart_attendance_app/l10n/app_localizations.dart';
 
 class SplashScreen extends StatefulWidget {
@@ -130,20 +131,26 @@ class _SplashScreenState extends State<SplashScreen>
     await Future.delayed(const Duration(milliseconds: 3200));
     if (!mounted) return;
 
-    final user = Supabase.instance.client.auth.currentUser;
-    if (user != null) {
-      final isBiometricEnabled = await BiometricService.isBiometricEnabled();
+    final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
+
+    final permissionsDone =
+        prefs.getBool(AppPermissionsService.prefKeySetupDone) ?? false;
+    if (AppPermissionsService.shouldRunPermissionGate &&
+        !permissionsDone) {
       if (!mounted) return;
-      if (isBiometricEnabled) {
-        Navigator.pushReplacementNamed(context, BiometricLockScreen.routeName);
-        return;
-      } else {
-        Navigator.pushReplacementNamed(context, MainNavigationScreen.routeName);
-        return;
-      }
+      Navigator.pushReplacementNamed(context, AppPermissionsScreen.routeName);
+      return;
     }
 
-    final prefs = await SharedPreferences.getInstance();
+    final user = Supabase.instance.client.auth.currentUser;
+    if (user != null) {
+      // Every cold start: require PIN (and offer biometric if enabled on device)
+      if (!mounted) return;
+      Navigator.pushReplacementNamed(context, BiometricLockScreen.routeName);
+      return;
+    }
+
     if (!mounted) return;
     final onboardingCompleted = prefs.getBool('onboarding_completed') ?? false;
 
@@ -207,13 +214,19 @@ class _SplashScreenState extends State<SplashScreen>
                               .clamp(0.0, constraints.maxWidth - 2 * padX);
                           return SingleChildScrollView(
                             physics: const BouncingScrollPhysics(),
-                            child: ConstrainedBox(
-                              constraints: BoxConstraints(
-                                minHeight: constraints.maxHeight,
-                              ),
-                              child: Padding(
-                                padding: EdgeInsets.symmetric(horizontal: padX),
-                                child: Column(
+                            child: Center(
+                              child: ConstrainedBox(
+                                constraints: BoxConstraints(
+                                  minHeight: constraints.maxHeight,
+                                  maxWidth: Responsive.contentMaxWidth(
+                                    context,
+                                    mobile: 560,
+                                    tablet: 760,
+                                  ),
+                                ),
+                                child: Padding(
+                                  padding: EdgeInsets.symmetric(horizontal: padX),
+                                  child: Column(
                                   mainAxisAlignment: MainAxisAlignment.center,
                                   children: [
                           Transform.scale(
@@ -354,6 +367,7 @@ class _SplashScreenState extends State<SplashScreen>
                             ),
                           ),
                                   ],
+                                  ),
                                 ),
                               ),
                             ),

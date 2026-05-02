@@ -9,13 +9,11 @@ import '../../core/theme/app_theme.dart';
 /// Attendance Calendar Screen - Shows monthly calendar with attendance
 class AttendanceCalendarScreen extends StatefulWidget {
   final String instituteId;
-  final String? batchId;
   final String? rollNumber;
 
   const AttendanceCalendarScreen({
     super.key,
     required this.instituteId,
-    this.batchId,
     this.rollNumber,
   });
 
@@ -26,7 +24,8 @@ class AttendanceCalendarScreen extends StatefulWidget {
 
 class _AttendanceCalendarScreenState extends State<AttendanceCalendarScreen> {
   DateTime _selectedDate = DateTime.now();
-  DateTime _focusedDate = DateTime.now();
+  DateTime _rangeEndMonth = DateTime(DateTime.now().year, DateTime.now().month, 1);
+  int _rangeMonths = 1;
   Map<String, int> _attendanceMap = {}; // date -> count
 
   @override
@@ -36,17 +35,22 @@ class _AttendanceCalendarScreenState extends State<AttendanceCalendarScreen> {
   }
 
   Future<void> _loadAttendanceData() async {
-    final startOfMonth = DateTime(_focusedDate.year, _focusedDate.month, 1);
-    final endOfMonth = DateTime(_focusedDate.year, _focusedDate.month + 1, 0);
-    final startStr = DateFormat('yyyy-MM-dd').format(startOfMonth);
-    final endStr = DateFormat('yyyy-MM-dd').format(endOfMonth);
+    final startMonth = DateTime(
+      _rangeEndMonth.year,
+      _rangeEndMonth.month - (_rangeMonths - 1),
+      1,
+    );
+    final endMonth = DateTime(_rangeEndMonth.year, _rangeEndMonth.month + 1, 0);
+    final startStr = DateFormat('yyyy-MM-dd').format(startMonth);
+    final endStr = DateFormat('yyyy-MM-dd').format(endMonth);
 
     final code = await instituteCodeForId(widget.instituteId);
+    if (!mounted) return;
     final List<dynamic> rows;
     if (widget.rollNumber != null && widget.rollNumber!.isNotEmpty) {
       rows = await appDb
           .from('attendance_in_out')
-          .select('attendance_date')
+          .select('attendance_date,student_id,sr_no,type,additional')
           .eq('institute_code', code)
           .gte('attendance_date', startStr)
           .lte('attendance_date', endStr)
@@ -54,22 +58,36 @@ class _AttendanceCalendarScreenState extends State<AttendanceCalendarScreen> {
     } else {
       rows = await appDb
           .from('attendance_in_out')
-          .select('attendance_date')
+          .select('attendance_date,student_id,sr_no,type,additional')
           .eq('institute_code', code)
           .gte('attendance_date', startStr)
           .lte('attendance_date', endStr);
     }
-    final Map<String, int> tempMap = {};
+    if (!mounted) return;
+    final Map<String, Set<String>> presentByDate = {};
 
     for (final r in rows) {
-      final date = r['attendance_date']?.toString();
-      if (date != null) {
-        tempMap[date] = (tempMap[date] ?? 0) + 1;
-      }
+      final data = r as Map<String, dynamic>;
+      final date = data['attendance_date']?.toString();
+      if (date == null || date.isEmpty) continue;
+      final sid = (data['student_id'] as String?)?.trim() ?? '';
+      final sr = (data['sr_no'] as String?)?.trim() ?? '';
+      final key = sid.isNotEmpty ? sid : sr;
+      if (key.isEmpty) continue;
+
+      final type = (data['type']?.toString() ?? '').toLowerCase();
+      final add = data['additional'];
+      final status = (add is Map ? add['status'] : null)?.toString().toLowerCase();
+      final isPresent = status == 'present' || (status == null && type == 'exit');
+      if (!isPresent) continue;
+
+      presentByDate.putIfAbsent(date, () => <String>{}).add(key);
     }
 
     setState(() {
-      _attendanceMap = tempMap;
+      _attendanceMap = {
+        for (final e in presentByDate.entries) e.key: e.value.length,
+      };
     });
   }
 
@@ -79,18 +97,31 @@ class _AttendanceCalendarScreenState extends State<AttendanceCalendarScreen> {
     if (widget.rollNumber != null && widget.rollNumber!.isNotEmpty) {
       rows = await appDb
           .from('attendance_in_out')
-          .select('id')
+          .select('student_id,sr_no,type,additional')
           .eq('institute_code', code)
           .eq('attendance_date', dateStr)
           .eq('sr_no', widget.rollNumber!);
     } else {
       rows = await appDb
           .from('attendance_in_out')
-          .select('id')
+          .select('student_id,sr_no,type,additional')
           .eq('institute_code', code)
           .eq('attendance_date', dateStr);
     }
-    return rows.length;
+    final presentStudents = <String>{};
+    for (final raw in rows) {
+      final row = raw as Map<String, dynamic>;
+      final sid = (row['student_id'] as String?)?.trim() ?? '';
+      final sr = (row['sr_no'] as String?)?.trim() ?? '';
+      final key = sid.isNotEmpty ? sid : sr;
+      if (key.isEmpty) continue;
+      final type = (row['type']?.toString() ?? '').toLowerCase();
+      final add = row['additional'];
+      final status = (add is Map ? add['status'] : null)?.toString().toLowerCase();
+      final isPresent = status == 'present' || (status == null && type == 'exit');
+      if (isPresent) presentStudents.add(key);
+    }
+    return presentStudents.length;
   }
 
   @override
@@ -105,25 +136,27 @@ class _AttendanceCalendarScreenState extends State<AttendanceCalendarScreen> {
             icon: const Icon(Icons.arrow_back_ios),
             onPressed: () {
               setState(() {
-                _focusedDate = DateTime(
-                  _focusedDate.year,
-                  _focusedDate.month - 1,
+                _rangeEndMonth = DateTime(
+                  _rangeEndMonth.year,
+                  _rangeEndMonth.month - 1,
+                  1,
                 );
                 _loadAttendanceData();
               });
             },
           ),
           Text(
-            DateFormat('MMMM yyyy').format(_focusedDate),
+            '${_rangeMonths}M · ${DateFormat('MMM yyyy').format(_rangeEndMonth)}',
             style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
           ),
           IconButton(
             icon: const Icon(Icons.arrow_forward_ios),
             onPressed: () {
               setState(() {
-                _focusedDate = DateTime(
-                  _focusedDate.year,
-                  _focusedDate.month + 1,
+                _rangeEndMonth = DateTime(
+                  _rangeEndMonth.year,
+                  _rangeEndMonth.month + 1,
+                  1,
                 );
                 _loadAttendanceData();
               });
@@ -133,8 +166,8 @@ class _AttendanceCalendarScreenState extends State<AttendanceCalendarScreen> {
       ),
       body: Column(
         children: [
-          // Calendar Grid
-          Expanded(child: _buildCalendarGrid(isDark)),
+          _buildRangeSelector(isDark),
+          Expanded(child: _buildRangeCalendars(isDark)),
           // Selected Date Info
           Container(
             padding: const EdgeInsets.all(20),
@@ -157,19 +190,86 @@ class _AttendanceCalendarScreenState extends State<AttendanceCalendarScreen> {
     );
   }
 
-  Widget _buildCalendarGrid(bool isDark) {
-    final firstDay = DateTime(_focusedDate.year, _focusedDate.month, 1);
-    final lastDay = DateTime(_focusedDate.year, _focusedDate.month + 1, 0);
+  Widget _buildRangeSelector(bool isDark) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 6),
+      child: Row(
+        children: [1, 3, 6].map((months) {
+          final isSelected = _rangeMonths == months;
+          return Expanded(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 4),
+              child: ChoiceChip(
+                label: Text('$months Month${months > 1 ? 's' : ''}'),
+                selected: isSelected,
+                onSelected: (_) {
+                  setState(() {
+                    _rangeMonths = months;
+                    _loadAttendanceData();
+                  });
+                },
+                selectedColor: AppTheme.primaryBlue.withValues(alpha: 0.2),
+                backgroundColor:
+                    isDark ? Colors.white.withValues(alpha: 0.06) : Colors.grey.shade100,
+              ),
+            ),
+          );
+        }).toList(),
+      ),
+    );
+  }
+
+  List<DateTime> _monthsToDisplay() {
+    final months = <DateTime>[];
+    for (int i = _rangeMonths - 1; i >= 0; i--) {
+      months.add(DateTime(_rangeEndMonth.year, _rangeEndMonth.month - i, 1));
+    }
+    return months;
+  }
+
+  Widget _buildRangeCalendars(bool isDark) {
+    final months = _monthsToDisplay();
+    return ListView.builder(
+      physics: const BouncingScrollPhysics(),
+      padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
+      itemCount: months.length,
+      itemBuilder: (context, index) => _buildCalendarGridForMonth(isDark, months[index]),
+    );
+  }
+
+  Widget _buildCalendarGridForMonth(bool isDark, DateTime monthStart) {
+    final firstDay = DateTime(monthStart.year, monthStart.month, 1);
+    final lastDay = DateTime(monthStart.year, monthStart.month + 1, 0);
     final firstDayOfWeek = firstDay.weekday;
     final daysInMonth = lastDay.day;
 
     // Weekday headers
     final weekdays = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
-    return Padding(
-      padding: const EdgeInsets.all(16),
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: isDark ? Colors.white.withValues(alpha: 0.04) : Colors.white,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(
+          color: isDark ? Colors.white.withValues(alpha: 0.1) : Colors.grey.shade300,
+        ),
+      ),
       child: Column(
         children: [
+          Align(
+            alignment: Alignment.centerLeft,
+            child: Text(
+              DateFormat('MMMM yyyy').format(monthStart),
+              style: TextStyle(
+                fontSize: 16,
+                fontWeight: FontWeight.bold,
+                color: isDark ? Colors.white : AppTheme.textDark,
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
           // Weekday headers
           Row(
             children: weekdays.map((day) {
@@ -191,8 +291,10 @@ class _AttendanceCalendarScreenState extends State<AttendanceCalendarScreen> {
           ),
           const SizedBox(height: 8),
           // Calendar days
-          Expanded(
+          SizedBox(
+            height: 230,
             child: GridView.builder(
+              physics: const NeverScrollableScrollPhysics(),
               gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
                 crossAxisCount: 7,
                 childAspectRatio: 1,
@@ -207,8 +309,8 @@ class _AttendanceCalendarScreenState extends State<AttendanceCalendarScreen> {
 
                 final day = index - firstDayOfWeek + 2;
                 final date = DateTime(
-                  _focusedDate.year,
-                  _focusedDate.month,
+                  monthStart.year,
+                  monthStart.month,
                   day,
                 );
                 final dateStr = DateFormat('yyyy-MM-dd').format(date);
@@ -316,8 +418,8 @@ class _AttendanceCalendarScreenState extends State<AttendanceCalendarScreen> {
             const SizedBox(height: 12),
             Text(
               hasAttendance
-                  ? '$count attendance record${count > 1 ? 's' : ''} marked'
-                  : 'No attendance marked',
+                  ? '$count student${count > 1 ? 's' : ''} present'
+                  : 'No student present',
               style: TextStyle(
                 fontSize: 14,
                 color: isDark

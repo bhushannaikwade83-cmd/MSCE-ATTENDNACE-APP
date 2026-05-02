@@ -3,6 +3,7 @@ import 'package:geolocator/geolocator.dart';
 import 'package:intl/intl.dart';
 import 'package:flutter_screenutil/flutter_screenutil.dart';
 import '../../core/utils/responsive.dart';
+import '../../core/utils/responsive_page.dart';
 import '../../core/theme/app_theme.dart';
 
 /// Modern Attendance Check-in Screen - Similar to the reference design
@@ -51,7 +52,7 @@ class _ModernAttendanceScreenState extends State<ModernAttendanceScreen> {
 
   void _handleCheckIn() {
     setState(() {
-      _checkInTime = DateFormat('hh:mm a').format(DateTime.now());
+      _checkInTime = DateFormat('HH:mm').format(DateTime.now());
     });
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
@@ -72,7 +73,7 @@ class _ModernAttendanceScreenState extends State<ModernAttendanceScreen> {
   @override
   Widget build(BuildContext context) {
     final now = DateTime.now();
-    final currentTime = DateFormat('hh:mm a').format(now);
+    final currentTime = DateFormat('HH:mm').format(now);
     final currentDate = DateFormat('EEEE, MMMM-dd, yyyy').format(now);
 
     return Scaffold(
@@ -95,7 +96,7 @@ class _ModernAttendanceScreenState extends State<ModernAttendanceScreen> {
           ),
         ],
       ),
-      body: SingleChildScrollView(
+      body: ResponsiveScrollBody(
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -142,12 +143,16 @@ class _ModernAttendanceScreenState extends State<ModernAttendanceScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(
+                  FittedBox(
+                    fit: BoxFit.scaleDown,
+                    alignment: Alignment.centerLeft,
+                    child: Text(
                     currentTime,
                     style: const TextStyle(
                       fontSize: 48,
                       fontWeight: FontWeight.bold,
                       color: AppTheme.primaryBlue,
+                    ),
                     ),
                   ),
                   const SizedBox(height: 8),
@@ -170,8 +175,8 @@ class _ModernAttendanceScreenState extends State<ModernAttendanceScreen> {
               child: GestureDetector(
                 onTap: _handleCheckIn,
                 child: Container(
-                  width: 200,
-                  height: 200,
+                  width: Responsive.pctShortestSide(context, 0.42).clamp(160.0, 220.0),
+                  height: Responsive.pctShortestSide(context, 0.42).clamp(160.0, 220.0),
                   decoration: BoxDecoration(
                     color: Colors.white,
                     shape: BoxShape.circle,
@@ -192,7 +197,7 @@ class _ModernAttendanceScreenState extends State<ModernAttendanceScreen> {
                     children: [
                       Icon(
                         Icons.fingerprint,
-                        size: 80,
+                        size: Responsive.pctShortestSide(context, 0.17).clamp(56.0, 84.0),
                         color: AppTheme.primaryBlue,
                       ),
                       const SizedBox(height: 12),

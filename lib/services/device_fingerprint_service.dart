@@ -15,10 +15,15 @@ class DeviceFingerprintService {
   static Future<Map<String, dynamic>> getDeviceFingerprint() async {
     try {
       if (kIsWeb) {
+        const webId = 'web_browser';
         return {
           'platform': 'web',
-          'userAgent': 'web_browser',
-          'fingerprint': _generateFingerprint('web', 'web_browser'),
+          'userAgent': webId,
+          'fingerprint': _generateFingerprint(
+            platform: 'web',
+            stableId: webId,
+            model: webId,
+          ),
         };
       }
 
@@ -38,8 +43,11 @@ class DeviceFingerprintService {
           'hardware': androidInfo.hardware,
           'androidId': androidInfo.id,
           'fingerprint': _generateFingerprint(
-            androidInfo.id,
-            '${androidInfo.manufacturer}_${androidInfo.model}',
+            platform: 'android',
+            stableId: androidInfo.id,
+            model: androidInfo.model,
+            manufacturer: androidInfo.manufacturer,
+            brand: androidInfo.brand,
           ),
         };
       } else if (Platform.isIOS) {
@@ -52,8 +60,10 @@ class DeviceFingerprintService {
           'systemName': iosInfo.systemName,
           'systemVersion': iosInfo.systemVersion,
           'fingerprint': _generateFingerprint(
-            iosInfo.identifierForVendor ?? 'unknown',
-            iosInfo.model,
+            platform: 'ios',
+            stableId: iosInfo.identifierForVendor ?? 'unknown',
+            model: iosInfo.model,
+            manufacturer: iosInfo.name,
           ),
         };
       }
@@ -79,8 +89,23 @@ class DeviceFingerprintService {
   }
 
   /// Generate a unique fingerprint hash
-  static String _generateFingerprint(String deviceId, String model) {
-    final bytes = utf8.encode('$deviceId|$model|${DateTime.now().millisecondsSinceEpoch}');
+  static String _generateFingerprint({
+    required String platform,
+    required String stableId,
+    required String model,
+    String? manufacturer,
+    String? brand,
+  }) {
+    // Keep this deterministic for a given device installation profile.
+    // Do not include time-based values, otherwise every call appears as a new device.
+    final seed = [
+      platform.trim().toLowerCase(),
+      stableId.trim(),
+      model.trim().toLowerCase(),
+      (manufacturer ?? '').trim().toLowerCase(),
+      (brand ?? '').trim().toLowerCase(),
+    ].join('|');
+    final bytes = utf8.encode(seed);
     final digest = sha256.convert(bytes);
     return digest.toString().substring(0, 16); // Short hash
   }

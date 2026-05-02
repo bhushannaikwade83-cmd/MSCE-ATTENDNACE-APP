@@ -16,13 +16,14 @@ abstract final class AppUI {
       'MSCE Smart Attendance Management System';
   static const String officialBadgeLabel = 'OFFICIAL';
   static const String footerOfficialUse = 'OFFICIAL USE ONLY';
-  static const String footerCredit = 'Powered by Digitrix Media';
+  static const String footerCredit = 'Powered by MSCE - Maharashtra State Council of Education';
 
   /// In-app and launcher branding (single file to swap for a new logo).
   static const String appLogoAsset = 'assets/msce_attendance_app_logo.png';
 
   /// Width ÷ height of [appLogoAsset] in pixels (avoids cropping in square boxes).
-  static const double appLogoAspectRatio = 1376 / 768;
+  /// MSCE Pune official emblem (square).
+  static const double appLogoAspectRatio = 224 / 225;
 
   /// Caps logo width using viewport **fractions** so the logo block (with [appLogoAspectRatio])
   /// does not overflow short or landscape screens. [contentWidth] = horizontal space for the logo.
@@ -59,7 +60,7 @@ abstract final class AppUI {
   /// Subtitle under the portal header for each main bottom-nav tab (order matches bar).
   static const List<String> mainNavSecondaryLines = <String>[
     'Admin dashboard  |  प्रशासक डॅशबोर्ड',
-    'Batch management  |  तुकडी व्यवस्थापन',
+    'Instructor accounts  |  प्रशिक्षक खाती',
     'Student records  |  विद्यार्थी नोंदी',
     'GPS geofence  |  स्थान सीमा सेटिंग्ज',
     'Attendance reports  |  उपस्थिती अहवाल',
@@ -113,6 +114,12 @@ class AppTheme {
   static const Color govHeaderBlue    = Color(0xFF0D2E5F);
   static const Color govBannerSaffron = Color(0xFFFF8C00);
   static const Color govGreen         = Color(0xFF006400);
+
+  // NEW: Supporting Colors for Enhanced Design
+  static const Color primaryBlueLighter = Color(0xFFE3F2FD);
+  static const Color borderLight        = Color(0xFFD5E8F7);
+  static const Color disabledGray       = Color(0xFFE8EAED);
+  static const Color focusRing          = Color(0xFF2B5BA0);
 
   // Legacy aliases for compatibility
   static const Color accentMint       = greenLight;
@@ -617,6 +624,8 @@ class GovPortalHeader extends StatelessWidget {
                       children: [
                         Text(
                           p,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
                           style: TextStyle(
                             color: Colors.white,
                             fontSize: 13.sp,
@@ -626,6 +635,8 @@ class GovPortalHeader extends StatelessWidget {
                         ),
                         Text(
                           s,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
                           style: TextStyle(
                             color: Colors.white.withValues(alpha: 0.75),
                             fontSize: 9.5.sp,
@@ -703,21 +714,18 @@ class GovElevatedCard extends StatelessWidget {
       ),
       child: ClipRRect(
         borderRadius: BorderRadius.circular(AppUI.govCardInnerClipRadius),
-        child: IntrinsicHeight(
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              SizedBox(
+        child: DecoratedBox(
+          decoration: const BoxDecoration(
+            border: Border(
+              left: BorderSide(
+                color: AppTheme.primaryBlue,
                 width: AppUI.govCardAccentStripWidth,
-                child: const ColoredBox(color: AppTheme.primaryBlue),
               ),
-              Expanded(
-                child: Padding(
-                  padding: padding,
-                  child: child,
-                ),
-              ),
-            ],
+            ),
+          ),
+          child: Padding(
+            padding: padding,
+            child: child,
           ),
         ),
       ),
@@ -768,3 +776,46 @@ class GovPortalFooter extends StatelessWidget {
     );
   }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SPACING SYSTEM — Use this for all margins, padding, gaps (consistency)
+// ═══════════════════════════════════════════════════════════════════════════════
+abstract final class AppSpacing {
+  static const double xs = 4;    // Extra small
+  static const double sm = 8;    // Small
+  static const double md = 12;   // Medium
+  static const double lg = 16;   // Large
+  static const double xl = 24;   // Extra large
+  static const double xxl = 32;  // Extra extra large
+
+  // Commonly used combinations
+  static const EdgeInsets paddingSm = EdgeInsets.all(sm);
+  static const EdgeInsets paddingMd = EdgeInsets.all(md);
+  static const EdgeInsets paddingLg = EdgeInsets.all(lg);
+  static const EdgeInsets paddingXl = EdgeInsets.all(xl);
+
+  static const EdgeInsets paddingHorizontalMd = EdgeInsets.symmetric(horizontal: md);
+  static const EdgeInsets paddingHorizontalLg = EdgeInsets.symmetric(horizontal: lg);
+  static const EdgeInsets paddingVerticalMd = EdgeInsets.symmetric(vertical: md);
+  static const EdgeInsets paddingVerticalLg = EdgeInsets.symmetric(vertical: lg);
+
+  // Card and component spacing
+  static const EdgeInsets cardPadding = EdgeInsets.all(lg);
+  static const EdgeInsets buttonPadding = EdgeInsets.symmetric(horizontal: lg, vertical: md);
+  static const EdgeInsets listItemPadding = EdgeInsets.symmetric(horizontal: lg, vertical: md);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ANIMATION DURATIONS — Consistent micro-interaction timings
+// ═══════════════════════════════════════════════════════════════════════════════
+abstract final class AppAnimations {
+  static const Duration quickFeedback = Duration(milliseconds: 100);
+  static const Duration standard = Duration(milliseconds: 200);
+  static const Duration standardPlus = Duration(milliseconds: 250);
+  static const Duration transition = Duration(milliseconds: 300);
+  static const Duration delayed = Duration(milliseconds: 500);
+
+  static const Curve easeOut = Curves.easeOut;
+  static const Curve easeInOut = Curves.easeInOut;
+}
+

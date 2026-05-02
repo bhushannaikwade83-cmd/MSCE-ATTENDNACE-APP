@@ -10,12 +10,10 @@ import '../../core/utils/responsive.dart';
 /// Quick Stats Widget - Shows today's attendance statistics
 class QuickStatsWidget extends StatefulWidget {
   final String instituteId;
-  final String? batchId;
 
   const QuickStatsWidget({
     super.key,
     required this.instituteId,
-    this.batchId,
   });
 
   @override
@@ -47,24 +45,30 @@ class _QuickStatsWidgetState extends State<QuickStatsWidget> {
       final code = await instituteCodeForId(widget.instituteId);
       final attRows = await appDb
           .from('attendance_in_out')
-          .select('id')
+          .select('student_id,sr_no,type,additional')
           .eq('institute_code', code)
           .eq('attendance_date', today);
 
-      List<dynamic> studRows;
-      if (widget.batchId != null && widget.batchId!.isNotEmpty) {
-        studRows = await appDb
-            .from('students')
-            .select('id')
-            .eq('institute_id', widget.instituteId)
-            .eq('batch_id', widget.batchId!);
-      } else {
-        studRows = await appDb.from('students').select('id').eq('institute_id', widget.instituteId);
+      final studRows =
+          await appDb.from('students').select('id').eq('institute_id', widget.instituteId);
+
+      final uniqueToday = <String>{};
+      for (final r in attRows) {
+        final m = r as Map<String, dynamic>;
+        final type = (m['type']?.toString() ?? '').toLowerCase();
+        final add = m['additional'];
+        final status = (add is Map ? add['status'] : null)?.toString().toLowerCase();
+        final isPresent = status == 'present' || (status == null && type == 'exit');
+        if (!isPresent) continue;
+        final sid = (m['student_id'] as String?)?.trim() ?? '';
+        final sr = (m['sr_no'] as String?)?.trim() ?? '';
+        final key = sid.isNotEmpty ? sid : sr;
+        if (key.isNotEmpty) uniqueToday.add(key);
       }
 
       if (mounted) {
         setState(() {
-          _presentCount = attRows.length;
+          _presentCount = uniqueToday.length;
           _totalStudents = studRows.length;
           _loading = false;
         });

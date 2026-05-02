@@ -5,10 +5,13 @@ import 'dart:ui';
 import 'package:provider/provider.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../../core/app_db.dart';
+import '../../core/institute_id_display.dart';
 import '../../core/supabase_maps.dart';
 import 'package:intl/intl.dart';
 import 'package:flutter_screenutil/flutter_screenutil.dart';
 import '../../core/utils/responsive.dart';
+import '../../core/utils/responsive_page.dart';
+import '../../core/utils/professional_messaging.dart';
 import '../../services/auth_service.dart';
 import '../../services/offline_service.dart';
 import '../../services/error_handler.dart';
@@ -16,14 +19,20 @@ import '../../services/theme_service.dart';
 import '../../services/session_manager.dart';
 import '../../core/theme/app_theme.dart';
 import '../screens/login_screen.dart';
-import 'batch_management_screen.dart';
+import 'add_institute_attendance_user_screen.dart';
 import 'student_management_screen.dart';
 import 'attendance_reports_screen.dart';
 import 'attendance_calendar_screen.dart';
 import 'attendance_trend_screen.dart';
 import 'help_desk_screen.dart';
+import 'security_dashboard_screen.dart';
 import '../widgets/quick_stats_widget.dart';
-import '../../services/batch_service.dart';
+import '../widgets/support_email_footer.dart';
+import '../../services/institute_lecture_timing_service.dart';
+import '../../services/b2b_storage_service.dart';
+import '../../services/institute_realtime_sync_service.dart';
+import '../../services/institute_status_service.dart';
+import '../../services/geofence_service.dart';
 
 class AdminHomeScreen extends StatefulWidget {
   static const routeName = '/admin-home';
@@ -35,15 +44,42 @@ class AdminHomeScreen extends StatefulWidget {
 
 class _AdminHomeScreenState extends State<AdminHomeScreen> with TickerProviderStateMixin {
   final AuthService _authService = AuthService();
-  final BatchService _batchService = BatchService();
+  final InstituteLectureTimingService _lectureTimingService = InstituteLectureTimingService();
+  final InstituteStatusService _statusService = InstituteStatusService();
   String? _instituteId;
   bool _isLoadingInstitute = true;
   Map<String, dynamic>? _instituteTiming;
+  Map<String, dynamic>? _instituteData;
+
+  // Institute open/close/holiday status for today
+  Map<String, dynamic>? _todayStatus;
+  bool _isChangingStatus = false;
+  bool _isAutoMarkingAbsent = false;
+  Timer? _midnightTimer;
+  StreamSubscription<InstituteSyncEvent>? _syncSubscription;
+  Timer? _syncDebounce;
   
   late AnimationController _fadeController;
   late Animation<double> _fadeAnimation;
   
   String get _todayDateId => DateTime.now().toString().split(' ')[0];
+
+  Future<bool> _ensureLockedGpsForRestrictedActions() async {
+    final ok = await GeofenceService().hasValidPersonalGpsForCurrentAdmin();
+    if (!mounted) return false;
+    if (!ok) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Open GPS Settings (bottom bar) and lock your attendance zone before using this feature.',
+          ),
+          backgroundColor: Colors.orange,
+          duration: Duration(seconds: 4),
+        ),
+      );
+    }
+    return ok;
+  }
 
   @override
   void initState() {
@@ -70,6 +106,13 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> with TickerProviderSt
 
   @override
   void dispose() {
+    _midnightTimer?.cancel();
+    _syncDebounce?.cancel();
+    _syncSubscription?.cancel();
+    final iid = _instituteId;
+    if (iid != null && iid.isNotEmpty) {
+      InstituteRealtimeSyncService.instance.release(iid);
+    }
     _fadeController.dispose();
     super.dispose();
   }
@@ -78,25 +121,64 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> with TickerProviderSt
     try {
       final user = appDb.auth.currentUser;
       if (user == null) {
-        setState(() => _isLoadingInstitute = false);
+        if (mounted) {
+          setState(() => _isLoadingInstitute = false);
+        }
         if (mounted) await _loadDashboardStats();
         return;
       }
 
       final row = await appDb.from('profiles').select('institute_id').eq('id', user.id).maybeSingle();
+      if (!mounted) return;
       final instituteId = row?['institute_id'] as String?;
       if (instituteId != null && instituteId.isNotEmpty) {
-        setState(() {
-          _instituteId = instituteId;
+        if (mounted) {
+          setState(() {
+            _instituteId = instituteId;
+          });
+        }
+        if (!mounted) return;
+        await InstituteRealtimeSyncService.instance.retain(instituteId);
+        if (!mounted) return;
+        _syncSubscription?.cancel();
+        _syncSubscription = InstituteRealtimeSyncService.instance
+            .watch(instituteId)
+            .listen((event) {
+          if (!mounted) return;
+          _syncDebounce?.cancel();
+          _syncDebounce = Timer(const Duration(milliseconds: 700), () async {
+            if (!mounted || _instituteId == null) return;
+            if (event.type == 'institute' || event.type == 'gps') {
+              await _loadInstituteTiming(_instituteId!);
+            }
+            if (event.type == 'students' ||
+                event.type == 'attendance' ||
+                event.type == 'institute') {
+              if (!mounted) return;
+              await _loadDashboardStats();
+              if (!mounted) return;
+              await _loadTodayStatus();
+            }
+          });
         });
         _loadInstituteTiming(instituteId);
+        _loadTodayStatus();
+        _scheduleMidnightAutoClose();
       }
-      setState(() => _isLoadingInstitute = false);
+      if (mounted) {
+        setState(() => _isLoadingInstitute = false);
+      }
     } catch (e) {
-      setState(() => _isLoadingInstitute = false);
-      if (kDebugMode) {
-        final errorResult = ErrorHandler.formatErrorForUI(e, context: 'loadInstituteId', appType: 'admin');
-        debugPrint('Error loading institute: ${errorResult['error']}');
+      if (mounted) {
+        setState(() => _isLoadingInstitute = false);
+        if (kDebugMode) {
+          final errorResult = ErrorHandler.formatErrorForUI(
+            e,
+            context: 'loadInstituteId',
+            appType: 'admin',
+          );
+          debugPrint('Error loading institute: ${errorResult['error']}');
+        }
       }
     }
     if (mounted) await _loadDashboardStats();
@@ -104,7 +186,7 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> with TickerProviderSt
 
   Future<void> _loadInstituteTiming(String instituteId) async {
     try {
-      final timing = await _batchService.getInstituteTiming(instituteId);
+      final timing = await _lectureTimingService.getInstituteTiming(instituteId);
       if (mounted) {
         setState(() {
           _instituteTiming = timing;
@@ -115,6 +197,337 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> with TickerProviderSt
         debugPrint('Error loading institute timing: $e');
       }
     }
+    // Also load institute info
+    _loadInstituteInfo(instituteId);
+  }
+
+  Future<void> _loadInstituteInfo(String instituteId) async {
+    try {
+      final data = await appDb
+          .from('institutes')
+          .select('id, name, address')
+          .eq('id', instituteId)
+          .single();
+      if (mounted) {
+        setState(() {
+          _instituteData = data;
+        });
+      }
+    } catch (e) {
+      if (kDebugMode) {
+        debugPrint('Error loading institute info: $e');
+      }
+    }
+  }
+
+  Future<void> _loadTodayStatus() async {
+    if (_instituteId == null) return;
+    try {
+      final status = await _statusService.getTodayStatus(_instituteId!);
+      if (mounted) setState(() => _todayStatus = status);
+
+      // AUTO-OPEN INSTITUTE 3002 (TESTING ONLY)
+      if (_instituteId == '3002' && status?['status'] == 'closed') {
+        print('🟢 Auto-opening institute 3002...');
+        await _changeInstituteStatus('open');
+      }
+    } catch (e) {
+      if (kDebugMode) debugPrint('Error loading today status: $e');
+    }
+  }
+
+  // ── Midnight auto-close ──────────────────────────────────────────────────
+
+  /// Schedule a one-shot timer that fires just after midnight so the institute
+  /// is automatically closed and all unmarked students are marked absent.
+  void _scheduleMidnightAutoClose() {
+    _midnightTimer?.cancel();
+    final now = DateTime.now();
+    // Fire 5 seconds after midnight of the next calendar day
+    final midnight =
+        DateTime(now.year, now.month, now.day + 1, 0, 0, 5);
+    final delay = midnight.difference(now);
+    _midnightTimer = Timer(delay, _performMidnightAutoClose);
+    if (kDebugMode) {
+      debugPrint(
+          '🕛 Midnight auto-close scheduled in ${delay.inMinutes} min');
+    }
+  }
+
+  Future<void> _performMidnightAutoClose() async {
+    if (!mounted) return;
+    if (_instituteId == null) return;
+    if (kDebugMode) debugPrint('🕛 Midnight reached — refreshing day status');
+    // New day should start in default "closed" mode until admin chooses Open/Holiday.
+    // Do not auto-mark absences for the new day at midnight.
+    if (mounted) await _loadTodayStatus();
+    if (!mounted) return;
+    _scheduleMidnightAutoClose();
+  }
+
+  // ── Auto-mark absent on close ─────────────────────────────────────────────
+
+  Future<void> _runAutoMarkAbsent({String reason = 'institute closed'}) async {
+    if (_instituteId == null) return;
+    if (mounted) setState(() => _isAutoMarkingAbsent = true);
+    try {
+      final result = await _statusService
+          .markAbsentAllUnmarkedStudents(_instituteId!);
+      if (kDebugMode) {
+        debugPrint(
+            '✅ Auto-absent ($reason): total=${result['total']}');
+      }
+      if (mounted && (result['total'] as int? ?? 0) > 0) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(
+              '📋 ${result['total']} student(s) automatically marked absent.'),
+          backgroundColor: AppTheme.accentOrange,
+          duration: const Duration(seconds: 4),
+        ));
+      }
+    } catch (e) {
+      if (kDebugMode) debugPrint('❌ Auto-absent error: $e');
+    } finally {
+      if (mounted) setState(() => _isAutoMarkingAbsent = false);
+    }
+  }
+
+  bool _canCloseInstituteNow() {
+    final timing = _instituteTiming;
+    if (timing == null) return true;
+    final close = timing['closeTime'];
+    if (close is! Map) return true;
+    final closeHour = (close['hour'] as int?) ?? 22;
+    final closeMinute = (close['minute'] as int?) ?? 0;
+    final now = DateTime.now();
+    final nowMinutes = now.hour * 60 + now.minute;
+    final closeMinutes = closeHour * 60 + closeMinute;
+    final windowStart = closeMinutes - 5;
+    // Close is allowed from the final 5 minutes onward until day is closed.
+    return nowMinutes >= windowStart;
+  }
+
+  String _closeButtonHelperText() {
+    final timing = _instituteTiming;
+    if (timing == null) return 'Close is available near end of day.';
+    final close = timing['closeTime'];
+    if (close is! Map) return 'Close is available near end of day.';
+    final closeHour = (close['hour'] as int?) ?? 22;
+    final closeMinute = (close['minute'] as int?) ?? 0;
+    final enableMinute = closeMinute - 5;
+    var hour = closeHour;
+    var minute = enableMinute;
+    if (minute < 0) {
+      hour = (hour - 1) % 24;
+      minute += 60;
+    }
+    final hh = hour.toString().padLeft(2, '0');
+    final mm = minute.toString().padLeft(2, '0');
+    return 'Close becomes available at $hh:$mm and stays enabled until institute is closed.';
+  }
+
+  // ── Show confirmation dialog before closing ──────────────────────────────
+
+  Future<void> _confirmCloseInstitute() async {
+    if (_instituteId == null) return;
+    if (!_canCloseInstituteNow()) {
+      ProfessionalMessaging.showWarning(
+        context,
+        title: 'Close Not Available Yet',
+        message: _closeButtonHelperText(),
+      );
+      return;
+    }
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        shape:
+            RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: Row(
+          children: [
+            Icon(Icons.warning_amber_rounded,
+                color: AppTheme.accentRed, size: 28),
+            const SizedBox(width: 10),
+            const Expanded(
+              child: Text(
+                'Close Institute for Today?',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+              ),
+            ),
+          ],
+        ),
+        content: const Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Closing the institute will immediately:',
+              style: TextStyle(fontWeight: FontWeight.w600),
+            ),
+            SizedBox(height: 8),
+            Text('• Students with entry but NO exit → marked Absent'),
+            Text('• Students with NO entry at all → marked Absent'),
+            SizedBox(height: 12),
+            Text(
+              'This action cannot be undone for today.',
+              style: TextStyle(color: Colors.red, fontWeight: FontWeight.w500),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: AppTheme.accentRed,
+              foregroundColor: Colors.white,
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(10)),
+            ),
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Yes, Close & Mark Absent'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true) return;
+    await _changeInstituteStatus('closed');
+  }
+
+  // ── Status change ─────────────────────────────────────────────────────────
+
+  Future<void> _changeInstituteStatus(String newStatus, {String? holidayReason}) async {
+    if (_instituteId == null || _isChangingStatus) return;
+    if (mounted) setState(() => _isChangingStatus = true);
+    try {
+      Map<String, dynamic> result;
+      if (newStatus == 'open') {
+        result = await _statusService.markOpen(_instituteId!);
+      } else if (newStatus == 'holiday') {
+        result = await _statusService.markHoliday(_instituteId!, reason: holidayReason ?? 'Holiday');
+      } else {
+        result = await _statusService.markClosed(_instituteId!);
+      }
+      if (!mounted) return;
+      if (result['success'] == true) {
+        await _loadTodayStatus();
+        if (newStatus == 'closed' || newStatus == 'holiday') {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+              content: Text(newStatus == 'holiday'
+                  ? '🏖️ Today marked as Holiday. No attendance will be marked.'
+                  : '🔴 Institute marked as Closed. Marking absent now...'),
+              backgroundColor: newStatus == 'holiday'
+                  ? AppTheme.accentOrange
+                  : AppTheme.accentRed,
+              duration: const Duration(seconds: 3),
+            ));
+          }
+          // Auto-mark all unmarked students as absent
+          if (newStatus == 'closed') {
+            await _runAutoMarkAbsent();
+          }
+        }
+      } else {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text(result['message'] ?? 'Failed to update status'),
+            backgroundColor: AppTheme.accentRed,
+          ));
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('Error: ${e.toString()}'),
+          backgroundColor: AppTheme.accentRed,
+        ));
+      }
+    } finally {
+      if (mounted) setState(() => _isChangingStatus = false);
+    }
+  }
+
+  bool _isOpenHolidayDecisionLocked() => _todayStatus?['dayDecisionLocked'] == true;
+
+  Future<void> _confirmOneWayDecision({
+    required String actionLabel,
+    required String warningText,
+    required Future<void> Function() onConfirm,
+  }) async {
+    final yes = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: Row(
+          children: [
+            const Icon(Icons.warning_amber_rounded, color: AppTheme.accentRed),
+            SizedBox(width: 8.w),
+            Expanded(
+              child: Text(
+                '$actionLabel Confirmation',
+                style: const TextStyle(fontWeight: FontWeight.bold),
+              ),
+            ),
+          ],
+        ),
+        content: Text(
+          '$warningText\n\nThis is a one-way process for today and cannot be undone.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: AppTheme.accentRed,
+              foregroundColor: Colors.white,
+            ),
+            child: const Text('Proceed'),
+          ),
+        ],
+      ),
+    );
+    if (yes == true) {
+      await onConfirm();
+    }
+  }
+
+  /// Resolves a full display name when `profiles.name` is empty or only first name in DB.
+  String _composeAdminFullName(Map<String, dynamic>? profileRow, User user) {
+    String p(String? s) => (s ?? '').trim();
+
+    final fromProfile = p(profileRow?['name'] as String?);
+    if (fromProfile.isNotEmpty) return fromProfile;
+
+    final meta = user.userMetadata;
+    if (meta != null && meta.isNotEmpty) {
+      final full = p(meta['full_name']?.toString());
+      if (full.isNotEmpty) return full;
+      final nm = p(meta['name']?.toString());
+      if (nm.isNotEmpty) return nm;
+      final fn = p(meta['first_name']?.toString() ?? meta['given_name']?.toString());
+      final ln = p(meta['last_name']?.toString() ?? meta['family_name']?.toString());
+      if (fn.isNotEmpty || ln.isNotEmpty) return '$fn $ln'.trim();
+    }
+
+    final email = p(profileRow?['email'] as String?).isNotEmpty
+        ? p(profileRow?['email'] as String?)
+        : p(user.email);
+    if (email.contains('@')) {
+      final local = email.split('@').first;
+      final pretty = local.replaceAll(RegExp(r'[._+\-]+'), ' ').trim();
+      if (pretty.isNotEmpty) return pretty;
+    }
+    return 'Admin';
   }
 
   // Dashboard counters – loaded once on init, refreshed only when user pulls-to-refresh.
@@ -125,7 +538,7 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> with TickerProviderSt
 
   Future<void> _loadDashboardStats() async {
     if (!mounted) return;
-    setState(() => _statsLoading = true);
+    if (mounted) setState(() => _statsLoading = true);
     try {
       final u = appDb.auth.currentUser;
       if (u == null) {
@@ -140,9 +553,12 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> with TickerProviderSt
         return;
       }
 
-      final profileRow =
-          await appDb.from('profiles').select('name').eq('id', u.id).maybeSingle();
-      final name = profileRow?['name'] as String?;
+      final profileRow = await appDb
+          .from('profiles')
+          .select('name, email')
+          .eq('id', u.id)
+          .maybeSingle();
+      final name = _composeAdminFullName(profileRow, u);
 
       int sc = 0;
       int att = 0;
@@ -156,13 +572,25 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> with TickerProviderSt
         sc = studentRes.count;
 
         final code = await instituteCodeForId(iid);
-        final attRes = await appDb
+        final attRows = await appDb
             .from('attendance_in_out')
-            .select('id')
+            .select('student_id,sr_no,type,additional')
             .eq('institute_code', code)
-            .eq('attendance_date', _todayDateId)
-            .count(CountOption.exact);
-        att = attRes.count;
+            .eq('attendance_date', _todayDateId);
+        final uniqueToday = <String>{};
+        for (final r in attRows) {
+          final m = r as Map<String, dynamic>;
+          final type = (m['type']?.toString() ?? '').toLowerCase();
+          final add = m['additional'];
+          final status = (add is Map ? add['status'] : null)?.toString().toLowerCase();
+          final isPresent = status == 'present' || (status == null && type == 'exit');
+          if (!isPresent) continue;
+          final sid = (m['student_id'] as String?)?.trim() ?? '';
+          final sr = (m['sr_no'] as String?)?.trim() ?? '';
+          final key = sid.isNotEmpty ? sid : sr;
+          if (key.isNotEmpty) uniqueToday.add(key);
+        }
+        att = uniqueToday.length;
       }
 
       if (!mounted) return;
@@ -197,42 +625,53 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> with TickerProviderSt
             child: Column(
               children: [
                 Expanded(
-                  child: LayoutBuilder(
-                    builder: (context, constraints) {
-                      return SingleChildScrollView(
-                        physics: const BouncingScrollPhysics(),
+                  child: ResponsiveScrollBody(
                         padding: EdgeInsets.all(16.w),
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
                             _buildProfileGovCard(isDark),
                             SizedBox(height: 16.h),
+
+                            // ── Institute Information Card (Name, Address, ID) ──
+                            if (_instituteId != null && _instituteData != null)
+                              _buildInstituteInfoCard(isDark),
+                            if (_instituteId != null && _instituteData != null)
+                              SizedBox(height: 16.h),
+
+                            // ── Institute Open / Close / Holiday ── FIRST ──
+                            if (_instituteId != null)
+                              _buildInstituteStatusCard(isDark),
+                            if (_instituteId != null)
+                              SizedBox(height: 16.h),
+
                             // Date and Clock Times
                             _buildDateAndClockTimes(isDark),
                             SizedBox(height: 20.h),
-                            
+
                             // Institute Timing Card
                             if (_instituteTiming != null)
                               _buildInstituteTimingCard(isDark),
                             if (_instituteTiming != null)
                               SizedBox(height: 20.h),
-                            
+
                             // Enhanced Quick Stats Widget (Today's Stats)
                             if (_instituteId != null)
                               QuickStatsWidget(
                                 instituteId: _instituteId!,
                               ),
                             SizedBox(height: 20.h),
-                            
+
                             // Quick Actions
                             _buildQuickActions(isDark),
                             SizedBox(height: 20.h),
-                            
+
+                            const Center(child: SupportEmailFooter()),
+                            SizedBox(height: 16.h),
+
                             SizedBox(height: 24.h),
                           ],
                         ),
-                      );
-                    },
                   ),
                 ),
               ],
@@ -289,7 +728,7 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> with TickerProviderSt
                           onPressed: () async {
                             if (_instituteId != null) {
                               await OfflineService.syncPendingAttendance(_instituteId!);
-                              setState(() {});
+                              if (mounted) setState(() {});
                             }
                           },
                           tooltip: '$pendingCount pending sync',
@@ -327,6 +766,13 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> with TickerProviderSt
                   Navigator.pushNamed(context, HelpDeskScreen.routeName);
                 },
                 tooltip: 'Help & Instructions',
+              ),
+              IconButton(
+                icon: Icon(Icons.security, color: Colors.white, size: 24.sp),
+                onPressed: () {
+                  Navigator.pushNamed(context, SecurityDashboardScreen.routeName);
+                },
+                tooltip: 'Security Dashboard',
               ),
               Consumer<ThemeService>(
                 builder: (context, themeService, _) {
@@ -487,10 +933,10 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> with TickerProviderSt
 
   Widget _buildCalendarButton() {
     return Container(
-      height: 60,
+      height: 60.h,
       decoration: BoxDecoration(
         color: Colors.white.withValues(alpha: 0.15),
-        borderRadius: BorderRadius.circular(16),
+        borderRadius: BorderRadius.circular(16.r),
         border: Border.all(color: Colors.white.withValues(alpha: 0.3), width: 1.5),
       ),
       child: Material(
@@ -508,24 +954,26 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> with TickerProviderSt
               );
             }
           },
-          borderRadius: BorderRadius.circular(16),
+          borderRadius: BorderRadius.circular(16.r),
           child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 20),
+            padding: EdgeInsets.symmetric(horizontal: 20.w),
             child: Row(
               children: [
-                const Icon(Icons.calendar_today, color: Colors.white, size: 24),
-                const SizedBox(width: 12),
-                const Expanded(
+                Icon(Icons.calendar_today, color: Colors.white, size: 22.sp),
+                SizedBox(width: 12.w),
+                Expanded(
                   child: Text(
                     'View Attendance Calendar',
                     style: TextStyle(
                       color: Colors.white,
-                      fontSize: 16,
+                      fontSize: 14.sp,
                       fontWeight: FontWeight.w600,
                     ),
+                    overflow: TextOverflow.ellipsis,
+                    maxLines: 1,
                   ),
                 ),
-                const Icon(Icons.arrow_forward_ios, color: Colors.white, size: 18),
+                Icon(Icons.arrow_forward_ios, color: Colors.white, size: 16.sp),
               ],
             ),
           ),
@@ -536,10 +984,10 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> with TickerProviderSt
 
   Widget _buildTrendButton() {
     return Container(
-      height: 60,
+      height: 60.h,
       decoration: BoxDecoration(
         color: Colors.white.withValues(alpha: 0.15),
-        borderRadius: BorderRadius.circular(16),
+        borderRadius: BorderRadius.circular(16.r),
         border: Border.all(color: Colors.white.withValues(alpha: 0.3), width: 1.5),
       ),
       child: Material(
@@ -557,24 +1005,26 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> with TickerProviderSt
               );
             }
           },
-          borderRadius: BorderRadius.circular(16),
+          borderRadius: BorderRadius.circular(16.r),
           child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 20),
+            padding: EdgeInsets.symmetric(horizontal: 20.w),
             child: Row(
               children: [
-                const Icon(Icons.show_chart, color: Colors.white, size: 24),
-                const SizedBox(width: 12),
-                const Expanded(
+                Icon(Icons.show_chart, color: Colors.white, size: 22.sp),
+                SizedBox(width: 12.w),
+                Expanded(
                   child: Text(
                     'View Attendance Trend',
                     style: TextStyle(
                       color: Colors.white,
-                      fontSize: 16,
+                      fontSize: 14.sp,
                       fontWeight: FontWeight.w600,
                     ),
+                    overflow: TextOverflow.ellipsis,
+                    maxLines: 1,
                   ),
                 ),
-                const Icon(Icons.arrow_forward_ios, color: Colors.white, size: 18),
+                Icon(Icons.arrow_forward_ios, color: Colors.white, size: 16.sp),
               ],
             ),
           ),
@@ -738,13 +1188,16 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> with TickerProviderSt
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  'Mr ${_profileName ?? 'Admin'}',
+                  (_profileName == null || _profileName == 'Admin')
+                      ? 'Welcome'
+                      : 'Mr $_profileName',
                   style: TextStyle(
                     color: isDark ? Colors.white : AppTheme.textDark,
                     fontSize: 17.sp,
                     fontWeight: FontWeight.bold,
                   ),
-                  maxLines: 1,
+                  maxLines: 2,
+                  softWrap: true,
                   overflow: TextOverflow.ellipsis,
                 ),
                 Text(
@@ -808,6 +1261,13 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> with TickerProviderSt
               Navigator.pushNamed(context, HelpDeskScreen.routeName);
             },
             tooltip: 'Help & Instructions',
+          ),
+          IconButton(
+            icon: Icon(Icons.security, color: AppTheme.primaryBlue, size: 22.sp),
+            onPressed: () {
+              Navigator.pushNamed(context, SecurityDashboardScreen.routeName);
+            },
+            tooltip: 'Security Dashboard',
           ),
           Consumer<ThemeService>(
             builder: (context, themeService, _) {
@@ -1123,7 +1583,7 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> with TickerProviderSt
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  'Institute Batch Timing',
+                  'Institute hours',
                   style: TextStyle(
                     fontSize: 14.sp,
                     fontWeight: FontWeight.w600,
@@ -1180,9 +1640,9 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> with TickerProviderSt
                 ),
                 SizedBox(height: 4.h),
                 Text(
-                  duration == 120 
-                      ? '120 minutes per batch (2 hours)'
-                      : '60 minutes per batch (1 hour)',
+                  duration == 120
+                      ? '120 minutes per slot (2 hours)'
+                      : '60 minutes per slot (1 hour)',
                   style: TextStyle(
                     fontSize: 12.sp,
                     color: isDark ? Colors.white60 : AppTheme.textDark.withValues(alpha: 0.6),
@@ -1191,6 +1651,440 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> with TickerProviderSt
               ],
             ),
           ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildInstituteInfoCard(bool isDark) {
+    final instituteName = _instituteData?['name'] as String? ?? 'Unknown Institute';
+    final instituteAddress = _instituteData?['address'] as String? ?? 'Address not set';
+    final instituteId = _instituteData?['id'] as String? ?? 'N/A';
+
+    return GovElevatedCard(
+      padding: EdgeInsets.symmetric(horizontal: 14.w, vertical: 12.h),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                padding: EdgeInsets.all(8.w),
+                decoration: BoxDecoration(
+                  color: AppTheme.primaryBlue.withValues(alpha: 0.2),
+                  borderRadius: BorderRadius.circular(8.r),
+                ),
+                child: Icon(Icons.school, color: AppTheme.primaryBlue, size: 24.sp),
+              ),
+              SizedBox(width: 12.w),
+              Expanded(
+                child: Text(
+                  instituteName,
+                  style: TextStyle(
+                    color: isDark ? Colors.white : AppTheme.textDark,
+                    fontSize: 17.sp,
+                    fontWeight: FontWeight.bold,
+                  ),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
+          ),
+          SizedBox(height: 12.h),
+          Row(
+            children: [
+              Icon(Icons.location_on, color: AppTheme.primaryBlue, size: 16.sp),
+              SizedBox(width: 8.w),
+              Expanded(
+                child: Text(
+                  instituteAddress,
+                  style: TextStyle(
+                    color: isDark ? Colors.white70 : AppTheme.textGray,
+                    fontSize: 13.sp,
+                  ),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
+          ),
+          SizedBox(height: 8.h),
+          Row(
+            children: [
+              Icon(Icons.badge, color: AppTheme.primaryBlue, size: 16.sp),
+              SizedBox(width: 8.w),
+              Expanded(
+                child: Text(
+                  'ID: ${formatInstituteIdForDisplay(instituteId)}',
+                  style: TextStyle(
+                    color: isDark ? Colors.white70 : AppTheme.textGray,
+                    fontSize: 12.sp,
+                    fontFamily: 'monospace',
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildInstituteStatusCard(bool isDark) {
+    final status = _todayStatus?['status'] as String? ?? 'unknown';
+    final isDayFinalized = _todayStatus?['dayFinalized'] == true;
+    final isDecisionLocked = _isOpenHolidayDecisionLocked();
+    final canCloseNow = _canCloseInstituteNow();
+    final today = DateFormat('EEE, d MMM yyyy').format(DateTime.now());
+
+    Color statusColor;
+    IconData statusIcon;
+    String statusLabel;
+
+    switch (status) {
+      case 'open':
+        statusColor = AppTheme.accentGreen;
+        statusIcon = Icons.domain_verification_rounded;
+        statusLabel = 'Open';
+        break;
+      case 'holiday':
+        statusColor = AppTheme.accentOrange;
+        statusIcon = Icons.beach_access_rounded;
+        statusLabel = 'Holiday';
+        break;
+      case 'closed':
+        statusColor = AppTheme.accentRed;
+        statusIcon = Icons.domain_disabled_rounded;
+        statusLabel = 'Closed';
+        break;
+      default:
+        statusColor = isDark ? Colors.white54 : Colors.grey.shade500;
+        statusIcon = Icons.help_outline_rounded;
+        statusLabel = 'Not Set';
+    }
+
+    return Container(
+      decoration: BoxDecoration(
+        color: isDark ? const Color(0xFF1E293B) : Colors.white,
+        borderRadius: BorderRadius.circular(20.r),
+        boxShadow: [
+          BoxShadow(
+            color: statusColor.withValues(alpha: 0.15),
+            blurRadius: 16.r,
+            offset: Offset(0, 4.h),
+          ),
+        ],
+        border: Border.all(color: statusColor.withValues(alpha: 0.4)),
+      ),
+      child: Padding(
+        padding: EdgeInsets.all(16.w),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // Header row
+            Row(
+              children: [
+                Container(
+                  padding: EdgeInsets.all(10.w),
+                  decoration: BoxDecoration(
+                    color: statusColor.withValues(alpha: 0.15),
+                    borderRadius: BorderRadius.circular(12.r),
+                  ),
+                  child: Icon(statusIcon, color: statusColor, size: 24.sp),
+                ),
+                SizedBox(width: 12.w),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Institute Status — Today',
+                        style: TextStyle(
+                          fontSize: 13.sp,
+                          color: isDark ? Colors.white60 : Colors.grey.shade600,
+                        ),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      Text(
+                        today,
+                        style: TextStyle(
+                          fontSize: 12.sp,
+                          color: isDark ? Colors.white38 : Colors.grey.shade400,
+                        ),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ],
+                  ),
+                ),
+                // Current status badge
+                Container(
+                  padding: EdgeInsets.symmetric(horizontal: 12.w, vertical: 6.h),
+                  decoration: BoxDecoration(
+                    color: statusColor,
+                    borderRadius: BorderRadius.circular(20.r),
+                  ),
+                  child: Text(
+                    statusLabel,
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 13.sp,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            SizedBox(height: 16.h),
+            // Description
+            Text(
+              status == 'open'
+                  ? 'Attendance is being tracked. Students marking entry will be counted for today.'
+                  : status == 'holiday'
+                  ? 'Today is a holiday. Attendance will not be counted — students are marked accordingly.'
+                  : status == 'closed'
+                  ? 'Institute is closed. Attendance will not be counted for today.'
+                  : 'Set today\'s status to control attendance tracking and auto-absence.',
+              style: TextStyle(
+                fontSize: 13.sp,
+                color: isDark ? Colors.white70 : AppTheme.textDark.withValues(alpha: 0.7),
+              ),
+            ),
+            if (status == 'closed' && isDayFinalized) ...[
+              SizedBox(height: 10.h),
+              Container(
+                padding: EdgeInsets.symmetric(horizontal: 10.w, vertical: 6.h),
+                decoration: BoxDecoration(
+                  color: AppTheme.accentRed.withValues(alpha: 0.18),
+                  borderRadius: BorderRadius.circular(999.r),
+                  border: Border.all(
+                    color: AppTheme.accentRed.withValues(alpha: 0.45),
+                  ),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.lock_rounded,
+                      size: 14.sp,
+                      color: AppTheme.accentRed,
+                    ),
+                    SizedBox(width: 6.w),
+                    Text(
+                      'Day Finalized - Reopen disabled for today',
+                      style: TextStyle(
+                        fontSize: 11.sp,
+                        fontWeight: FontWeight.w700,
+                        color: isDark ? Colors.white : AppTheme.accentRed,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+            if (isDecisionLocked) ...[
+              SizedBox(height: 10.h),
+              Container(
+                padding: EdgeInsets.symmetric(horizontal: 10.w, vertical: 6.h),
+                decoration: BoxDecoration(
+                  color: AppTheme.primaryBlue.withValues(alpha: 0.12),
+                  borderRadius: BorderRadius.circular(999.r),
+                  border: Border.all(
+                    color: AppTheme.primaryBlue.withValues(alpha: 0.35),
+                  ),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.info_outline_rounded,
+                      size: 14.sp,
+                      color: AppTheme.primaryBlue,
+                    ),
+                    SizedBox(width: 6.w),
+                    Text(
+                      'Today\'s Open/Holiday choice is locked.',
+                      style: TextStyle(
+                        fontSize: 11.sp,
+                        fontWeight: FontWeight.w700,
+                        color: isDark ? Colors.white : AppTheme.primaryBlue,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+            SizedBox(height: 16.h),
+            // Action buttons
+            if (_isChangingStatus)
+              Center(
+                child: Padding(
+                  padding: EdgeInsets.symmetric(vertical: 8.h),
+                  child: SizedBox(
+                    width: 24.w,
+                    height: 24.w,
+                    child: CircularProgressIndicator(strokeWidth: 2.5, color: statusColor),
+                  ),
+                ),
+              )
+            else
+              Row(
+                children: [
+                  // Open button
+                  Expanded(
+                    child: _buildStatusButton(
+                      label: isDayFinalized && status == 'closed'
+                          ? '🟢  Open (Locked)'
+                          : '🟢  Open',
+                      color: AppTheme.accentGreen,
+                      isActive: status == 'open',
+                      isDark: isDark,
+                      onTap: (isDayFinalized && status == 'closed') || isDecisionLocked
+                          ? null
+                          : () => _confirmOneWayDecision(
+                                actionLabel: 'Open Institute',
+                                warningText:
+                                    'If you choose Open now, Holiday option will be disabled for today.',
+                                onConfirm: () => _changeInstituteStatus('open'),
+                              ),
+                    ),
+                  ),
+                  SizedBox(width: 8.w),
+                  // Holiday button
+                  Expanded(
+                    child: _buildStatusButton(
+                      label: '🏖️  Holiday',
+                      color: AppTheme.accentOrange,
+                      isActive: status == 'holiday',
+                      isDark: isDark,
+                      onTap: isDecisionLocked || (isDayFinalized && status == 'closed')
+                          ? null
+                          : () => _confirmOneWayDecision(
+                                actionLabel: 'Mark Holiday',
+                                warningText:
+                                    'If you choose Holiday now, Open option will be disabled for today.',
+                                onConfirm: _showHolidayReasonDialog,
+                              ),
+                    ),
+                  ),
+                  SizedBox(width: 8.w),
+                  // Close button
+                  Expanded(
+                    child: _buildStatusButton(
+                      label: _isAutoMarkingAbsent
+                          ? '⏳ Marking...'
+                          : (canCloseNow ? '🔴  Close' : '🔒 Close'),
+                      color: AppTheme.accentRed,
+                      isActive: status == 'closed',
+                      isDark: isDark,
+                      onTap: (_isChangingStatus ||
+                              _isAutoMarkingAbsent ||
+                              !canCloseNow)
+                          ? null
+                          : () => _confirmCloseInstitute(),
+                    ),
+                  ),
+                ],
+              ),
+            if (!canCloseNow && status != 'closed') ...[
+              SizedBox(height: 8.h),
+              Text(
+                _closeButtonHelperText(),
+                style: TextStyle(
+                  fontSize: 12.sp,
+                  color: isDark
+                      ? Colors.white70
+                      : AppTheme.textDark.withValues(alpha: 0.65),
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildStatusButton({
+    required String label,
+    required Color color,
+    required bool isActive,
+    required bool isDark,
+    VoidCallback? onTap,
+  }) {
+    return GestureDetector(
+      onTap: isActive ? null : onTap,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 200),
+        padding: EdgeInsets.symmetric(vertical: 10.h),
+        decoration: BoxDecoration(
+          color: isActive ? color : color.withValues(alpha: 0.12),
+          borderRadius: BorderRadius.circular(12.r),
+          border: Border.all(color: color.withValues(alpha: isActive ? 0 : 0.4)),
+        ),
+        child: Center(
+          child: Text(
+            label,
+            style: TextStyle(
+              fontSize: 13.sp,
+              fontWeight: FontWeight.bold,
+              color: isActive ? Colors.white : color,
+            ),
+            overflow: TextOverflow.ellipsis,
+            maxLines: 1,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _showHolidayReasonDialog() async {
+    final reason = await showDialog<String>(
+      context: context,
+      builder: (ctx) => SimpleDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        title: const Row(
+          children: [
+            Icon(Icons.beach_access_rounded, color: AppTheme.accentOrange, size: 24),
+            SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                'Mark as Holiday',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+              ),
+            ),
+          ],
+        ),
+        children: [
+          _buildHolidayReasonOption(ctx, 'Holiday'),
+          _buildHolidayReasonOption(ctx, 'Government Holiday'),
+          _buildHolidayReasonOption(ctx, 'Festival'),
+          _buildHolidayReasonOption(ctx, 'Emergency Closure'),
+          _buildHolidayReasonOption(ctx, 'Other Holiday'),
+          const Divider(height: 8),
+          SimpleDialogOption(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Cancel'),
+          ),
+        ],
+      ),
+    );
+    if (!mounted || reason == null) return;
+
+    await Future<void>.delayed(const Duration(milliseconds: 80));
+    if (!mounted) return;
+    await _changeInstituteStatus('holiday', holidayReason: reason);
+  }
+
+  Widget _buildHolidayReasonOption(BuildContext ctx, String reason) {
+    return SimpleDialogOption(
+      onPressed: () => Navigator.of(ctx).pop(reason),
+      child: Row(
+        children: [
+          const Icon(Icons.check_circle_outline, size: 18, color: AppTheme.accentOrange),
+          const SizedBox(width: 10),
+          Expanded(child: Text(reason)),
         ],
       ),
     );
@@ -1238,15 +2132,19 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> with TickerProviderSt
                 SizedBox(width: 12.w),
                 Expanded(
                   child: _buildActionCard(
-                    'Batches',
-                    Icons.group_work_rounded,
+                    'Institute instructor',
+                    Icons.person_add_alt_1,
                     AppTheme.primaryBlue,
-                    () => Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (_) => const BatchManagementScreen(),
-                      ),
-                    ),
+                    () async {
+                      if (!await _ensureLockedGpsForRestrictedActions()) return;
+                      if (!mounted) return;
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (_) => const AddInstituteAttendanceUserScreen(),
+                        ),
+                      );
+                    },
                     isDark,
                   ),
                 ),
@@ -1281,9 +2179,48 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> with TickerProviderSt
                     'Reports',
                     Icons.bar_chart,
                     AppTheme.accentGreen,
+                    () async {
+                      if (!await _ensureLockedGpsForRestrictedActions()) return;
+                      if (!mounted) return;
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(builder: (_) => const AttendanceReportsScreen()),
+                      );
+                    },
+                    isDark,
+                  ),
+                ),
+              ],
+            ),
+            SizedBox(height: 12.h),
+            Row(
+              children: [
+                Expanded(
+                  child: _buildActionCard(
+                    'Status',
+                    Icons.domain_verification_rounded,
+                    AppTheme.primaryBlue,
+                    () {
+                      // Scroll to Institute Status Card
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(
+                          content: Text('👆 Scroll up to change institute status'),
+                          duration: Duration(seconds: 2),
+                        ),
+                      );
+                    },
+                    isDark,
+                  ),
+                ),
+                SizedBox(width: 12.w),
+                Expanded(
+                  child: _buildActionCard(
+                    'Help',
+                    Icons.help_center_rounded,
+                    AppTheme.accentOrange,
                     () => Navigator.push(
                       context,
-                      MaterialPageRoute(builder: (_) => const AttendanceReportsScreen()),
+                      MaterialPageRoute(builder: (_) => const HelpDeskScreen()),
                     ),
                     isDark,
                   ),
@@ -1291,6 +2228,7 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> with TickerProviderSt
               ],
             ),
             SizedBox(height: 12.h),
+
             // Logout Button - Full Width
             _buildLogoutButton(isDark),
           ],
@@ -1515,13 +2453,17 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> with TickerProviderSt
           childAspectRatio: 1.0,
           children: [
             _buildFeatureGridCard(
-              title: 'Batches',
-              icon: Icons.group_work_rounded,
+              title: 'Institute instructor',
+              icon: Icons.person_add_alt_1,
               color: AppTheme.primaryBlue,
-              onTap: () => Navigator.push(
-                context,
-                MaterialPageRoute(builder: (_) => const BatchManagementScreen()),
-              ),
+              onTap: () async {
+                if (!await _ensureLockedGpsForRestrictedActions()) return;
+                if (!mounted) return;
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (_) => const AddInstituteAttendanceUserScreen()),
+                );
+              },
               isDark: isDark,
             ),
             _buildFeatureGridCard(
@@ -1538,10 +2480,14 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> with TickerProviderSt
               title: 'Reports',
               icon: Icons.bar_chart,
               color: AppTheme.accentOrange,
-              onTap: () => Navigator.push(
-                context,
-                MaterialPageRoute(builder: (_) => const AttendanceReportsScreen()),
-              ),
+              onTap: () async {
+                if (!await _ensureLockedGpsForRestrictedActions()) return;
+                if (!mounted) return;
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (_) => const AttendanceReportsScreen()),
+                );
+              },
               isDark: isDark,
             ),
           ],

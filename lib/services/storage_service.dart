@@ -1,3 +1,6 @@
+import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
+
+import '../config/b2b_storage_config.dart';
 import 'b2b_storage_service.dart';
 
 /// Storage Service for organizing attendance photos
@@ -5,7 +8,7 @@ import 'b2b_storage_service.dart';
 /// 
 /// Folder Structure:
 ///   institute_id/
-///     batch_year/
+///     folder_year/
 ///       rollNumber/
 ///         subject/
 ///           YYYY-MM-DD/
@@ -13,17 +16,17 @@ import 'b2b_storage_service.dart';
 class StorageService {
   /// Generate storage path for attendance photo
   /// 
-  /// Structure: institute_id/batch_year/rollNumber/subject/YYYY-MM-DD/photo.jpg
+  /// Structure: institute_id/folder_year/rollNumber/subject/YYYY-MM-DD/photo.jpg
   static String generatePhotoPath({
     required String instituteId,
-    required String batchYear,
+    required String folderYear,
     required String rollNumber,
     required String subject,
     required String date, // Format: YYYY-MM-DD
   }) {
     return B2BStorageService.generatePhotoPath(
       instituteId: instituteId,
-      batchYear: batchYear,
+      folderYear: folderYear,
       rollNumber: rollNumber,
       subject: subject,
       date: date,
@@ -36,7 +39,7 @@ class StorageService {
   /// photoType: 'entry' or 'exit' (optional, defaults to 'entry' for backward compatibility)
   static Future<Map<String, String>> uploadAttendancePhoto({
     required String instituteId,
-    required String batchYear,
+    required String folderYear,
     required String rollNumber,
     required String subject,
     required String date,
@@ -46,7 +49,7 @@ class StorageService {
     try {
       final result = await B2BStorageService.uploadAttendancePhoto(
         instituteId: instituteId,
-        batchYear: batchYear,
+        folderYear: folderYear,
         rollNumber: rollNumber,
         subject: subject,
         date: date,
@@ -57,6 +60,7 @@ class StorageService {
       return {
         'url': result['url']!,
         'path': result['path']!,
+        if (result['fileId'] != null) 'fileId': result['fileId']!,
       };
     } catch (e) {
       throw Exception('Failed to upload photo: $e');
@@ -64,12 +68,21 @@ class StorageService {
   }
 
   /// Delete attendance photo from B2B Storage
-  static Future<void> deleteAttendancePhoto(String objectPath) async {
+  static Future<void> deleteAttendancePhoto(String objectPath, {String? fileId}) async {
     try {
-      await B2BStorageService.deleteAttendancePhoto(objectPath);
+      await B2BStorageService.deleteAttendancePhoto(objectPath, fileId: fileId);
     } catch (e) {
       throw Exception('Failed to delete photo: $e');
     }
+  }
+
+  /// Delete photo by path or URL and optional fileId (preferred).
+  static Future<void> deletePhotoReference(String pathOrUrl, {String? fileId}) async {
+    final raw = pathOrUrl.trim();
+    if (raw.isEmpty) return;
+    final objectPath = raw.startsWith('http') ? (b2ObjectPathFromPhotoUrl(raw) ?? '') : raw;
+    if (objectPath.isEmpty) return;
+    await deleteAttendancePhoto(objectPath, fileId: fileId);
   }
 
   /// Get photo URL from object path
@@ -89,30 +102,50 @@ class StorageService {
     }
   }
 
-  /// Ensure URL is signed (regenerate if needed)
-  /// Use this when you have a URL that might be unsigned
-  static Future<String> ensureSignedUrl(String url) async {
-    // If URL is already signed (has Authorization param), return as-is
-    if (url.contains('Authorization=')) {
-      return url;
+  /// Extract B2 object key from a friendly file URL (path is `/file/{bucket}/{key}`; key may be URI-encoded).
+  static String? b2ObjectPathFromPhotoUrl(String url) {
+    final u = url.trim();
+    if (u.isEmpty) return null;
+    final lower = u.toLowerCase();
+    if (!lower.contains('backblazeb2.com')) return null;
+    try {
+      final uri = Uri.parse(u);
+      final p = uri.path;
+      const marker = '/file/';
+      final idx = p.indexOf(marker);
+      if (idx < 0) return null;
+      final after = p.substring(idx + marker.length);
+      final slash = after.indexOf('/');
+      if (slash < 0 || slash >= after.length - 1) return null;
+      final encodedObject = after.substring(slash + 1);
+      if (encodedObject.isEmpty) return null;
+      return Uri.decodeComponent(encodedObject);
+    } catch (e) {
+      if (kDebugMode) debugPrint('b2ObjectPathFromPhotoUrl: $e');
+      return null;
     }
+  }
 
-    // If URL is from B2 but unsigned, extract path and regenerate
-    if (url.contains('backblazeb2.com')) {
+  /// Returns a **fresh** temporary signed URL for B2 objects whenever possible.
+  /// Old logic kept expired `Authorization=` query params, which broke [CachedNetworkImage].
+  static Future<String> ensureSignedUrl(String url) async {
+    final u = url.trim();
+    if (u.isEmpty) return u;
+
+    final b2Path = b2ObjectPathFromPhotoUrl(u);
+    if (b2Path != null && b2Path.isNotEmpty && B2BStorageConfig.isConfigured) {
       try {
-        final pathMatch = RegExp(r'/file/[^/]+/(.+?)(?:\?|$)').firstMatch(url);
-        if (pathMatch != null) {
-          final objectPath = Uri.decodeComponent(pathMatch.group(1)!);
-          return await getPhotoUrl(objectPath);
-        }
+        return await getPhotoUrl(b2Path);
       } catch (e) {
-        // If regeneration fails, return original (will show error)
-        return url;
+        if (kDebugMode) debugPrint('ensureSignedUrl(getPhotoUrl): $e');
+        if (u.contains('backblazeb2.com')) {
+          rethrow;
+        }
       }
     }
 
-    // For non-B2 URLs (e.g., Firebase Storage), return as-is
-    return url;
+    // Non-B2 or B2 without extractable path (e.g. wrong host shape): return as-is
+    return u;
   }
   
   /// Get authorization token for private bucket access
@@ -131,7 +164,7 @@ class StorageService {
       if (parts.length >= 5) {
         return {
           'instituteId': parts[0],
-          'batchYear': parts[1],
+          'folderYear': parts[1],
           'rollNumber': parts[2],
           'subject': parts[3].replaceAll('_', ' '),
           'date': parts[4],
@@ -164,24 +197,29 @@ class StorageService {
 
       // Priority 2: Process photoUrl
       if (photoUrl != null && photoUrl.isNotEmpty) {
-        // If it's not a URL (starts with http), treat it as storage path
-        if (!photoUrl.startsWith('http')) {
-          return await getPhotoUrl(photoUrl);
+        final p = photoUrl.trim();
+        // Raw object path stored in DB (no scheme)
+        if (!p.startsWith('http')) {
+          return await getPhotoUrl(p);
         }
 
-        // If it's a URL, ensure it's signed
-        return await ensureSignedUrl(photoUrl);
+        // B2: always mint a new temp URL from object path when possible
+        final fromUrl = b2ObjectPathFromPhotoUrl(p);
+        if (fromUrl != null && fromUrl.isNotEmpty && B2BStorageConfig.isConfigured) {
+          return await getPhotoUrl(fromUrl);
+        }
+
+        return await ensureSignedUrl(p);
       }
 
-      // No valid data
       return null;
     } catch (e) {
-      // Return null on error (caller can handle)
+      if (kDebugMode) debugPrint('getTemporaryPhotoUrl: $e');
       return null;
     }
   }
 
-  /// Batch convert multiple photos to temporary URLs
+  /// Convert multiple photos to temporary URLs (parallel)
   /// Useful for displaying multiple student photos at once
   static Future<List<Map<String, dynamic>>> convertPhotosToTemporaryUrls(
     List<Map<String, dynamic>> photos,

@@ -2,7 +2,7 @@ name: smart_attendance_app
 description: "MSCE Smart Attendance Management System - Official Government App"
 publish_to: 'none'
 
-version: 1.0.0+1
+version: 2.0.0+2
 
 environment:
   sdk: ^3.10.3
@@ -46,9 +46,10 @@ dependencies:
   
   # Security & Anti-Fraud Packages
   device_info_plus: ^12.4.0  # Device fingerprinting
-  image: ^4.3.0  # Image processing & watermarking
+  image: ^4.8.0  # Image processing & watermarking
   exif: ^3.3.0  # EXIF metadata extraction
   connectivity_plus: ^7.1.1  # Network type detection
+  permission_handler: ^11.4.0  # First-launch camera / location / notification prompts
   http: ^1.2.2  # IP address detection
   path_provider: ^2.1.2  # File paths
   local_auth: ^3.0.1  # Biometric authentication (fingerprint/face unlock)
@@ -63,6 +64,9 @@ dependencies:
   
   # Responsive Design
   flutter_screenutil: ^5.9.0
+  google_mlkit_pose_detection: ^0.14.1
+  flutter_secure_storage: ^10.0.0
+  flutter_cache_manager: ^3.4.1
 
 
 dev_dependencies:
@@ -75,7 +79,7 @@ flutter_launcher_icons:
   android: true
   ios: true
   image_path: assets/msce_attendance_app_logo.png
-  adaptive_icon_background: "#1A3C6E"
+  adaptive_icon_background: "#FFFFFF"
   adaptive_icon_foreground: assets/msce_attendance_app_logo.png
   min_sdk_android: 21
 
@@ -88,3 +92,4 @@ flutter:
     - .env
     - assets/msce_attendance_app_logo.png
     - assets/models/mobilefacenet.tflite
+    - assets/models/anti_spoof_model.tflite

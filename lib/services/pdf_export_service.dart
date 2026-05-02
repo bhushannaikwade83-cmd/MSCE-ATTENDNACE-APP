@@ -11,8 +11,55 @@ import 'package:intl/intl.dart';
 import '../core/app_db.dart';
 import '../core/supabase_maps.dart';
 import '../core/time_parse.dart';
+import 'institute_status_service.dart';
 
 class PdfExportService {
+  static final DateFormat _pdfTimeFmt = DateFormat('HH:mm');
+  static final DateFormat _pdfDateFmt = DateFormat('MMM dd, yyyy');
+
+  /// Parse a DB date key (`yyyy-MM-dd`) as local calendar date (no timezone shift).
+  static DateTime _parseDateKeyLocal(String dateKey) {
+    try {
+      return DateFormat('yyyy-MM-dd').parseStrict(dateKey);
+    } catch (_) {
+      // Fallback for unexpected formats
+      return DateTime.tryParse(dateKey)?.toLocal() ?? DateTime.now();
+    }
+  }
+
+  static String _formatPdfLocalTime(DateTime dt) => _pdfTimeFmt.format(dt.toLocal());
+  static String _formatPdfLocalDateFromKey(String dateKey) =>
+      _pdfDateFmt.format(_parseDateKeyLocal(dateKey));
+
+  static Future<Map<String, String>> _holidayReasons({
+    required String instituteId,
+    required String startDate,
+    required String endDate,
+  }) async {
+    final rows = await appDb
+        .from('institute_daily_status')
+        .select('date_key,payload')
+        .eq('institute_id', instituteId)
+        .eq('student_id', InstituteStatusService.kInstituteStatusStudentId)
+        .gte('date_key', startDate)
+        .lte('date_key', endDate);
+
+    final out = <String, String>{};
+    for (final raw in rows) {
+      final row = raw as Map<String, dynamic>;
+      final date = row['date_key']?.toString() ?? '';
+      if (date.isEmpty) continue;
+      final payload = row['payload'];
+      final map = payload is Map
+          ? payload.map((k, v) => MapEntry(k.toString(), v))
+          : <String, dynamic>{};
+      if (map['status']?.toString() != 'holiday') continue;
+      final reason = map['reason']?.toString().trim();
+      out[date] = reason == null || reason.isEmpty ? 'Holiday' : reason;
+    }
+    return out;
+  }
+
   static String _rollKey(Map<String, dynamic> s) {
     final u = s['user_id'] as String?;
     final sr = s['sr_no'] as String?;
@@ -36,7 +83,216 @@ class PdfExportService {
 
   static String? _subjectFromRow(Map<String, dynamic> r) {
     final add = _additional(r['additional']);
-    return add['subject']?.toString() ?? r['semester_code']?.toString();
+    return add['subject']?.toString();
+  }
+
+  /// Groups rows that share the same calendar day and subject (case-insensitive).
+  /// Rows with no subject use a shared `'General'` bucket for that date.
+  static String _subjectMergeKey(Map<String, dynamic> r) {
+    final s = _subjectFromRow(r)?.trim() ?? '';
+    if (s.isEmpty) return '__general__';
+    return s.toLowerCase();
+  }
+
+  static String _subjectDisplayFromGroup(List<Map<String, dynamic>> list) {
+    for (final r in list) {
+      final s = _subjectFromRow(r)?.trim() ?? '';
+      if (s.isNotEmpty) return s;
+    }
+    return 'General';
+  }
+
+  static Map<String, dynamic> _mergeInOutRowsForDateSubject(
+    String date,
+    List<Map<String, dynamic>> list,
+    String subjectDisplay,
+  ) {
+    DateTime? entryTime;
+    DateTime? exitTime;
+    var status = 'absent';
+    double? hours;
+    var lectures = <String, dynamic>{};
+    DateTime? latestTs;
+    var autoClosedMissingExit = false;
+    String? autoClosedNote;
+
+    for (final data in list) {
+      final add = _additional(data['additional']);
+      final et = parseAnyTimestamp(add['entryTime']);
+      final xt = parseAnyTimestamp(add['exitTime']);
+      if (et != null) {
+        entryTime = entryTime == null || et.isBefore(entryTime!) ? et : entryTime;
+      }
+      if (xt != null) {
+        exitTime = exitTime == null || xt.isAfter(exitTime!) ? xt : exitTime;
+      }
+    }
+
+    void pickLectures(Map<String, dynamic> m) {
+      if (m.isEmpty) return;
+      lectures = Map<String, dynamic>.from(m);
+    }
+
+    for (final data in list) {
+      final add = _additional(data['additional']);
+      final typ = (data['type'] as String?)?.toLowerCase() ?? 'entry';
+      final created = parseAnyTimestamp(data['created_at']);
+      final st = _statusFromRow(data);
+      if (st == 'present') status = 'present';
+
+      if (add['hours'] != null) {
+        hours = (add['hours'] as num).toDouble();
+      }
+      if (add['lectures'] is Map) {
+        pickLectures(
+          Map<String, dynamic>.from((add['lectures'] as Map).cast<String, dynamic>()),
+        );
+      }
+
+      if (add['autoClosedMissingExit'] == true) {
+        autoClosedMissingExit = true;
+        final n = add['autoClosedNote']?.toString().trim();
+        if (n != null && n.isNotEmpty) autoClosedNote = n;
+      }
+
+      final etAdd = parseAnyTimestamp(add['entryTime']);
+      final xtAdd = parseAnyTimestamp(add['exitTime']);
+
+      if (created != null) {
+        latestTs = latestTs == null || created.isAfter(latestTs!) ? created : latestTs;
+      }
+
+      if (typ == 'exit') {
+        if (created != null) {
+          exitTime = exitTime == null || created.isAfter(exitTime!) ? created : exitTime;
+        }
+        if (xtAdd != null) {
+          exitTime = exitTime == null || xtAdd.isAfter(exitTime!) ? xtAdd : exitTime;
+        }
+      } else {
+        if (created != null) {
+          entryTime = entryTime == null || created.isBefore(entryTime!) ? created : entryTime;
+        }
+        if (etAdd != null) {
+          entryTime = entryTime == null || etAdd.isBefore(entryTime!) ? etAdd : entryTime;
+        }
+      }
+    }
+
+    for (final data in list) {
+      final add = _additional(data['additional']);
+      final et = parseAnyTimestamp(add['entryTime']);
+      final xt = parseAnyTimestamp(add['exitTime']);
+      if (et != null) {
+        entryTime = entryTime == null || et.isBefore(entryTime!) ? et : entryTime;
+      }
+      if (xt != null) {
+        exitTime = exitTime == null || xt.isAfter(exitTime!) ? xt : exitTime;
+      }
+    }
+
+    if (entryTime == null) {
+      for (final data in list) {
+        final typ = (data['type'] as String?)?.toLowerCase() ?? 'entry';
+        if (typ != 'entry') continue;
+        final c = parseAnyTimestamp(data['created_at']);
+        if (c != null) {
+          entryTime = entryTime == null || c.isBefore(entryTime!) ? c : entryTime;
+        }
+      }
+    }
+    if (exitTime == null) {
+      for (final data in list) {
+        final typ = (data['type'] as String?)?.toLowerCase() ?? 'entry';
+        if (typ != 'exit') continue;
+        final c = parseAnyTimestamp(data['created_at']);
+        if (c != null) {
+          exitTime = exitTime == null || c.isAfter(exitTime!) ? c : exitTime;
+        }
+      }
+    }
+
+    final typeEntry =
+        list.any((d) => (d['type']?.toString().toLowerCase().trim() == 'entry'));
+    final hasEntrySignal = entryTime != null || typeEntry;
+    final credited = hours != null && hours > 0;
+    if (hasEntrySignal ||
+        autoClosedMissingExit ||
+        credited ||
+        (exitTime != null && status == 'present')) {
+      status = 'present';
+    } else {
+      status = 'absent';
+    }
+
+    return {
+      'date': date,
+      'status': status,
+      'subject': subjectDisplay,
+      'timestamp': latestTs,
+      'entryTime': entryTime,
+      'exitTime': exitTime,
+      'hours': hours,
+      'lectures': lectures,
+      'type': 'session',
+      'autoClosedMissingExit': autoClosedMissingExit,
+      if (autoClosedNote != null && autoClosedNote.isNotEmpty) 'autoClosedNote': autoClosedNote,
+    };
+  }
+
+  /// True if [r] should be included when filtering reports/PDF by a single subject name.
+  static bool rowMatchesSubjectFilter(Map<String, dynamic> r, String? selectedSubject) {
+    if (selectedSubject == null ||
+        selectedSubject.isEmpty ||
+        selectedSubject == 'All Subjects') {
+      return true;
+    }
+    final subj = _subjectFromRow(r) ?? '';
+    if (subj.isEmpty) return false;
+    if (subj == selectedSubject) return true;
+    for (final part in subj.split(',')) {
+      if (part.trim() == selectedSubject) return true;
+    }
+    return false;
+  }
+
+  /// One row per calendar day **per subject**: merges separate `type: entry` / `type: exit`
+  /// rows from [attendance_in_out] within the same date and subject bucket.
+  static List<Map<String, dynamic>> mergeAttendanceInOutRowsByDate(
+    List<Map<String, dynamic>> rows,
+  ) {
+    if (rows.isEmpty) return [];
+    const sep = '|';
+    final byComposite = <String, List<Map<String, dynamic>>>{};
+    for (final r in rows) {
+      final d = r['attendance_date']?.toString() ?? '';
+      if (d.isEmpty) continue;
+      final mk = _subjectMergeKey(r);
+      byComposite.putIfAbsent('$d$sep$mk', () => []).add(r);
+    }
+    final sortedKeys = byComposite.keys.toList()..sort((a, b) {
+      final ia = a.indexOf(sep);
+      final ib = b.indexOf(sep);
+      final da = a.substring(0, ia);
+      final db = b.substring(0, ib);
+      final byDate = da.compareTo(db);
+      if (byDate != 0) return byDate;
+      final ka = a.substring(ia + sep.length);
+      final kb = b.substring(ib + sep.length);
+      if (ka == '__general__' && kb != '__general__') return 1;
+      if (ka != '__general__' && kb == '__general__') return -1;
+      return ka.compareTo(kb);
+    });
+
+    final out = <Map<String, dynamic>>[];
+    for (final key in sortedKeys) {
+      final i = key.indexOf(sep);
+      final date = key.substring(0, i);
+      final list = byComposite[key]!;
+      final display = _subjectDisplayFromGroup(list);
+      out.add(_mergeInOutRowsForDateSubject(date, list, display));
+    }
+    return out;
   }
 
   /// Generate PDF report for all students with daily attendance
@@ -49,6 +305,11 @@ class PdfExportService {
     final pdf = pw.Document();
     final startDateStr = DateFormat('yyyy-MM-dd').format(startDate);
     final endDateStr = DateFormat('yyyy-MM-dd').format(endDate);
+    final holidays = await _holidayReasons(
+      instituteId: instituteId,
+      startDate: startDateStr,
+      endDate: endDateStr,
+    );
 
     final code = await instituteCodeForId(instituteId);
     var attRows = await appDb
@@ -61,8 +322,7 @@ class PdfExportService {
     if (subject != null && subject != 'All Subjects') {
       attRows = attRows.where((raw) {
         final r = raw as Map<String, dynamic>;
-        final subj = _subjectFromRow(r);
-        return subj == subject;
+        return rowMatchesSubjectFilter(r, subject);
       }).toList();
     }
 
@@ -78,7 +338,6 @@ class PdfExportService {
       studentData[roll] = {
         'name': row['name'] as String? ?? 'Unknown',
         'rollNumber': roll,
-        'batchName': row['batch_name'] as String? ?? '',
         'photoUrl': row['photo_url'] as String? ?? row['face_photo_url'] as String? ?? '',
       };
       studentAttendance[roll] = [];
@@ -93,6 +352,7 @@ class PdfExportService {
       if (rk.isNotEmpty) idToRoll[id] = rk;
     }
 
+    final Map<String, List<Map<String, dynamic>>> rawByRoll = {};
     for (final raw in attRows) {
       final data = raw as Map<String, dynamic>;
       final sid = data['student_id'] as String? ?? '';
@@ -109,27 +369,13 @@ class PdfExportService {
       }
       if (roll.isEmpty) roll = sr;
       if (roll.isEmpty) continue;
+      rawByRoll.putIfAbsent(roll, () => []).add(data);
+    }
 
-      final date = data['attendance_date']?.toString() ?? '';
-      final status = _statusFromRow(data);
-      final subjectName = _subjectFromRow(data) ?? '';
-      final add = _additional(data['additional']);
-      final entryTime = parseAnyTimestamp(add['entryTime'] ?? data['created_at']);
-      final exitTime = parseAnyTimestamp(add['exitTime']);
-      final lectures = add['lectures'] is Map ? Map<String, dynamic>.from((add['lectures'] as Map).cast<String, dynamic>()) : <String, dynamic>{};
-
-      if (date.isEmpty) continue;
-      studentAttendance.putIfAbsent(roll, () => []);
-      studentAttendance[roll]!.add({
-        'date': date,
-        'status': status,
-        'subject': subjectName,
-        'timestamp': parseAnyTimestamp(data['created_at']),
-        'entryTime': entryTime,
-        'exitTime': exitTime,
-        'hours': (add['hours'] as num?)?.toDouble(),
-        'lectures': lectures,
-      });
+    for (final e in rawByRoll.entries) {
+      final merged = mergeAttendanceInOutRowsByDate(e.value);
+      studentAttendance.putIfAbsent(e.key, () => []);
+      studentAttendance[e.key]!.addAll(merged);
     }
 
     pdf.addPage(
@@ -154,7 +400,7 @@ class PdfExportService {
                     ),
                     pw.SizedBox(height: 4),
                     pw.Text(
-                      '${DateFormat('MMM dd, yyyy').format(startDate)} - ${DateFormat('MMM dd, yyyy').format(endDate)}',
+                      '${_pdfDateFmt.format(startDate)} - ${_pdfDateFmt.format(endDate)}',
                       style: pw.TextStyle(fontSize: 12, color: PdfColors.grey700),
                     ),
                     if (subject != null && subject != 'All Subjects')
@@ -165,13 +411,45 @@ class PdfExportService {
                   ],
                 ),
                 pw.Text(
-                  DateFormat('MMM dd, yyyy').format(DateTime.now()),
+                  _pdfDateFmt.format(DateTime.now()),
                   style: pw.TextStyle(fontSize: 10, color: PdfColors.grey600),
                 ),
               ],
             ),
           ),
           pw.SizedBox(height: 20),
+          if (holidays.isNotEmpty) ...[
+            pw.Container(
+              padding: const pw.EdgeInsets.all(12),
+              decoration: pw.BoxDecoration(
+                color: PdfColors.orange50,
+                border: pw.Border.all(color: PdfColors.orange300),
+                borderRadius: pw.BorderRadius.circular(8),
+              ),
+              child: pw.Column(
+                crossAxisAlignment: pw.CrossAxisAlignment.start,
+                children: [
+                  pw.Text(
+                    'Institute Holidays',
+                    style: pw.TextStyle(
+                      fontSize: 14,
+                      fontWeight: pw.FontWeight.bold,
+                      color: PdfColors.orange800,
+                    ),
+                  ),
+                  pw.SizedBox(height: 6),
+                  ...holidays.entries.map((e) => pw.Padding(
+                        padding: const pw.EdgeInsets.only(bottom: 3),
+                        child: pw.Text(
+                          '${_formatPdfLocalDateFromKey(e.key)}: ${e.value}',
+                          style: const pw.TextStyle(fontSize: 10),
+                        ),
+                      )),
+                ],
+              ),
+            ),
+            pw.SizedBox(height: 16),
+          ],
           pw.Text(
             'Students Attendance Summary',
             style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold),
@@ -193,10 +471,6 @@ class PdfExportService {
                   ),
                   pw.Padding(
                     padding: const pw.EdgeInsets.all(8),
-                    child: pw.Text('Batch', style: pw.TextStyle(fontWeight: pw.FontWeight.bold)),
-                  ),
-                  pw.Padding(
-                    padding: const pw.EdgeInsets.all(8),
                     child: pw.Text('Present', style: pw.TextStyle(fontWeight: pw.FontWeight.bold)),
                   ),
                   pw.Padding(
@@ -211,6 +485,13 @@ class PdfExportService {
                     padding: const pw.EdgeInsets.all(8),
                     child: pw.Text('Percentage', style: pw.TextStyle(fontWeight: pw.FontWeight.bold)),
                   ),
+                  pw.Padding(
+                    padding: const pw.EdgeInsets.all(8),
+                    child: pw.Text(
+                      'Total seated',
+                      style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 9),
+                    ),
+                  ),
                 ],
               ),
               ...studentData.entries.map((entry) {
@@ -221,6 +502,13 @@ class PdfExportService {
                 final absentCount = attendance.where((a) => a['status'] == 'absent').length;
                 final total = attendance.length;
                 final percentage = total > 0 ? (presentCount / total * 100) : 0.0;
+                var seatedTotal = Duration.zero;
+                for (final a in attendance) {
+                  final d = seatedDurationFromMergedAttendanceDay(a);
+                  if (d != null && !d.isNegative) seatedTotal += d;
+                }
+                final seatedStr =
+                    seatedTotal > Duration.zero ? formatSeatedDurationHuman(seatedTotal) : '—';
 
                 return pw.TableRow(
                   children: [
@@ -232,13 +520,6 @@ class PdfExportService {
                       padding: const pw.EdgeInsets.all(8),
                       child: pw.Text(
                         student['name'] as String? ?? 'Unknown',
-                        style: const pw.TextStyle(fontSize: 10),
-                      ),
-                    ),
-                    pw.Padding(
-                      padding: const pw.EdgeInsets.all(8),
-                      child: pw.Text(
-                        student['batchName'] as String? ?? '',
                         style: const pw.TextStyle(fontSize: 10),
                       ),
                     ),
@@ -264,6 +545,10 @@ class PdfExportService {
                         ),
                       ),
                     ),
+                    pw.Padding(
+                      padding: const pw.EdgeInsets.all(8),
+                      child: pw.Text(seatedStr, style: const pw.TextStyle(fontSize: 9)),
+                    ),
                   ],
                 );
               }),
@@ -286,6 +571,11 @@ class PdfExportService {
     final pdf = pw.Document();
     final startDateStr = DateFormat('yyyy-MM-dd').format(startDate);
     final endDateStr = DateFormat('yyyy-MM-dd').format(endDate);
+    final holidays = await _holidayReasons(
+      instituteId: instituteId,
+      startDate: startDateStr,
+      endDate: endDateStr,
+    );
 
     final allStudents = await appDb.from('students').select().eq('institute_id', instituteId);
     Map<String, dynamic>? studentData;
@@ -303,7 +593,6 @@ class PdfExportService {
     }
     final studentId = studentData['id'] as String;
     final studentName = studentData['name'] as String? ?? 'Unknown';
-    final batchName = studentData['batch_name'] as String? ?? '';
     final photoUrl = studentData['photo_url'] as String? ?? studentData['face_photo_url'] as String?;
 
     final code = await instituteCodeForId(instituteId);
@@ -317,55 +606,39 @@ class PdfExportService {
         .order('attendance_date');
 
     final attendanceDocs = rawAtt.map((e) => e as Map<String, dynamic>).toList();
-
-    final Map<String, List<Map<String, dynamic>>> subjectAttendance = {};
-    final List<Map<String, dynamic>> dailyAttendance = [];
-
-    for (final data in attendanceDocs) {
-      final date = data['attendance_date']?.toString() ?? '';
-      final status = _statusFromRow(data);
-      final subj = _subjectFromRow(data) ?? 'Unknown';
-      final add = _additional(data['additional']);
-      final created = parseAnyTimestamp(data['created_at']);
-      final typ = data['type'] as String? ?? 'entry';
-      DateTime? entryTime;
-      DateTime? exitTime;
-      if (typ == 'entry') {
-        entryTime = created;
-      } else {
-        exitTime = created;
-      }
-
-      dailyAttendance.add({
-        'date': date,
-        'status': status,
-        'subject': subj,
-        'timestamp': created,
-        'entryTime': entryTime,
-        'exitTime': exitTime,
-        'hours': (add['hours'] as num?)?.toDouble(),
-        'lectures': add['lectures'] is Map ? Map<String, dynamic>.from((add['lectures'] as Map).cast<String, dynamic>()) : <String, dynamic>{},
-        'type': typ,
-      });
-
-      subjectAttendance.putIfAbsent(subj, () => []);
-      subjectAttendance[subj]!.add({
-        'date': date,
-        'status': status,
-        'timestamp': created,
-      });
-    }
-
-    dailyAttendance.sort((a, b) {
-      final da = a['date'] as String? ?? '';
-      final db = b['date'] as String? ?? '';
-      return da.compareTo(db);
+    final dailyAttendance = mergeAttendanceInOutRowsByDate(attendanceDocs);
+    final dailyDetails = <Map<String, dynamic>>[
+      ...dailyAttendance,
+      ...holidays.entries.map((e) => {
+            'date': e.key,
+            'status': 'holiday',
+            'reason': e.value,
+          }),
+    ]..sort((a, b) {
+      final da = a['date'] as String;
+      final db = b['date'] as String;
+      final byDate = da.compareTo(db);
+      if (byDate != 0) return byDate;
+      final ha = a['status'] == 'holiday';
+      final hb = b['status'] == 'holiday';
+      if (ha != hb) return ha ? 1 : -1;
+      final sa = (a['subject'] as String? ?? '').toLowerCase();
+      final sb = (b['subject'] as String? ?? '').toLowerCase();
+      return sa.compareTo(sb);
     });
 
     final totalLectures = dailyAttendance.length;
     final presentCount = dailyAttendance.where((a) => a['status'] == 'present').length;
     final absentCount = dailyAttendance.where((a) => a['status'] == 'absent').length;
     final percentage = totalLectures > 0 ? (presentCount / totalLectures * 100) : 0.0;
+
+    var periodSeatedTotal = Duration.zero;
+    for (final m in dailyAttendance) {
+      final d = seatedDurationFromMergedAttendanceDay(m);
+      if (d != null && !d.isNegative) {
+        periodSeatedTotal += d;
+      }
+    }
 
     pw.ImageProvider? photoProvider;
     if (photoUrl != null && photoUrl.isNotEmpty) {
@@ -432,14 +705,9 @@ class PdfExportService {
                       'Roll Number: $rollNumber',
                       style: pw.TextStyle(fontSize: 14, color: PdfColors.grey700),
                     ),
-                    if (batchName.isNotEmpty)
-                      pw.Text(
-                        'Batch: $batchName',
-                        style: pw.TextStyle(fontSize: 14, color: PdfColors.grey700),
-                      ),
                     pw.SizedBox(height: 8),
                     pw.Text(
-                      '${DateFormat('MMM dd, yyyy').format(startDate)} - ${DateFormat('MMM dd, yyyy').format(endDate)}',
+                      '${_pdfDateFmt.format(startDate)} - ${_pdfDateFmt.format(endDate)}',
                       style: pw.TextStyle(fontSize: 12, color: PdfColors.grey600),
                     ),
                   ],
@@ -468,7 +736,7 @@ class PdfExportService {
                       ),
                     ),
                     pw.Text(
-                      'Total Lectures',
+                      'Total sessions',
                       style: pw.TextStyle(fontSize: 10, color: PdfColors.grey700),
                     ),
                   ],
@@ -521,67 +789,34 @@ class PdfExportService {
                     ),
                   ],
                 ),
+                pw.Column(
+                  children: [
+                    pw.Text(
+                      periodSeatedTotal > Duration.zero
+                          ? formatSeatedDurationHuman(periodSeatedTotal)
+                          : '—',
+                      style: pw.TextStyle(
+                        fontSize: 20,
+                        fontWeight: pw.FontWeight.bold,
+                        color: PdfColors.indigo700,
+                      ),
+                    ),
+                    pw.Text(
+                      'Total seated',
+                      style: pw.TextStyle(fontSize: 10, color: PdfColors.grey700),
+                    ),
+                  ],
+                ),
               ],
             ),
           ),
-          pw.SizedBox(height: 30),
-          pw.Text(
-            'Subject-wise Attendance',
-            style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold),
-          ),
-          pw.SizedBox(height: 10),
-          ...subjectAttendance.entries.map((entry) {
-            final subject = entry.key;
-            final records = entry.value;
-            final subjectTotal = records.length;
-            final subjectPresent = records.where((r) => r['status'] == 'present').length;
-            final subjectPercentage = subjectTotal > 0 ? (subjectPresent / subjectTotal * 100) : 0.0;
-
-            return pw.Container(
-              margin: const pw.EdgeInsets.only(bottom: 12),
-              padding: const pw.EdgeInsets.all(12),
-              decoration: pw.BoxDecoration(
-                border: pw.Border.all(color: PdfColors.grey300),
-                borderRadius: pw.BorderRadius.circular(8),
-              ),
-              child: pw.Column(
-                crossAxisAlignment: pw.CrossAxisAlignment.start,
-                children: [
-                  pw.Row(
-                    mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
-                    children: [
-                      pw.Text(
-                        subject,
-                        style: pw.TextStyle(
-                          fontSize: 14,
-                          fontWeight: pw.FontWeight.bold,
-                        ),
-                      ),
-                      pw.Text(
-                        '$subjectPresent/$subjectTotal (${subjectPercentage.toStringAsFixed(1)}%)',
-                        style: pw.TextStyle(
-                          fontSize: 12,
-                          color: subjectPercentage >= 75 ? PdfColors.green700 : PdfColors.red700,
-                        ),
-                      ),
-                    ],
-                  ),
-                  pw.SizedBox(height: 8),
-                  pw.Text(
-                    'Attended: $subjectPresent | Total: $subjectTotal',
-                    style: pw.TextStyle(fontSize: 11, color: PdfColors.grey700),
-                  ),
-                ],
-              ),
-            );
-          }),
           pw.SizedBox(height: 20),
           pw.Text(
             'Daily Attendance Details',
             style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold),
           ),
           pw.SizedBox(height: 10),
-          if (dailyAttendance.isEmpty)
+          if (dailyDetails.isEmpty)
             pw.Container(
               padding: const pw.EdgeInsets.all(16),
               decoration: pw.BoxDecoration(
@@ -607,6 +842,10 @@ class PdfExportService {
                     ),
                     pw.Padding(
                       padding: const pw.EdgeInsets.all(8),
+                      child: pw.Text('Subject', style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 10)),
+                    ),
+                    pw.Padding(
+                      padding: const pw.EdgeInsets.all(8),
                       child: pw.Text('Entry Time', style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 10)),
                     ),
                     pw.Padding(
@@ -615,11 +854,10 @@ class PdfExportService {
                     ),
                     pw.Padding(
                       padding: const pw.EdgeInsets.all(8),
-                      child: pw.Text('Hours', style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 10)),
-                    ),
-                    pw.Padding(
-                      padding: const pw.EdgeInsets.all(8),
-                      child: pw.Text('Lectures', style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 10)),
+                      child: pw.Text(
+                        'Seated',
+                        style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 10),
+                      ),
                     ),
                     pw.Padding(
                       padding: const pw.EdgeInsets.all(8),
@@ -627,50 +865,70 @@ class PdfExportService {
                     ),
                   ],
                 ),
-                ...dailyAttendance.map((record) {
+                ...dailyDetails.map((record) {
                   final date = record['date'] as String;
                   final status = record['status'] as String;
+                  final reason = record['reason'] as String?;
+                  final subjectLabel =
+                      status == 'holiday' ? '—' : (record['subject'] as String? ?? 'General');
                   final entryTime = record['entryTime'] as DateTime?;
                   final exitTime = record['exitTime'] as DateTime?;
-                  final lectures = record['lectures'] as Map<String, dynamic>? ?? {};
-
                   var entryTimeStr = '-';
                   if (entryTime != null) {
-                    entryTimeStr = DateFormat('hh:mm a').format(entryTime);
+                    entryTimeStr = _formatPdfLocalTime(entryTime);
                   }
 
                   var exitTimeStr = '-';
                   if (exitTime != null) {
-                    exitTimeStr = DateFormat('hh:mm a').format(exitTime);
+                    exitTimeStr = _formatPdfLocalTime(exitTime);
                   } else if (status == 'absent') {
                     exitTimeStr = 'No Exit';
+                  } else if (status == 'holiday') {
+                    exitTimeStr = reason == null || reason.isEmpty ? 'Holiday' : reason;
                   }
 
-                  var hoursStr = '-';
-                  if (entryTime != null && exitTime != null) {
-                    final duration = exitTime.difference(entryTime);
-                    final hours = duration.inMinutes / 60.0;
-                    hoursStr = '${hours.toStringAsFixed(2)} hrs';
-                  } else if (record['hours'] != null) {
-                    final hours = record['hours'] as double? ?? 0.0;
-                    hoursStr = '${hours.toStringAsFixed(2)} hrs';
+                  final autoClosed = record['autoClosedMissingExit'] == true;
+                  final policyNote = record['autoClosedNote'] as String?;
+
+                  final seatedDur = seatedDurationFromMergedAttendanceDay(record);
+                  final hc = record['hours'];
+                  final String seatedStr;
+                  if (autoClosed) {
+                    final h = record['hours'];
+                    final tail =
+                        h is num ? ' (${h.toStringAsFixed(2)} h credited)' : '';
+                    seatedStr =
+                        'No exit photo$tail${policyNote != null ? '. $policyNote' : ''}';
+                  } else if (hc is num && hc > 0) {
+                    seatedStr =
+                        '${hc.toStringAsFixed(2)} h credited${seatedDur != null && seatedDur > Duration.zero ? ' (${formatSeatedDurationHuman(seatedDur)} seated)' : ''}';
+                  } else if (seatedDur != null && seatedDur > Duration.zero) {
+                    seatedStr = formatSeatedDurationHuman(seatedDur);
+                  } else {
+                    seatedStr = '—';
                   }
 
-                  final markedLectures = lectures.entries.where((e) {
-                    final lecture = e.value as Map<String, dynamic>?;
-                    return lecture?['marked'] == true;
-                  }).length;
-                  final totalLec = lectures.length;
-                  final lecturesStr = totalLec > 0 ? '$markedLectures/$totalLec' : '-';
+                  var statusCell = status == 'holiday'
+                      ? 'Holiday'
+                      : status == 'absent'
+                          ? 'Absent'
+                          : (status == 'pending' ? 'Pending' : 'Present');
+                  if (autoClosed && status == 'present') {
+                    statusCell = 'Present (policy)';
+                  }
 
                   return pw.TableRow(
                     children: [
                       pw.Padding(
                         padding: const pw.EdgeInsets.all(8),
                         child: pw.Text(
-                          DateFormat('MMM dd, yyyy').format(DateTime.parse(date)),
+                          _formatPdfLocalDateFromKey(date),
                           style: const pw.TextStyle(fontSize: 9),
                         ),
+                      ),
+                      pw.Padding(
+                        padding: const pw.EdgeInsets.all(8),
+                        child: pw.Text(subjectLabel, style: const pw.TextStyle(fontSize: 9)),
                       ),
                       pw.Padding(
                         padding: const pw.EdgeInsets.all(8),
@@ -682,19 +940,17 @@ class PdfExportService {
                       ),
                       pw.Padding(
                         padding: const pw.EdgeInsets.all(8),
-                        child: pw.Text(hoursStr, style: const pw.TextStyle(fontSize: 9)),
-                      ),
-                      pw.Padding(
-                        padding: const pw.EdgeInsets.all(8),
-                        child: pw.Text(lecturesStr, style: const pw.TextStyle(fontSize: 9)),
+                        child: pw.Text(seatedStr, style: const pw.TextStyle(fontSize: 9)),
                       ),
                       pw.Padding(
                         padding: const pw.EdgeInsets.all(8),
                         child: pw.Text(
-                          status == 'absent' ? 'Absent' : (status == 'pending' ? 'Pending' : 'Present'),
+                          statusCell,
                           style: pw.TextStyle(
                             fontSize: 9,
-                            color: status == 'absent'
+                            color: status == 'holiday'
+                                ? PdfColors.orange700
+                                : status == 'absent'
                                 ? PdfColors.red700
                                 : (status == 'pending' ? PdfColors.orange700 : PdfColors.green700),
                           ),
@@ -703,6 +959,46 @@ class PdfExportService {
                     ],
                   );
                 }),
+                pw.TableRow(
+                  decoration: const pw.BoxDecoration(color: PdfColors.grey100),
+                  children: [
+                    pw.Padding(
+                      padding: const pw.EdgeInsets.all(8),
+                      child: pw.Text(
+                        'Total (period)',
+                        style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 9),
+                      ),
+                    ),
+                    pw.Padding(
+                      padding: const pw.EdgeInsets.all(8),
+                      child: pw.Text('—', style: const pw.TextStyle(fontSize: 9)),
+                    ),
+                    pw.Padding(
+                      padding: const pw.EdgeInsets.all(8),
+                      child: pw.Text('—', style: const pw.TextStyle(fontSize: 9)),
+                    ),
+                    pw.Padding(
+                      padding: const pw.EdgeInsets.all(8),
+                      child: pw.Text('—', style: const pw.TextStyle(fontSize: 9)),
+                    ),
+                    pw.Padding(
+                      padding: const pw.EdgeInsets.all(8),
+                      child: pw.Text(
+                        periodSeatedTotal > Duration.zero
+                            ? formatSeatedDurationHuman(periodSeatedTotal)
+                            : '—',
+                        style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 9),
+                      ),
+                    ),
+                    pw.Padding(
+                      padding: const pw.EdgeInsets.all(8),
+                      child: pw.Text(
+                        '$presentCount / $totalLectures sessions',
+                        style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 9),
+                      ),
+                    ),
+                  ],
+                ),
               ],
             ),
         ],

@@ -68,7 +68,6 @@ STUDENTS_COLUMNS = [
     "first_name",
     "middle_name",
     "last_name",
-    "phone_number",
     "sr_no",
     "user_id",
     "year",
@@ -78,7 +77,6 @@ STUDENTS_COLUMNS = [
     "created_at",
     "updated_at",
     "sr_no_migrated_at",
-    "email",
     "batch_ids",
     "batch_name",
     "batch_timing",
@@ -271,7 +269,6 @@ def main():
             "",
             "",
             "",
-            "9123456789",
             "1",
             "ROLL001",
             "2025",
@@ -281,7 +278,6 @@ def main():
             "",  # created_at
             "",  # updated_at
             "",  # sr_no_migrated_at
-            "",
             "",  # batch_ids text[] e.g. {uuid} if multi-batch
             "Batch 1 (08:00 - 09:00)",
             "08:00 - 09:00",
@@ -304,7 +300,6 @@ def main():
             "Sneha",
             "",
             "Kulkarni",
-            "9988776655",
             "2",
             "ROLL002",
             "2025",
@@ -314,7 +309,6 @@ def main():
             "",
             "",
             "",
-            "sneha.example@email.com",
             "",
             "Batch 2 (09:00 - 10:00)",
             "09:00 - 10:00",

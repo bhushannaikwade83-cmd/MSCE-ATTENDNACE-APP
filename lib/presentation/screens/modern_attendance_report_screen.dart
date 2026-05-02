@@ -3,7 +3,9 @@ import 'package:intl/intl.dart';
 import 'dart:math' as math;
 import 'package:flutter_screenutil/flutter_screenutil.dart';
 import '../../core/utils/responsive.dart';
+import '../../core/utils/responsive_page.dart';
 import '../../core/theme/app_theme.dart';
+import '../../services/attendance_debug_service.dart';
 
 /// Modern Attendance Report Screen with Charts
 class ModernAttendanceReportScreen extends StatefulWidget {
@@ -21,6 +23,25 @@ class ModernAttendanceReportScreen extends StatefulWidget {
 }
 
 class _ModernAttendanceReportScreenState extends State<ModernAttendanceReportScreen> {
+  /// Test function to debug attendance database
+  Future<void> _testAttendance() async {
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('🔍 Running attendance diagnostics... Check console')),
+    );
+
+    await AttendanceDebugService.debugUniqueTypeValues(
+      instituteCode: widget.instituteId,
+      startDate: DateTime.now().subtract(Duration(days: 30)),
+      endDate: DateTime.now(),
+    );
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('✅ Diagnostic complete! Check console output')),
+      );
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -38,12 +59,17 @@ class _ModernAttendanceReportScreenState extends State<ModernAttendanceReportScr
         ),
         actions: [
           IconButton(
+            icon: const Icon(Icons.bug_report, color: Colors.white),
+            tooltip: 'Test Attendance Data',
+            onPressed: _testAttendance,
+          ),
+          IconButton(
             icon: const Icon(Icons.description, color: Colors.white),
             onPressed: () {},
           ),
         ],
       ),
-      body: SingleChildScrollView(
+      body: ResponsiveScrollBody(
         padding: const EdgeInsets.all(16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -93,8 +119,8 @@ class _ModernAttendanceReportScreenState extends State<ModernAttendanceReportScr
           ),
           const SizedBox(height: 20),
           SizedBox(
-            width: 200,
-            height: 200,
+            width: Responsive.pctShortestSide(context, 0.42).clamp(170.0, 220.0),
+            height: Responsive.pctShortestSide(context, 0.42).clamp(170.0, 220.0),
             child: CustomPaint(
               painter: DonutChartPainter(),
               child: const Center(
@@ -177,9 +203,9 @@ class _ModernAttendanceReportScreenState extends State<ModernAttendanceReportScr
     return GridView.builder(
       shrinkWrap: true,
       physics: const NeverScrollableScrollPhysics(),
-      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-        crossAxisCount: 2,
-        childAspectRatio: 2.5,
+      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: Responsive.isTablet(context) ? 3 : 2,
+        childAspectRatio: Responsive.isTablet(context) ? 2.8 : 2.2,
         crossAxisSpacing: 12,
         mainAxisSpacing: 12,
       ),

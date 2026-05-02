@@ -125,7 +125,7 @@ abstract class AppLocalizations {
   /// No description provided for @footerCredit.
   ///
   /// In en, this message translates to:
-  /// **'Powered by Digitrix Media'**
+  /// **'Powered by MSCE - Maharashtra State Council of Education'**
   String get footerCredit;
 
   /// No description provided for @mainNavSubtitleAdmin.
@@ -134,11 +134,11 @@ abstract class AppLocalizations {
   /// **'Admin dashboard  |  प्रशासक डॅशबोर्ड'**
   String get mainNavSubtitleAdmin;
 
-  /// No description provided for @mainNavSubtitleBatch.
+  /// No description provided for @mainNavSubtitleInstructor.
   ///
   /// In en, this message translates to:
-  /// **'Batch management  |  तुकडी व्यवस्थापन'**
-  String get mainNavSubtitleBatch;
+  /// **'Instructor user  |  प्रशिक्षक वापरकर्ता'**
+  String get mainNavSubtitleInstructor;
 
   /// No description provided for @mainNavSubtitleStudent.
   ///
@@ -173,7 +173,7 @@ abstract class AppLocalizations {
   /// No description provided for @splashCredit.
   ///
   /// In en, this message translates to:
-  /// **'Powered by Digitrix Media'**
+  /// **'Powered by MSCE - Maharashtra State Council of Education'**
   String get splashCredit;
 
   /// No description provided for @splashLoading.
@@ -235,24 +235,6 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'Secure'**
   String get chipSecure;
-
-  /// No description provided for @badgeGovtCertified.
-  ///
-  /// In en, this message translates to:
-  /// **'Govt. Certified  |  सरकारी प्रमाणित'**
-  String get badgeGovtCertified;
-
-  /// No description provided for @badgeSslSecured.
-  ///
-  /// In en, this message translates to:
-  /// **'SSL Secured  |  SSL सुरक्षित'**
-  String get badgeSslSecured;
-
-  /// No description provided for @badgeCertInCompliant.
-  ///
-  /// In en, this message translates to:
-  /// **'CERT-In Compliant  |  CERT-In अनुपालन'**
-  String get badgeCertInCompliant;
 }
 
 class _AppLocalizationsDelegate

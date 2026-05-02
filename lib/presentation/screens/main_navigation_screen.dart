@@ -1,13 +1,15 @@
 import 'package:flutter/material.dart';
 import 'package:smart_attendance_app/l10n/app_localizations.dart';
+import '../../services/geofence_service.dart';
 import 'admin_home_screen.dart';
 import 'student_management_screen.dart';
 import 'attendance_reports_screen.dart';
-import 'add_student_screen.dart';
-import 'batch_management_screen.dart';
+import 'add_institute_attendance_user_screen.dart';
 import 'gps_settings_screen.dart';
 import '../widgets/modern_bottom_nav_bar.dart';
+import '../widgets/session_monitor.dart';
 import '../../core/theme/app_theme.dart';
+import 'institute_location_gate_screen.dart';
 
 /// Main Navigation Screen with Bottom Navigation Bar
 /// Provides easy access to all features
@@ -20,28 +22,96 @@ class MainNavigationScreen extends StatefulWidget {
   State<MainNavigationScreen> createState() => _MainNavigationScreenState();
 }
 
-class _MainNavigationScreenState extends State<MainNavigationScreen> {
+class _MainNavigationScreenState extends State<MainNavigationScreen>
+    with WidgetsBindingObserver {
   int _currentIndex = 0;
   final PageController _pageController = PageController();
-
-  List<Widget> get _screens => [
-    const AdminHomeScreen(),
-    const BatchManagementScreen(),
-    const StudentManagementScreen(), // View Students Screen
-    const GpsSettingsScreen(),
-    const AttendanceReportsScreen(),
+  late final List<Widget> _screens = [
+    const AdminHomeScreen(key: PageStorageKey('main-admin-home')),
+    const AddInstituteAttendanceUserScreen(key: PageStorageKey('main-add-user')),
+    const StudentManagementScreen(key: PageStorageKey('main-students')),
+    const GpsSettingsScreen(key: PageStorageKey('main-gps')),
+    const AttendanceReportsScreen(key: PageStorageKey('main-reports')),
   ];
 
   @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _redirectIfAdminNeedsGps());
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _pageController.dispose();
     super.dispose();
   }
 
-  void _onNavItemTapped(int index) {
-    setState(() {
-      _currentIndex = index;
-    });
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    if (state == AppLifecycleState.resumed) {
+      Future.delayed(const Duration(milliseconds: 550), () async {
+        if (!mounted || SessionMonitor.shouldSkipResumeLockForCamera) return;
+        final ok = await GeofenceService().hasValidPersonalGpsForCurrentAdmin();
+        if (!mounted || !ok) return;
+        final gate = await GeofenceService().attendanceLocationGateForCurrentUser();
+        if (!mounted || gate['allowed'] == true) return;
+        Navigator.pushNamedAndRemoveUntil(
+          context,
+          InstituteLocationGateScreen.routeName,
+          (_) => false,
+          arguments: {'resumeRoute': MainNavigationScreen.routeName},
+        );
+      });
+    }
+  }
+
+  Future<void> _redirectIfAdminNeedsGps() async {
+    if (!mounted) return;
+    final ok = await GeofenceService().hasValidPersonalGpsForCurrentAdmin();
+    if (!mounted) return;
+    if (!ok) {
+      Navigator.pushNamedAndRemoveUntil(
+        context,
+        GpsSettingsScreen.routeName,
+        (route) => false,
+        arguments: {'mandatory': true, 'fromLogin': true},
+      );
+      return;
+    }
+    final gate = await GeofenceService().attendanceLocationGateForCurrentUser();
+    if (!mounted || gate['allowed'] == true) return;
+    Navigator.pushNamedAndRemoveUntil(
+      context,
+      InstituteLocationGateScreen.routeName,
+      (_) => false,
+      arguments: {'resumeRoute': MainNavigationScreen.routeName},
+    );
+  }
+
+  Future<void> _onNavItemTapped(int index) async {
+    // Add user (1) and Reports (4) require a locked attendance GPS zone for admins.
+    if (index == 1 || index == 4) {
+      final ok = await GeofenceService().hasValidPersonalGpsForCurrentAdmin();
+      if (!mounted) return;
+      if (!ok) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Lock your attendance zone in GPS Settings before adding users or viewing reports.',
+            ),
+            backgroundColor: Colors.orange,
+            duration: Duration(seconds: 4),
+          ),
+        );
+        setState(() => _currentIndex = 3);
+        _pageController.jumpToPage(3);
+        return;
+      }
+    }
+    setState(() => _currentIndex = index);
     _pageController.jumpToPage(index);
   }
 
@@ -50,7 +120,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
     final l10n = AppLocalizations.of(context);
     final navSubtitles = <String>[
       l10n.mainNavSubtitleAdmin,
-      l10n.mainNavSubtitleBatch,
+      l10n.mainNavSubtitleInstructor,
       l10n.mainNavSubtitleStudent,
       l10n.mainNavSubtitleGps,
       l10n.mainNavSubtitleReports,
@@ -62,6 +132,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
         // If didPop is false, pop was prevented (no previous route), also no action needed
       },
       child: Scaffold(
+        resizeToAvoidBottomInset: true,
         backgroundColor: AppTheme.backgroundGrey,
         body: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -84,7 +155,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
         ),
       bottomNavigationBar: ModernBottomNavBar(
         selectedIndex: _currentIndex,
-        onTap: _onNavItemTapped,
+        onTap: (i) => _onNavItemTapped(i),
       ),
       ),
     );
@@ -131,7 +202,7 @@ class _SearchScreenState extends State<_SearchScreen> {
             child: TextField(
               controller: _searchController,
               decoration: InputDecoration(
-                hintText: 'Search students, batches, attendance...',
+                hintText: 'Search students, attendance...',
                 prefixIcon: const Icon(Icons.search, color: AppTheme.primaryBlue),
                 suffixIcon: _searchQuery.isNotEmpty
                     ? IconButton(
@@ -182,7 +253,7 @@ class _SearchScreenState extends State<_SearchScreen> {
           ),
           const SizedBox(height: 16),
           Text(
-            'Search for students, batches, or attendance',
+            'Search for students or attendance',
             style: TextStyle(
               fontSize: 16,
               color: Colors.grey.shade600,
@@ -194,12 +265,12 @@ class _SearchScreenState extends State<_SearchScreen> {
   }
 
   Widget _buildSearchResults() {
-    // In a real app, this would search through Firestore
+    // Placeholder search results (wire to your data source when needed)
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
         _buildSearchResultItem('Students', Icons.person, 'Search students by name or roll number'),
-        _buildSearchResultItem('Batches', Icons.groups, 'Find batches and subjects'),
+        _buildSearchResultItem('Classes', Icons.groups, 'Find subjects and schedules'),
         _buildSearchResultItem('Attendance', Icons.calendar_today, 'Search attendance records'),
         _buildSearchResultItem('Reports', Icons.bar_chart, 'View attendance reports'),
       ],
@@ -257,138 +328,6 @@ class _SearchScreenState extends State<_SearchScreen> {
           ),
           const Icon(Icons.arrow_forward_ios, size: 18, color: Colors.grey),
         ],
-      ),
-    );
-  }
-}
-
-
-/// Create/Add Screen
-class _CreateScreen extends StatelessWidget {
-  const _CreateScreen();
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: AppTheme.backgroundGrey,
-      appBar: AppBar(
-        backgroundColor: AppTheme.primaryBlue,
-        elevation: 0,
-        title: const Text(
-          'Create',
-          style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
-        ),
-      ),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(20),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            _buildCreateCard(
-              title: 'Add Student',
-              icon: Icons.person_add,
-              description: 'Register a new student',
-              color: AppTheme.primaryBlue,
-              onTap: () {
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(builder: (_) => const AddStudentScreen()),
-                );
-              },
-            ),
-            const SizedBox(height: 16),
-            _buildCreateCard(
-              title: 'Create Batch',
-              icon: Icons.group_add,
-              description: 'Open batch management to add time slots',
-              color: AppTheme.accentOrange,
-              onTap: () {
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (_) => const BatchManagementScreen(),
-                  ),
-                );
-              },
-            ),
-            const SizedBox(height: 16),
-            _buildCreateCard(
-              title: 'Generate Report',
-              icon: Icons.description,
-              description: 'Create attendance report',
-              color: AppTheme.accentGreen,
-              onTap: () {
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(builder: (_) => const AttendanceReportsScreen()),
-                );
-              },
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildCreateCard({
-    required String title,
-    required IconData icon,
-    required String description,
-    required Color color,
-    required VoidCallback onTap,
-  }) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Container(
-        padding: const EdgeInsets.all(20),
-        decoration: BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.circular(12),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withOpacity(0.05),
-              blurRadius: 10,
-              offset: const Offset(0, 2),
-            ),
-          ],
-        ),
-        child: Row(
-          children: [
-            Container(
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: color.withOpacity(0.1),
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: Icon(icon, color: color, size: 28),
-            ),
-            const SizedBox(width: 16),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    title,
-                    style: const TextStyle(
-                      fontSize: 18,
-                      fontWeight: FontWeight.bold,
-                      color: AppTheme.textDark,
-                    ),
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    description,
-                    style: TextStyle(
-                      fontSize: 14,
-                      color: Colors.grey.shade600,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            const Icon(Icons.arrow_forward_ios, size: 18, color: Colors.grey),
-          ],
-        ),
       ),
     );
   }

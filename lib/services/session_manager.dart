@@ -70,6 +70,10 @@ class SessionManager {
     _backgroundTime = null;
   }
 
+  static DateTime? getBackgroundStartTime() {
+    return _backgroundTime;
+  }
+
   static bool isSessionValid() {
     if (_lastActivity == null) return false;
 
@@ -108,6 +112,11 @@ class SessionManager {
   }
 
   static bool isAuthenticated() {
-    return appDb.auth.currentUser != null && isSessionValid();
+    final user = appDb.auth.currentUser;
+    if (user == null) return false;
+    // Auth listener may lag one frame after sign-in; avoid false "logged out" during
+    // navigation to the dashboard (SessionMonitor / timers use this).
+    _lastActivity ??= DateTime.now();
+    return isSessionValid();
   }
 }

@@ -1,8 +1,9 @@
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:workmanager/workmanager.dart';
-import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
+import 'package:flutter/foundation.dart' show kDebugMode, kIsWeb, debugPrint;
 import 'package:timezone/timezone.dart' as tz;
 import 'package:timezone/data/latest.dart' as tz;
+import '../core/attendance_auto_close_policy.dart';
 import 'institute_status_service.dart';
 import 'notification_handler.dart';
 
@@ -231,7 +232,8 @@ class InstituteNotificationService {
         body: body,
         scheduledDate: _convertToTZDateTime(scheduledDate),
         notificationDetails: details,
-        androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+        // Inexact avoids SCHEDULE_EXACT_ALARM (blocked by default Android 12+ / Play policies).
+        androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
         payload: payload,
       );
 
@@ -243,10 +245,15 @@ class InstituteNotificationService {
     }
   }
 
-  /// Convert DateTime to TZDateTime
+  /// Convert wall-clock [dateTime] to [tz.TZDateTime] for zoned scheduling.
+  ///
+  /// Uses [tz.UTC] and [DateTime.millisecondsSinceEpoch] so we never touch
+  /// [tz.local] (unset unless [tz.setLocalLocation] was called → LateInitializationError).
   static tz.TZDateTime _convertToTZDateTime(DateTime dateTime) {
-    final local = tz.local;
-    return tz.TZDateTime.from(dateTime, local);
+    return tz.TZDateTime.fromMillisecondsSinceEpoch(
+      tz.UTC,
+      dateTime.millisecondsSinceEpoch,
+    );
   }
 
   /// Get unique notification ID
@@ -272,6 +279,129 @@ class InstituteNotificationService {
     } catch (e) {
       if (kDebugMode) debugPrint('❌ Error cancelling notifications: $e');
     }
+  }
+
+  /// Two hours after entry: remind staff to mark exit before the auto-close window.
+  static const Duration attendanceExitReminderDelay = Duration(hours: 2);
+
+  static int attendanceExitReminderNotificationId({
+    required String instituteId,
+    required String rollKey,
+    required String dateKey,
+    required String subjectTag,
+  }) {
+    final raw = 'att_exit_rem|$instituteId|$rollKey|$dateKey|$subjectTag';
+    return raw.hashCode.abs() % 2147483647;
+  }
+
+  /// Schedule a one-shot reminder to complete exit photo for [rollKey] on [dateKey] (yyyy-MM-dd).
+  static Future<void> scheduleAttendanceExitReminder({
+    required String instituteId,
+    required String rollKey,
+    required String dateKey,
+    required String subjectTag,
+    required DateTime entryAtUtc,
+  }) async {
+    if (kIsWeb) return;
+    try {
+      final fireUtc = entryAtUtc.toUtc().add(attendanceExitReminderDelay);
+      final nowUtc = DateTime.now().toUtc();
+      if (!fireUtc.isAfter(nowUtc)) return;
+
+      final deadlineUtc = entryAtUtc.toUtc().add(kAttendanceExitDeadlineDuration);
+      if (!fireUtc.isBefore(deadlineUtc.subtract(const Duration(minutes: 1)))) {
+        return;
+      }
+
+      final id = attendanceExitReminderNotificationId(
+        instituteId: instituteId,
+        rollKey: rollKey,
+        dateKey: dateKey,
+        subjectTag: subjectTag,
+      );
+      await _notifications.cancel(id: id);
+
+      final fireLocal = fireUtc.toLocal();
+      final subjHint = subjectTag == 'all' ? '' : ' — $subjectTag';
+      await _scheduleAttendanceExitReminderNotification(
+        id: id,
+        title: 'Complete attendance',
+        body:
+            'Roll $rollKey$subjHint: mark exit soon (within ${kAttendanceExitDeadlineHours}h of entry).',
+        scheduledDate: fireLocal,
+        payload: 'pending_exit|$instituteId|$rollKey|$dateKey|$subjectTag',
+      );
+
+      if (kDebugMode) {
+        debugPrint(
+          '📅 Scheduled exit reminder for roll $rollKey at ${fireLocal.toIso8601String()}',
+        );
+      }
+    } catch (e) {
+      if (kDebugMode) debugPrint('❌ scheduleAttendanceExitReminder: $e');
+    }
+  }
+
+  static Future<void> cancelAttendanceExitReminder({
+    required String instituteId,
+    required String rollKey,
+    required String dateKey,
+    required String subjectTag,
+  }) async {
+    if (kIsWeb) return;
+    try {
+      final id = attendanceExitReminderNotificationId(
+        instituteId: instituteId,
+        rollKey: rollKey,
+        dateKey: dateKey,
+        subjectTag: subjectTag,
+      );
+      await _notifications.cancel(id: id);
+      if (kDebugMode) debugPrint('✅ Cancelled exit reminder id=$id roll=$rollKey');
+    } catch (e) {
+      if (kDebugMode) debugPrint('❌ cancelAttendanceExitReminder: $e');
+    }
+  }
+
+  static Future<void> _scheduleAttendanceExitReminderNotification({
+    required int id,
+    required String title,
+    required String body,
+    required DateTime scheduledDate,
+    required String payload,
+  }) async {
+    final androidDetails = AndroidNotificationDetails(
+      'attendance_pending_exit_channel',
+      'Attendance reminders',
+      channelDescription: 'Reminders to complete exit attendance after entry',
+      importance: Importance.high,
+      priority: Priority.high,
+      showWhen: true,
+      enableVibration: true,
+      playSound: true,
+    );
+
+    const iosDetails = DarwinNotificationDetails(
+      presentAlert: true,
+      presentBadge: true,
+      presentSound: true,
+    );
+
+    final details = NotificationDetails(
+      android: androidDetails,
+      iOS: iosDetails,
+    );
+
+    await _notifications.zonedSchedule(
+      id: id,
+      title: title,
+      body: body,
+      scheduledDate: _convertToTZDateTime(scheduledDate),
+      notificationDetails: details,
+      // Inexact avoids SCHEDULE_EXACT_ALARM (exact_alarms_not_permitted without special permission).
+      androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
+      payload: payload,
+    );
   }
 
   /// Send immediate notification (for testing or manual triggers)

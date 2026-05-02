@@ -2,9 +2,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_screenutil/flutter_screenutil.dart';
 import '../../core/utils/responsive.dart';
+import '../../core/institute_id_display.dart';
 import '../../core/theme/app_theme.dart';
 import '../../services/institute_setup_service.dart';
 import '../../services/error_handler.dart';
+import '../../services/validation_service.dart';
 
 /// Super Admin Institute Management Screen
 /// 
@@ -155,7 +157,7 @@ class _SuperAdminInstituteScreenState extends State<SuperAdminInstituteScreen> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(
-                'Institute ID: ${result['instituteId']}',
+                'Institute ID: ${formatInstituteIdForDisplay(result['instituteId']?.toString() ?? '')}',
                 style: const TextStyle(fontWeight: FontWeight.bold),
               ),
               const SizedBox(height: 12),
@@ -419,7 +421,7 @@ class _SuperAdminInstituteScreenState extends State<SuperAdminInstituteScreen> {
                 controller: _adminPasswordController,
                 decoration: InputDecoration(
                   labelText: 'Admin Password *',
-                  hintText: 'Minimum 6 characters',
+                  hintText: 'Strong password (see requirements)',
                   prefixIcon: const Icon(Icons.lock),
                   suffixIcon: IconButton(
                     icon: Icon(
@@ -435,10 +437,7 @@ class _SuperAdminInstituteScreenState extends State<SuperAdminInstituteScreen> {
                   if (value == null || value.isEmpty) {
                     return 'Admin password is required';
                   }
-                  if (value.length < 6) {
-                    return 'Password must be at least 6 characters';
-                  }
-                  return null;
+                  return ValidationService.validatePassword(value, isRegistration: true);
                 },
               ),
               const SizedBox(height: 16),

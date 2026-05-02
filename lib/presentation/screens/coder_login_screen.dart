@@ -4,6 +4,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../../core/app_db.dart';
 import '../../core/theme/app_theme.dart';
+import '../../core/utils/responsive_page.dart';
 import 'coder_dashboard_screen.dart';
 
 class CoderLoginScreen extends StatefulWidget {
@@ -86,8 +87,7 @@ class _CoderLoginScreenState extends State<CoderLoginScreen> {
     return Scaffold(
       backgroundColor: AppTheme.backgroundLight,
       body: SafeArea(
-        child: Center(
-          child: SingleChildScrollView(
+        child: ResponsiveScrollBody(
             padding: const EdgeInsets.all(24),
             child: Form(
               key: _formKey,
@@ -153,7 +153,6 @@ class _CoderLoginScreenState extends State<CoderLoginScreen> {
                 ],
               ),
             ),
-          ),
         ),
       ),
     );

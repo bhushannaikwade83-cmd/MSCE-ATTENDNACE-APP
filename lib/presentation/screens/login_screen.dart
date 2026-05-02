@@ -1,8 +1,9 @@
-import 'dart:async';
-import 'dart:math' as math;
 import 'package:flutter/material.dart';
+import 'dart:async' show unawaited;
+import 'dart:math' as math;
 import 'package:flutter/services.dart';
 import 'package:flutter/foundation.dart' show kDebugMode;
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter_screenutil/flutter_screenutil.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -12,11 +13,18 @@ import '../../services/auth_service.dart';
 import '../../services/error_handler.dart';
 import '../../services/biometric_service.dart';
 import '../../services/geofence_service.dart';
+import '../../services/security_ops_service.dart';
 import '../../core/theme/app_theme.dart';
+import '../../core/credential_strength.dart';
 import '../../core/utils/responsive.dart';
+import '../widgets/credential_strength_indicator.dart';
 import 'main_navigation_screen.dart';
 import 'institute_search_screen.dart';
+import 'attendance_staff_login_screen.dart';
+import 'gps_settings_screen.dart';
+import 'institute_location_gate_screen.dart';
 import 'biometric_lock_screen.dart';
+import '../widgets/support_email_footer.dart';
 import '../../core/app_db.dart';
 import '../../config/admin_portal_url.dart';
 
@@ -139,42 +147,40 @@ class LoginScreen extends StatefulWidget {
 
 class _LoginScreenState extends State<LoginScreen>
     with TickerProviderStateMixin {
+  bool get _allowDebugAttestationBypass {
+    if (!kDebugMode) return false;
+    final raw = (dotenv.env['ALLOW_ATTESTATION_BYPASS'] ?? '').trim().toLowerCase();
+    return raw == '1' || raw == 'true' || raw == 'yes' || raw == 'on';
+  }
+
   // ── Form controllers ─────────────────────────────────────────────────────────
-  final _formKey = GlobalKey<FormState>();
+  /// NEW FLOW: Institute ID (numeric only) + Password login
   final _emailController = TextEditingController();
+  final _instituteIdController = TextEditingController();
   final _passwordController = TextEditingController();
   final _pinController = TextEditingController();
   final _captchaController = TextEditingController();
-  final _emailOtpController = TextEditingController();
-
   // ── Services ─────────────────────────────────────────────────────────────────
   final AuthService _authService = AuthService();
   final GeofenceService _geofenceService = GeofenceService();
+  final SecurityOpsService _securityOps = SecurityOpsService();
 
   // ── State ────────────────────────────────────────────────────────────────────
   bool _isPasswordVisible = false;
   bool _isLoading = false;
   bool _biometricSupported = false;
-  bool _biometricEnabled = false;
+  bool _showBiometricOnPinCard = false;
   String? _currentUserId;
 
-  // ── IRCTC-style flow state ────────────────────────────────────────────────────
-  /// true  → show IRCTC PIN screen (returning user)
-  /// false → show full login form (first-time or Change User)
+  // ── Returning-user flow state ────────────────────────────────────────────────
   bool _isReturningUser = false;
-  String? _savedEmail;           // last successfully logged-in email
-  bool _hasPIN = false;          // does the last user have a PIN set?
+  String? _savedEmail;
+  bool _instituteIdFieldDisabled = true;  // Start disabled, only unlock to change institute
 
-  /// After password + CAPTCHA pass: user must enter email OTP before session is restored.
-  bool _waitingForEmailOtp = false;
-  /// True after [verifyLoginEmailOTP] succeeds; stay on OTP UI until sign-in + PIN/home complete.
-  bool _loginOtpVerified = false;
-  Timer? _loginOtpCooldownTimer;
-  int _loginOtpCooldownSec = 0;
-
-  static const String _prefLastEmail = 'msce_last_login_email';
-  /// Remember that this device last logged in with a PIN (works after logout when profile read may fail).
+  static const String _prefLastEmail = 'msce_last_admin_email';
+  static const String _prefLastInstituteId = 'msce_last_institute_id';
   static const String _prefLastUserHasPin = 'msce_last_user_has_pin';
+  static const String _prefForgotPinEmail = 'msce_forgot_pin_email';
 
   // ── CAPTCHA state ─────────────────────────────────────────────────────────────
   String _captchaText = '';
@@ -186,7 +192,6 @@ class _LoginScreenState extends State<LoginScreen>
 
   // ── Animation Controllers ─────────────────────────────────────────────────────
   late AnimationController _masterController;
-  late AnimationController _badgeWobbleController;
   late AnimationController _buttonPulseController;
 
   late Animation<double> _logoFlip;
@@ -194,7 +199,6 @@ class _LoginScreenState extends State<LoginScreen>
   late Animation<double> _cardTiltX;
   late Animation<double> _cardSlideY;
   late Animation<double> _cardFade;
-  late Animation<double> _badgeSpin;
   late Animation<double> _buttonPulse;
 
   bool _buttonPressed = false;
@@ -207,11 +211,19 @@ class _LoginScreenState extends State<LoginScreen>
 
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       final args = ModalRoute.of(context)?.settings.arguments;
+      if (args is Map && args['instituteId'] != null) {
+        _instituteIdController.text = args['instituteId'].toString();
+      }
       // forceFullLogin: show email/password/CAPTCHA (same as "Change user"), clear saved email.
       if (args is Map && args['forceFullLogin'] == true) {
         await _switchToChangeUser();
+        if (args['instituteId'] != null) {
+          _instituteIdController.text = args['instituteId'].toString();
+        }
       } else {
-        await _loadSavedUser();
+        // Check if returning user with PIN - if so, _loadSavedUser() navigates away
+        final navigatedAway = await _loadSavedUser();
+        if (navigatedAway) return;
       }
       if (!mounted) return;
       _checkBiometricStatus();
@@ -250,10 +262,13 @@ class _LoginScreenState extends State<LoginScreen>
 
   // ─── SAVED USER ───────────────────────────────────────────────────────────────
 
-  Future<void> _loadSavedUser() async {
+  /// Load saved user and check if they have PIN.
+  /// Returns true if navigated to BiometricLockScreen, false otherwise.
+  Future<bool> _loadSavedUser() async {
     try {
       final prefs = await SharedPreferences.getInstance();
       final email = prefs.getString(_prefLastEmail);
+      final instituteId = prefs.getString(_prefLastInstituteId);
       if (email != null && email.isNotEmpty) {
         final localHadPin = prefs.getBool(_prefLastUserHasPin) ?? false;
         bool serverHasPin = false;
@@ -262,23 +277,43 @@ class _LoginScreenState extends State<LoginScreen>
         } catch (_) {}
         final hasPIN = serverHasPin || localHadPin;
         if (mounted) {
+          if (hasPIN) {
+            // ✅ Returning user with PIN detected
+            // Navigate directly to BiometricLockScreen for unified PIN entry
+            // (instead of showing PIN card inline in LoginScreen)
+            Navigator.pushReplacementNamed(
+              context,
+              BiometricLockScreen.routeName,
+              arguments: {'loginEmail': email},
+            );
+            return true; // Navigated away
+          }
+
+          // No PIN: show full login form
           setState(() {
             _savedEmail = email;
-            _hasPIN = hasPIN;
-            _isReturningUser = hasPIN;
-            if (hasPIN) {
-              _emailController.text = email;
+            _isReturningUser = false;
+            _emailController.text = email;
+            if (instituteId != null) {
+              _instituteIdController.text = instituteId;
             }
+            // Field stays disabled always (auto-fetches during registration)
+            _instituteIdFieldDisabled = true;
           });
         }
       }
     } catch (_) {}
+    return false; // Didn't navigate away
   }
 
-  Future<void> _saveLastUser(String email) async {
+  Future<void> _saveLastUser(String email, {String? instituteId}) async {
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString(_prefLastEmail, email);
+      final key = instituteId?.trim();
+      if (key != null && key.isNotEmpty) {
+        await prefs.setString(_prefLastInstituteId, key);
+      }
     } catch (_) {}
   }
 
@@ -293,85 +328,39 @@ class _LoginScreenState extends State<LoginScreen>
     } catch (_) {}
   }
 
+  Future<String?> _consumeForgotPinEmail() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final email = prefs.getString(_prefForgotPinEmail)?.trim();
+      await prefs.remove(_prefForgotPinEmail);
+      if (email == null || email.isEmpty) return null;
+      return email.toLowerCase();
+    } catch (_) {
+      return null;
+    }
+  }
+
   Future<void> _switchToChangeUser() async {
-    _loginOtpCooldownTimer?.cancel();
-    _loginOtpCooldownTimer = null;
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.remove(_prefLastEmail);
+      await prefs.remove(_prefLastInstituteId);
       await prefs.remove(_prefLastUserHasPin);
     } catch (_) {}
     if (!mounted) return;
     setState(() {
       _isReturningUser = false;
-      _waitingForEmailOtp = false;
-      _loginOtpVerified = false;
-      _loginOtpCooldownSec = 0;
       _emailController.clear();
+      _instituteIdController.clear();
       _passwordController.clear();
       _pinController.clear();
-      _emailOtpController.clear();
     });
     _generateCaptcha();
   }
-
-  void _cancelEmailOtpStep() {
-    _loginOtpCooldownTimer?.cancel();
-    _loginOtpCooldownTimer = null;
-    setState(() {
-      _waitingForEmailOtp = false;
-      _loginOtpVerified = false;
-      _emailOtpController.clear();
-      _loginOtpCooldownSec = 0;
-    });
-    _generateCaptcha();
-  }
-
-  void _startLoginOtpCooldown(int seconds) {
-    _loginOtpCooldownTimer?.cancel();
-    setState(() => _loginOtpCooldownSec = seconds);
-    _loginOtpCooldownTimer = Timer.periodic(const Duration(seconds: 1), (t) {
-      if (!mounted) {
-        t.cancel();
-        return;
-      }
-      if (_loginOtpCooldownSec <= 1) {
-        t.cancel();
-        setState(() => _loginOtpCooldownSec = 0);
-      } else {
-        setState(() => _loginOtpCooldownSec--);
-      }
-    });
-  }
-
-  Future<void> _resendLoginOtp() async {
-    if (_loginOtpCooldownSec > 0 || _isLoading) return;
-    final email = _emailController.text.trim();
-    setState(() => _isLoading = true);
-    final r = await _authService.sendLoginEmailOTP(email);
-    if (!mounted) return;
-    setState(() => _isLoading = false);
-    if (r['success'] == true) {
-      _startLoginOtpCooldown(60);
-      if (kDebugMode) {
-        _showModernSnackbar(
-            'Demo OTP: ${r['otp'] ?? ''}', isSuccess: true);
-      } else {
-        _showModernSnackbar('OTP resent.', isSuccess: true);
-      }
-    } else {
-      _showModernSnackbar(r['message'] ?? 'Could not resend OTP', isSuccess: false);
-    }
-  }
-
-  // ─── ANIMATIONS ───────────────────────────────────────────────────────────────
 
   void _setupAnimations() {
     _masterController = AnimationController(
         duration: const Duration(milliseconds: 2000), vsync: this);
-    _badgeWobbleController = AnimationController(
-        duration: const Duration(seconds: 5), vsync: this)
-      ..repeat();
     _buttonPulseController = AnimationController(
         duration: const Duration(milliseconds: 1600), vsync: this)
       ..repeat(reverse: true);
@@ -396,9 +385,6 @@ class _LoginScreenState extends State<LoginScreen>
       CurvedAnimation(parent: _masterController,
           curve: const Interval(0.35, 0.65, curve: Curves.easeOutCubic)),
     );
-    _badgeSpin = Tween<double>(begin: 0, end: 2 * math.pi).animate(
-      CurvedAnimation(parent: _badgeWobbleController, curve: Curves.linear),
-    );
     _buttonPulse = Tween<double>(begin: 1.0, end: 1.028).animate(
       CurvedAnimation(parent: _buttonPulseController, curve: Curves.easeInOut),
     );
@@ -412,14 +398,18 @@ class _LoginScreenState extends State<LoginScreen>
 
   Future<void> _checkBiometricStatus() async {
     final isSupported = await BiometricService.isDeviceSupported();
-    final isEnabled = await BiometricService.isBiometricEnabled();
+    final anyAdminBio = await BiometricService.isBiometricEnabled();
+    final saved = _savedEmail?.trim() ?? '';
+    var forSaved = false;
+    if (isSupported && saved.isNotEmpty) {
+      forSaved = await BiometricService.isBiometricEnabledForAdmin(saved);
+    }
     if (mounted) {
       setState(() {
         _biometricSupported = isSupported;
-        _biometricEnabled = isEnabled;
+        _showBiometricOnPinCard = isSupported && (forSaved || anyAdminBio);
       });
-      // Auto-trigger biometric if returning user with biometric enabled
-      if (_biometricEnabled && _isReturningUser) {
+      if (_isReturningUser && isSupported && (forSaved || anyAdminBio)) {
         Future.delayed(const Duration(milliseconds: 700), () {
           if (mounted) _tryBiometricLogin();
         });
@@ -428,67 +418,120 @@ class _LoginScreenState extends State<LoginScreen>
   }
 
   Future<void> _tryBiometricLogin() async {
-    if (!_biometricEnabled || !_biometricSupported || !mounted) return;
-    final email = await BiometricService.getBiometricEmail();
-    if (email == null || email.isEmpty) return;
-    _emailController.text = email;
+    if (!_biometricSupported || !mounted) return;
+
+    final anyAdminBio = await BiometricService.isBiometricEnabled();
+    if (!anyAdminBio) {
+      if (mounted) {
+        _showModernSnackbar(
+          'Biometric login is not set up on this phone. Log in with password once, then enable biometric.',
+          isSuccess: false,
+        );
+      }
+      return;
+    }
+
+    String? selectedEmail;
+    final saved = _savedEmail?.trim();
+    if (saved != null && saved.isNotEmpty) {
+      if (await BiometricService.isBiometricEnabledForAdmin(saved)) {
+        selectedEmail = saved;
+      }
+    }
+
+    if (selectedEmail == null) {
+      final biometricAdmins = await BiometricService.getBiometricEnabledAdmins();
+      if (biometricAdmins.isEmpty) return;
+
+      if (biometricAdmins.length > 1) {
+        selectedEmail =
+            await _showBiometricAdminSelectionDialog(biometricAdmins);
+        if (selectedEmail == null || !mounted) return;
+      } else {
+        selectedEmail = biometricAdmins.first;
+      }
+    }
+
+    _emailController.text = selectedEmail;
+
+    // Verify biometric
     final authenticated = await BiometricService.authenticate(
-      reason: 'Use biometric to login to MSCE Attendance',
+      reason: 'Use biometric to login as $selectedEmail',
       useErrorDialogs: true,
     );
     if (!mounted) return;
-    if (authenticated) _showBiometricPasswordDialog(email);
+    if (!authenticated) return;
+
+    setState(() => _isLoading = true);
+    var result = await _authService.signInWithBiometric(email: selectedEmail);
+    if (!mounted) return;
+
+    if (result['success'] != true) {
+      final msg = result['message']?.toString() ?? '';
+      if (msg.toLowerCase().contains('not ready')) {
+        final pin = _pinController.text.trim();
+        if (AuthService.isValidLoginPinLength(pin)) {
+          final filled = await _authService.ensureBiometricCacheUsingPin(
+            email: selectedEmail,
+            pin: pin,
+          );
+          if (filled && mounted) {
+            result = await _authService.signInWithBiometric(email: selectedEmail);
+          }
+        }
+      }
+    }
+    if (!mounted) return;
+
+    if (result['success'] == true) {
+      _currentUserId = result['userId'];
+      final String role = result['role'];
+      if (role != 'admin') {
+        setState(() => _isLoading = false);
+        _showModernSnackbar('Access denied. Admin only.', isSuccess: false);
+        return;
+      }
+
+      await _saveLastUser(selectedEmail);
+      await _persistLastUserHasPin(true);
+      if (!mounted) return;
+      setState(() {
+        _isLoading = false;
+        _savedEmail = selectedEmail;
+        _isReturningUser = true;
+      });
+      _scheduleLocationLockFeedback();
+      if (mounted) await _navigateBasedOnGpsStatus();
+    } else {
+      setState(() => _isLoading = false);
+      _showLoginFailure(result);
+    }
   }
 
-  void _showBiometricPasswordDialog(String email) {
-    final passwordController = TextEditingController();
-    showDialog(
+  /// Show dialog to select which admin to login as when multiple have biometric enabled
+  Future<String?> _showBiometricAdminSelectionDialog(List<String> admins) async {
+    return await showDialog<String>(
       context: context,
       barrierDismissible: false,
-      builder: (context) => AlertDialog(
-        shape:
-            RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-        title: const Row(children: [
-          Icon(Icons.fingerprint, color: AppTheme.primaryGreen, size: 26),
-          SizedBox(width: 10),
-          Expanded(
-              child: Text('Biometric Verified',
-                  style: TextStyle(
-                      fontSize: 17, fontWeight: FontWeight.bold))),
-        ]),
-        content: Column(mainAxisSize: MainAxisSize.min, children: [
-          const Text('Enter your password to complete login',
-              style: TextStyle(fontSize: 13)),
-          const SizedBox(height: 14),
-          TextField(
-            controller: passwordController,
-            obscureText: true,
-            decoration: const InputDecoration(
-                labelText: 'Password',
-                border: OutlineInputBorder(),
-                prefixIcon: Icon(Icons.lock_outline)),
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Select Admin Account'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text('Multiple admin accounts have biometric enabled on this device.\nSelect which admin to login as:'),
+              const SizedBox(height: 16),
+              ...admins.map((email) => ListTile(
+                title: Text(email),
+                onTap: () => Navigator.pop(dialogContext, email),
+              )),
+            ],
           ),
-        ]),
+        ),
         actions: [
           TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text('Cancel')),
-          ElevatedButton(
-            onPressed: () async {
-              Navigator.pop(context);
-              _passwordController.text = passwordController.text;
-              _handleFullLogin(
-                email: email,
-                password: passwordController.text,
-                isBiometric: true,
-              );
-            },
-            style: ElevatedButton.styleFrom(
-                backgroundColor: AppTheme.primaryBlue,
-                foregroundColor: Colors.white,
-                shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(8))),
-            child: const Text('Login'),
+            onPressed: () => Navigator.pop(dialogContext, null),
+            child: const Text('Cancel'),
           ),
         ],
       ),
@@ -498,25 +541,31 @@ class _LoginScreenState extends State<LoginScreen>
   @override
   void dispose() {
     _emailController.dispose();
+    _instituteIdController.dispose();
     _passwordController.dispose();
     _pinController.dispose();
     _captchaController.dispose();
-    _emailOtpController.dispose();
-    _loginOtpCooldownTimer?.cancel();
     _masterController.dispose();
-    _badgeWobbleController.dispose();
     _buttonPulseController.dispose();
     super.dispose();
   }
 
   // ─── AUTH LOGIC ───────────────────────────────────────────────────────────────
 
-  /// Called when user taps LOGIN in the PIN screen (IRCTC mode)
+  /// Called when user taps LOGIN in the PIN screen.
   void _handlePINLogin() async {
-    if (!_formKey.currentState!.validate()) return;
-    setState(() => _isLoading = true);
     final email = _savedEmail ?? _emailController.text.trim();
     final pin = _pinController.text.trim();
+    if (pin.isEmpty) {
+      _showModernSnackbar('PIN is required', isSuccess: false);
+      return;
+    }
+    if (!AuthService.isValidLoginPinLength(pin)) {
+      _showModernSnackbar(AuthService.loginPinLengthMessage, isSuccess: false);
+      return;
+    }
+
+    setState(() => _isLoading = true);
 
     try {
       final result =
@@ -527,21 +576,23 @@ class _LoginScreenState extends State<LoginScreen>
         _currentUserId = result['userId'];
         final String role = result['role'];
         if (role != 'admin') {
+          if (!mounted) return;
           setState(() => _isLoading = false);
           _showModernSnackbar('Access denied. Admin only.', isSuccess: false);
           return;
         }
         await _persistLastUserHasPin(true);
+        if (!mounted) return;
         setState(() => _isLoading = false);
-        if (mounted) {
-          await _checkLocationLockStatus();
-          _navigateToHome();
-        }
+        _scheduleLocationLockFeedback();
+        if (mounted) await _navigateBasedOnGpsStatus();
       } else {
+        if (!mounted) return;
         setState(() => _isLoading = false);
         _showLoginFailure(result);
       }
     } catch (e) {
+      if (!mounted) return;
       setState(() => _isLoading = false);
       final err = ErrorHandler.formatErrorForUI(e,
           context: 'login', appType: 'admin');
@@ -549,9 +600,23 @@ class _LoginScreenState extends State<LoginScreen>
     }
   }
 
-  /// Step 1: password + CAPTCHA → verify credentials, sign out, send OTP.
+  /// Institute ID + password login. Email is resolved internally so Supabase
+  /// still creates the authenticated session required by existing RLS.
   Future<void> _handleFullFormLogin() async {
-    if (!_formKey.currentState!.validate()) return;
+    final instituteKey = _instituteIdController.text.trim();
+    final password = _passwordController.text;
+    if (instituteKey.isEmpty) {
+      _showModernSnackbar('Institute ID is required', isSuccess: false);
+      return;
+    }
+    if (!RegExp(r'^\d+$').hasMatch(instituteKey)) {
+      _showModernSnackbar('Institute ID must be numeric only', isSuccess: false);
+      return;
+    }
+    if (password.isEmpty) {
+      _showModernSnackbar('Password is required', isSuccess: false);
+      return;
+    }
 
     if (!_verifyCaptcha()) {
       _showModernSnackbar(
@@ -562,52 +627,81 @@ class _LoginScreenState extends State<LoginScreen>
     }
 
     setState(() => _isLoading = true);
-    final email = _emailController.text.trim();
-    final password = _passwordController.text;
 
     try {
-      final result = await _authService.signInWithEmail(
-          email: email, password: password);
+      // Resolve admin email in parallel with device risk work to cut wall-clock time.
+      final riskFuture = _securityOps.collectDeviceRiskSignals();
+      final emailFuture = _authService.getAdminEmailForInstituteLogin(instituteKey);
 
-      if (!mounted) return;
-
-      if (result['success'] != true) {
+      final risk = await riskFuture;
+      final riskFlags =
+          (risk['riskFlags'] as List?)?.map((e) => e.toString()).toList() ?? <String>[];
+      if (riskFlags.contains('unknown_platform') ||
+          riskFlags.contains('risk_collection_error')) {
+        await emailFuture;
+        if (!mounted) return;
         setState(() => _isLoading = false);
-        _showLoginFailure(result);
+        _showModernSnackbar(
+          'Security check failed on this device. Please retry or contact support.',
+          isSuccess: false,
+        );
+        return;
+      }
+
+      final platform = (risk['platform'] ?? 'unknown').toString();
+      final deviceTrustFuture = _securityOps.verifyDeviceTrust(
+        platform: platform,
+        // Free mode: use deterministic device fingerprint token for baseline trust scoring.
+        token: (risk['fingerprint'] ?? '').toString(),
+      );
+      final trustAndEmail = await Future.wait<dynamic>([
+        deviceTrustFuture,
+        emailFuture,
+      ]);
+      final deviceTrust = trustAndEmail[0] as Map<String, dynamic>;
+      final email = trustAndEmail[1] as String?;
+
+      if ((deviceTrust['verified'] ?? false) != true) {
+        final reason = (deviceTrust['reason'] ?? 'unknown').toString();
+        if (_allowDebugAttestationBypass) {
+          // Keep development/testing unblocked when attestation plumbing is incomplete,
+          // but surface a clear warning so this is never missed before release.
+          if (!mounted) return;
+          setState(() => _isLoading = false);
+          _showModernSnackbar(
+            'Debug bypass enabled: device trust check skipped ($reason). Disable ALLOW_ATTESTATION_BYPASS before release.',
+            isSuccess: false,
+          );
+        } else {
+          if (!mounted) return;
+          setState(() => _isLoading = false);
+          _showModernSnackbar(
+            'Device security check failed. Login blocked for security.',
+            isSuccess: false,
+          );
+          return;
+        }
+      }
+
+      if (email == null || email.isEmpty) {
+        if (!mounted) return;
+        setState(() => _isLoading = false);
+        _showModernSnackbar(
+          'No active admin found for this Institute ID. Complete admin setup first.',
+          isSuccess: false,
+        );
         _generateCaptcha();
         return;
       }
 
-      await _authService.signOut();
+      _emailController.text = email;
+      await _saveLastUser(email, instituteId: instituteKey);
 
-      final otpResult = await _authService.sendLoginEmailOTP(email);
-      if (!mounted) return;
-
-      if (otpResult['success'] != true) {
-        setState(() => _isLoading = false);
-        _showModernSnackbar(
-            otpResult['message'] ?? 'Could not send OTP', isSuccess: false);
-        _generateCaptcha();
-        return;
-      }
-
-      setState(() {
-        _isLoading = false;
-        _waitingForEmailOtp = true;
-        _emailOtpController.clear();
-      });
-      _startLoginOtpCooldown(60);
-
-      if (kDebugMode) {
-        _showModernSnackbar(
-            'Enter OTP below. Debug build shows code: ${otpResult['otp'] ?? ''}',
-            isSuccess: true);
-      } else {
-        _showModernSnackbar(
-            'OTP sent. Enter the 6-digit code to finish login. '
-            '(Production: connect SMS/email provider; demo uses in-app verification.)',
-            isSuccess: true);
-      }
+      await _handleFullLogin(
+        email: email,
+        password: password,
+        instituteId: instituteKey,
+      );
     } catch (e) {
       if (!mounted) return;
       setState(() => _isLoading = false);
@@ -618,65 +712,12 @@ class _LoginScreenState extends State<LoginScreen>
     }
   }
 
-  /// Step 2: OTP OK → sign in again and continue PIN/biometric flow.
-  Future<void> _handleEmailOtpVerify() async {
-    if (_loginOtpVerified) return;
-    final otp = _emailOtpController.text.trim();
-    if (otp.length != 6 || !RegExp(r'^\d{6}$').hasMatch(otp)) {
-      _showModernSnackbar('Enter the 6-digit OTP', isSuccess: false);
-      return;
-    }
-
-    setState(() => _isLoading = true);
-    final email = _emailController.text.trim();
-    final password = _passwordController.text;
-
-    try {
-      final v = await _authService.verifyLoginEmailOTP(email, otp);
-      if (!mounted) return;
-
-      if (v['success'] != true) {
-        setState(() => _isLoading = false);
-        _showModernSnackbar(v['message'] ?? 'Invalid OTP', isSuccess: false);
-        return;
-      }
-
-      _loginOtpCooldownTimer?.cancel();
-      // Stay on OTP step; show verified state while we sign in and open PIN / home.
-      setState(() {
-        _loginOtpVerified = true;
-        _loginOtpCooldownSec = 0;
-      });
-
-      await _handleFullLogin(
-        email: email,
-        password: password,
-        fromEmailOtpStep: true,
-      );
-    } catch (e) {
-      if (!mounted) return;
-      setState(() => _isLoading = false);
-      final err = ErrorHandler.formatErrorForUI(e,
-          context: 'login', appType: 'admin');
-      _showModernSnackbar(err['message'], isSuccess: false);
-    }
-  }
-
   Future<void> _handleFullLogin({
     required String email,
     required String password,
+    String? instituteId,
     bool isBiometric = false,
-    bool fromEmailOtpStep = false,
   }) async {
-    void resetOtpStepAfterFailure() {
-      if (!fromEmailOtpStep) return;
-      setState(() {
-        _waitingForEmailOtp = false;
-        _loginOtpVerified = false;
-        _emailOtpController.clear();
-      });
-    }
-
     try {
       final result = await _authService.signInWithEmail(
           email: email, password: password);
@@ -688,48 +729,75 @@ class _LoginScreenState extends State<LoginScreen>
         final String role = result['role'];
         if (role != 'admin') {
           setState(() => _isLoading = false);
-          resetOtpStepAfterFailure();
-          if (fromEmailOtpStep) _generateCaptcha();
           _showModernSnackbar('Access denied. Admin only.', isSuccess: false);
           return;
         }
 
         // Save email for future PIN-only logins
-        await _saveLastUser(email);
+        await Future.wait<void>([
+          _saveLastUser(
+            email,
+            instituteId: instituteId ?? _instituteIdController.text.trim(),
+          ),
+          _authService.cacheBiometricLogin(
+            email: email,
+            password: password,
+          ),
+        ]);
 
-        // Check PIN
-        final hasPin = await _authService.hasPIN(_currentUserId!);
+        final userData =
+            (result['userData'] as Map<String, dynamic>?) ?? <String, dynamic>{};
+        var hasPin = userData['hasPIN'] == true;
+        final forgotPinFuture = _consumeForgotPinEmail();
+        final pinChecks = await Future.wait<Object?>([
+          forgotPinFuture,
+          hasPin ? Future<bool>.value(true) : _authService.hasPIN(_currentUserId!),
+        ]);
+        final forgotPinEmail = pinChecks[0] as String?;
+        hasPin = pinChecks[1] as bool;
+        final normalizedLoginEmail = AuthService.normalizeLoginEmail(email);
+        if (forgotPinEmail == normalizedLoginEmail) {
+          final clearPinResult = await _authService.clearPinForUser(
+            userId: _currentUserId!,
+            email: email,
+          );
+          if (clearPinResult['success'] != true) {
+            setState(() => _isLoading = false);
+            _showModernSnackbar(
+              clearPinResult['message']?.toString() ?? 'Could not clear old PIN.',
+              isSuccess: false,
+            );
+            return;
+          }
+          hasPin = false;
+        }
+
         await _persistLastUserHasPin(hasPin);
+
+        if (hasPin) {
+          await _authService.syncLocalPinCacheAfterPasswordLogin(
+            email: email,
+            userData: userData,
+          );
+        }
+
+        setState(() => _isLoading = false);
+
         if (!hasPin) {
-          setState(() => _isLoading = false);
           _showPinSetupDialog(email);
           return;
         }
 
-        // Offer biometric setup once per install
-        if (_biometricSupported &&
-            !_biometricEnabled &&
-            !isBiometric &&
-            !await BiometricService.wasBiometricSetupPromptShown()) {
-          setState(() => _isLoading = false);
-          _showBiometricSetupDialog(email);
-          return;
-        }
-
-        setState(() => _isLoading = false);
         if (mounted) {
-          await _checkLocationLockStatus();
-          _navigateToHome();
+          await _maybeOfferBiometricAfterPin(email);
         }
       } else {
         setState(() => _isLoading = false);
-        resetOtpStepAfterFailure();
         _showLoginFailure(result);
         if (!isBiometric) _generateCaptcha();
       }
     } catch (e) {
       setState(() => _isLoading = false);
-      resetOtpStepAfterFailure();
       final err = ErrorHandler.formatErrorForUI(e,
           context: 'login', appType: 'admin');
       _showModernSnackbar(err['message'], isSuccess: false);
@@ -739,163 +807,59 @@ class _LoginScreenState extends State<LoginScreen>
 
   Future<void> _maybeOfferBiometricAfterPin(String email) async {
     if (!mounted) return;
-    final supported = await BiometricService.isDeviceSupported();
-    final enabled = await BiometricService.isBiometricEnabled();
-    final prompted = await BiometricService.wasBiometricSetupPromptShown();
+    final bio = await Future.wait<Object>([
+      BiometricService.isDeviceSupported(),
+      BiometricService.isBiometricEnabled(),
+      BiometricService.wasBiometricSetupPromptShown(),
+    ]);
+    final supported = bio[0] as bool;
+    final enabled = bio[1] as bool;
+    final prompted = bio[2] as bool;
     if (supported && !enabled && !prompted) {
       setState(() {
         _biometricSupported = supported;
-        _biometricEnabled = enabled;
       });
       _showBiometricSetupDialog(email);
       return;
     }
-    await _checkLocationLockStatus();
-    _navigateToHome();
+    await _finishAdminLoginToHomeOrGps();
+  }
+
+  /// Run after PIN / biometric prompts: GPS route decision is not blocked by location sampling snackbar.
+  Future<void> _finishAdminLoginToHomeOrGps() async {
+    if (!mounted) return;
+    _scheduleLocationLockFeedback();
+    await _navigateBasedOnGpsStatus();
   }
 
   void _showPinSetupDialog(String email) {
-    final pinCtrl = TextEditingController();
-    final confirmCtrl = TextEditingController();
-    showDialog(
+    showDialog<void>(
       context: context,
       barrierDismissible: false,
-      builder: (context) => AlertDialog(
-        shape:
-            RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-        titlePadding:
-            const EdgeInsets.fromLTRB(20, 20, 20, 0),
-        title: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(children: [
-              Container(
-                padding: const EdgeInsets.all(8),
-                decoration: BoxDecoration(
-                  color: AppTheme.primaryBlue.withValues(alpha: 0.1),
-                  shape: BoxShape.circle,
-                ),
-                child: const Icon(Icons.pin_rounded,
-                    color: AppTheme.primaryBlue, size: 22),
-              ),
-              const SizedBox(width: 12),
-              const Expanded(
-                child: Text('Set Login PIN',
-                    style: TextStyle(
-                        fontSize: 18, fontWeight: FontWeight.bold)),
-              ),
-            ]),
-            const SizedBox(height: 8),
-            const Text(
-              'Set a 4–6 digit PIN for quick login on your next visit — just like IRCTC.',
-              style: TextStyle(
-                  fontSize: 12,
-                  fontWeight: FontWeight.w400,
-                  color: AppTheme.textGray),
-            ),
-          ],
-        ),
-        content: Column(mainAxisSize: MainAxisSize.min, children: [
-          const SizedBox(height: 8),
-          TextField(
-            controller: pinCtrl,
-            keyboardType: TextInputType.number,
-            maxLength: 6,
-            obscureText: true,
-            textAlign: TextAlign.center,
-            style: const TextStyle(
-                fontSize: 22, letterSpacing: 8, fontWeight: FontWeight.bold),
-            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-            decoration: InputDecoration(
-              labelText: 'Enter PIN (4–6 digits)',
-              border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(8)),
-              focusedBorder: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(8),
-                borderSide:
-                    const BorderSide(color: AppTheme.primaryBlue, width: 2),
-              ),
-            ),
-          ),
-          const SizedBox(height: 10),
-          TextField(
-            controller: confirmCtrl,
-            keyboardType: TextInputType.number,
-            maxLength: 6,
-            obscureText: true,
-            textAlign: TextAlign.center,
-            style: const TextStyle(
-                fontSize: 22, letterSpacing: 8, fontWeight: FontWeight.bold),
-            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-            decoration: InputDecoration(
-              labelText: 'Confirm PIN',
-              border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(8)),
-              focusedBorder: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(8),
-                borderSide:
-                    const BorderSide(color: AppTheme.primaryBlue, width: 2),
-              ),
-            ),
-          ),
-        ]),
-        actions: [
-          TextButton(
-            onPressed: () {
-              Navigator.pop(context);
-              _navigateToHome();
-            },
-            child: const Text('Skip for now'),
-          ),
-          ElevatedButton(
-            onPressed: () async {
-              final pin = pinCtrl.text;
-              final confirmPin = confirmCtrl.text;
-              if (pin.length < 4 || pin.length > 6) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('PIN must be 4–6 digits')));
-                return;
-              }
-              if (pin != confirmPin) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('PINs do not match')));
-                return;
-              }
-              final result = await _authService.setPINWithPassword(
-                userId: _currentUserId!,
-                pin: pin,
-                password: _passwordController.text,
-              );
-              if (mounted) {
-                Navigator.pop(context);
-                if (result['success']) {
-                  await _persistLastUserHasPin(true);
-                  setState(() {
-                    _savedEmail = email;
-                    _hasPIN = true;
-                    _isReturningUser = true;
-                    _emailController.text = email;
-                    _pinController.clear();
-                    _waitingForEmailOtp = false;
-                    _loginOtpVerified = false;
-                  });
-                  _showModernSnackbar(
-                      'PIN set! Use PIN for next login.',
-                      isSuccess: true);
-                  await _maybeOfferBiometricAfterPin(email);
-                } else {
-                  _showModernSnackbar(result['message'], isSuccess: false);
-                }
-              }
-            },
-            style: ElevatedButton.styleFrom(
-                backgroundColor: AppTheme.primaryBlue,
-                foregroundColor: Colors.white,
-                shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(8))),
-            child: const Text('Set PIN'),
-          ),
-        ],
+      builder: (dialogContext) => _SetLoginPinAlert(
+        email: email,
+        authService: _authService,
+        userId: _currentUserId!,
+        accountPassword: _passwordController.text,
+        onDone: (success, message) async {
+          if (!mounted) return;
+          if (success) {
+            await _persistLastUserHasPin(true);
+            setState(() {
+              _savedEmail = email;
+              _isReturningUser = true;
+              _emailController.text = email;
+              _pinController.clear();
+            });
+            _showModernSnackbar(
+              'PIN set! Use PIN for next login.',
+              isSuccess: true,
+            );
+            await _maybeOfferBiometricAfterPin(email);
+          } else if (message != null && message.isNotEmpty) {
+            _showModernSnackbar(message, isSuccess: false);
+          }
+        },
       ),
     );
   }
@@ -958,8 +922,7 @@ class _LoginScreenState extends State<LoginScreen>
               Navigator.pop(context);
               await BiometricService.markBiometricSetupPromptShown();
               if (!mounted) return;
-              await _checkLocationLockStatus();
-              _navigateToHome();
+              await _finishAdminLoginToHomeOrGps();
             },
             child: const Text('Skip'),
           ),
@@ -983,15 +946,22 @@ class _LoginScreenState extends State<LoginScreen>
                 _showModernSnackbar(
                     'Biometric setup cancelled. Enable later in settings.',
                     isSuccess: false);
-                await _checkLocationLockStatus();
-                _navigateToHome();
+                await _finishAdminLoginToHomeOrGps();
                 return;
               }
               final enabled =
                   await BiometricService.enableBiometric(email);
               if (!mounted) return;
               if (enabled) {
-                setState(() => _biometricEnabled = true);
+                await _authService.cacheBiometricLogin(
+                  email: email,
+                  password: _passwordController.text,
+                );
+                if (!mounted) return;
+                setState(() {
+                  _showBiometricOnPinCard = _biometricSupported;
+                });
+                if (!context.mounted) return;
                 ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
                   content: Row(children: [
                     Icon(Icons.check_circle, color: Colors.white),
@@ -1001,8 +971,7 @@ class _LoginScreenState extends State<LoginScreen>
                   backgroundColor: AppTheme.primaryGreen,
                 ));
               }
-              await _checkLocationLockStatus();
-              _navigateToHome();
+              await _finishAdminLoginToHomeOrGps();
             },
             style: ElevatedButton.styleFrom(
                 backgroundColor: AppTheme.primaryBlue,
@@ -1018,30 +987,83 @@ class _LoginScreenState extends State<LoginScreen>
 
   void _navigateToHome() async {
     if (!mounted) return;
-    setState(() {
-      _waitingForEmailOtp = false;
-      _loginOtpVerified = false;
-    });
-    final isBiometricEnabled = await BiometricService.isBiometricEnabled();
-    final isBiometricSupported = await BiometricService.isDeviceSupported();
-    if (isBiometricEnabled && isBiometricSupported) {
-      Navigator.pushReplacementNamed(context, BiometricLockScreen.routeName);
-      return;
-    }
-    if (mounted) {
-      Navigator.pushReplacement(
+
+    // ── Stop all repeating animations BEFORE navigation ───────────────────────
+    // The 600ms page-transition keeps this widget alive; without stopping,
+    // the 3D-transform AnimatedBuilders keep firing and hit a RenderBox
+    // "!_debugNeedsLayout" assertion (dart:ui line ~6268).
+    _buttonPulseController.stop();
+    _masterController.stop();
+
+    Navigator.pushNamedAndRemoveUntil(
+      context,
+      MainNavigationScreen.routeName,
+      (route) => false,
+    );
+  }
+
+  /// Navigate to GPS settings if not configured, otherwise to home
+  Future<void> _navigateBasedOnGpsStatus() async {
+    if (!mounted || _currentUserId == null) return;
+
+    try {
+      final profile =
+          await _geofenceService.fetchProfileForLocationGate(_currentUserId!);
+      if (!mounted) return;
+
+      final isGpsConfigured = await _geofenceService
+          .hasValidPersonalGpsForCurrentAdmin(preloadedProfile: profile);
+      if (!mounted) return;
+
+      if (!isGpsConfigured) {
+        // GPS not configured - redirect to GPS settings (mandatory)
+        if (kDebugMode) debugPrint('🛰️ Redirecting admin to GPS configuration (mandatory)');
+
+        _buttonPulseController.stop();
+        _masterController.stop();
+
+        Navigator.pushNamedAndRemoveUntil(
+          context,
+          GpsSettingsScreen.routeName,
+          (route) => false,
+          arguments: {'mandatory': true, 'fromLogin': true},
+        );
+      } else {
+        final gateResult = await _geofenceService.attendanceLocationGateForCurrentUser(
+          preloadedProfile: profile,
+          fastFenceSampleForLogin: true,
+        );
+        if (!mounted) return;
+        if (gateResult['allowed'] != true) {
+          _buttonPulseController.stop();
+          _masterController.stop();
+
+          Navigator.pushNamedAndRemoveUntil(
+            context,
+            InstituteLocationGateScreen.routeName,
+            (_) => false,
+            arguments: {'resumeRoute': MainNavigationScreen.routeName},
+          );
+          return;
+        }
+        _navigateToHome();
+      }
+    } catch (e) {
+      if (kDebugMode) debugPrint('Error checking GPS status: $e');
+      if (!mounted) return;
+      Navigator.pushNamedAndRemoveUntil(
         context,
-        PageRouteBuilder(
-          pageBuilder: (_, animation, __) => const MainNavigationScreen(),
-          transitionDuration: const Duration(milliseconds: 600),
-          transitionsBuilder: (_, animation, __, child) => FadeTransition(
-            opacity: CurvedAnimation(
-                parent: animation, curve: Curves.easeIn),
-            child: child,
-          ),
-        ),
+        GpsSettingsScreen.routeName,
+        (route) => false,
+        arguments: {'mandatory': true, 'fromLogin': true},
       );
     }
+  }
+
+  /// Same GPS feedback as before, but does not block navigation (Geolocator can be slow).
+  void _scheduleLocationLockFeedback() {
+    if (!mounted || _currentUserId == null) return;
+    unawaited(_checkLocationLockStatus());
   }
 
   Future<void> _checkLocationLockStatus() async {
@@ -1080,16 +1102,35 @@ class _LoginScreenState extends State<LoginScreen>
   void _showLoginFailure(Map<String, dynamic> result) {
     final message = result['message'] as String? ?? 'Login failed';
     final openPortal = result['openAdminPortal'] == true;
+    final isLocked = result['isLocked'] == true;
+    final attemptsRemaining = result['attemptsRemaining'] as int?;
+    final displayMessage = attemptsRemaining != null && attemptsRemaining > 0
+        ? '$message\n🔐 $attemptsRemaining attempt${attemptsRemaining == 1 ? '' : 's'} remaining'
+        : message;
     final portalReady = AdminPortalUrl.isConfigured;
+    if (isLocked) {
+      final email = _emailController.text.trim();
+      if (email.isNotEmpty) {
+        _securityOps.reportIncident(
+          instituteId: (result['instituteId'] ?? '').toString(),
+          category: 'auth_lockout',
+          severity: 'high',
+          title: 'Admin login lockout triggered',
+          description: 'Account temporarily locked after repeated failed attempts.',
+          metadata: {
+            'email': email,
+            'flow': _isReturningUser ? 'pin' : 'password',
+          },
+        );
+      }
+    }
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
       content: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
         const Icon(Icons.error_outline, color: Colors.white, size: 20),
         const SizedBox(width: 10),
         Expanded(
             child: Text(
-          openPortal && !portalReady
-              ? '$message\n\nSet ADMIN_PORTAL_URL in .env.'
-              : message,
+          displayMessage,
           style: const TextStyle(fontSize: 13),
         )),
       ]),
@@ -1144,7 +1185,12 @@ class _LoginScreenState extends State<LoginScreen>
   }
 
   void _showForgotPinDialog() {
-    // Forgot PIN → clear saved user → go to full login form
+    final email = _savedEmail?.trim();
+    if (email == null || email.isEmpty) {
+      _showModernSnackbar('Saved account email not found.', isSuccess: false);
+      return;
+    }
+
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
@@ -1153,7 +1199,7 @@ class _LoginScreenState extends State<LoginScreen>
         title: const Text('Forgot PIN?',
             style: TextStyle(fontWeight: FontWeight.bold)),
         content: const Text(
-          'You will be redirected to the full login form where you can login with your password and set a new PIN.',
+          'Your old PIN will be removed. Then sign in with Institute ID, password and CAPTCHA to set a new PIN.',
           style: TextStyle(fontSize: 13),
         ),
         actions: [
@@ -1161,16 +1207,25 @@ class _LoginScreenState extends State<LoginScreen>
               onPressed: () => Navigator.pop(context),
               child: const Text('Cancel')),
           ElevatedButton(
-            onPressed: () {
+            onPressed: () async {
               Navigator.pop(context);
-              _switchToChangeUser();
+              final prefs = await SharedPreferences.getInstance();
+              await prefs.setString(_prefForgotPinEmail, email.toLowerCase());
+              await _persistLastUserHasPin(false);
+              await _switchToChangeUser();
+              if (!mounted) return;
+              _emailController.text = email;
+              _showModernSnackbar(
+                'Old PIN removed. Sign in with Institute ID, password and CAPTCHA to set a new PIN.',
+                isSuccess: true,
+              );
             },
             style: ElevatedButton.styleFrom(
                 backgroundColor: AppTheme.primaryBlue,
                 foregroundColor: Colors.white,
                 shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(8))),
-            child: const Text('Login with Password'),
+            child: const Text('Continue'),
           ),
         ],
       ),
@@ -1183,41 +1238,70 @@ class _LoginScreenState extends State<LoginScreen>
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: AppTheme.backgroundGrey,
-      body: AnimatedBuilder(
-        animation: _masterController,
-        builder: (context, _) {
-          return Opacity(
-            opacity: _screenFade.value.clamp(0.0, 1.0),
-            child: Column(
-              children: [
-                const GovPortalHeader(),
-                Expanded(
-                  child: SingleChildScrollView(
-                    physics: const BouncingScrollPhysics(),
-                    padding: EdgeInsets.symmetric(
-                      horizontal: Responsive.padding(context).horizontal,
-                      vertical: 20.h,
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        _buildLogoSection(context),
-                        SizedBox(height: 20.h),
-                        // Switch between IRCTC PIN screen and Full Login form
-                        _isReturningUser
-                            ? _buildIRCTCPinCard()
-                            : _buildFullLoginCard(),
-                        SizedBox(height: 24.h),
-                        _buildFooter(context),
-                        SizedBox(height: 16.h),
-                      ],
+      body: SafeArea(
+        bottom: false,
+        child: AnimatedBuilder(
+          animation: _masterController,
+          builder: (context, _) {
+            return Opacity(
+              opacity: _screenFade.value.clamp(0.0, 1.0),
+              child: Column(
+                children: [
+                  const GovPortalHeader(),
+                  Expanded(
+                    child: LayoutBuilder(
+                      builder: (context, constraints) {
+                        final maxWidth = context.contentMaxWidth(
+                          mobile: 560,
+                          tablet: 760,
+                        );
+                        return SingleChildScrollView(
+                          physics: const BouncingScrollPhysics(),
+                          keyboardDismissBehavior:
+                              ScrollViewKeyboardDismissBehavior.onDrag,
+                          padding: EdgeInsets.fromLTRB(
+                            Responsive.padding(context).horizontal,
+                            20.h,
+                            Responsive.padding(context).horizontal,
+                            MediaQuery.viewInsetsOf(context).bottom + 16.h,
+                          ),
+                          child: Center(
+                            child: ConstrainedBox(
+                              constraints: BoxConstraints(
+                                minHeight: constraints.maxHeight - 20.h,
+                                maxWidth: maxWidth,
+                              ),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.stretch,
+                                children: [
+                                  _buildLogoSection(context),
+                                  SizedBox(height: 20.h),
+                                  KeyedSubtree(
+                                    key: ValueKey(
+                                      _isReturningUser
+                                          ? 'pin-login-card'
+                                          : 'full-login-card',
+                                    ),
+                                    child: _isReturningUser
+                                        ? _buildIRCTCPinCard()
+                                        : _buildFullLoginCard(),
+                                  ),
+                                  SizedBox(height: 24.h),
+                                  _buildFooter(context),
+                                  SizedBox(height: 16.h),
+                                ],
+                              ),
+                            ),
+                          ),
+                        );
+                      },
                     ),
                   ),
-                ),
-              ],
-            ),
-          );
-        },
+                ],
+              ),
+            );
+          },
+        ),
       ),
     );
   }
@@ -1294,46 +1378,9 @@ class _LoginScreenState extends State<LoginScreen>
                 fontWeight: FontWeight.w500,
               ),
             ),
-            SizedBox(height: 14.h),
-            Wrap(
-              spacing: 8.w,
-              runSpacing: 6.h,
-              alignment: WrapAlignment.center,
-              children: [
-                _build3DBadge(Icons.verified_rounded, l10n.badgeGovtCertified,
-                    AppTheme.primaryBlue, 0.0),
-                _build3DBadge(Icons.security_rounded, l10n.badgeSslSecured,
-                    AppTheme.primaryGreen, 0.5),
-                _build3DBadge(Icons.lock_rounded, l10n.badgeCertInCompliant,
-                    AppTheme.accentSaffron, 1.0),
-              ],
-            ),
           ],
         );
       },
-    );
-  }
-
-  Widget _build3DBadge(IconData icon, String label, Color color, double phase) {
-    final sinVal = math.sin(_badgeSpin.value + phase * math.pi) * 0.05;
-    return Transform(
-      alignment: Alignment.center,
-      transform: Matrix4.identity()
-        ..setEntry(3, 2, 0.002)..rotateX(sinVal * 0.5)..rotateY(sinVal),
-      child: Container(
-        padding: EdgeInsets.symmetric(horizontal: 10.w, vertical: 5.h),
-        decoration: BoxDecoration(
-          color: color.withValues(alpha: 0.08),
-          borderRadius: BorderRadius.circular(20),
-          border: Border.all(color: color.withValues(alpha: 0.25), width: 1),
-          boxShadow: [BoxShadow(color: color.withValues(alpha: 0.1), blurRadius: 6, offset: const Offset(0, 2))],
-        ),
-        child: Row(mainAxisSize: MainAxisSize.min, children: [
-          Icon(icon, size: 12.sp, color: color),
-          SizedBox(width: 4.w),
-          Text(label, style: TextStyle(fontSize: 10.5.sp, color: color, fontWeight: FontWeight.w600)),
-        ]),
-      ),
     );
   }
 
@@ -1347,6 +1394,7 @@ class _LoginScreenState extends State<LoginScreen>
         transform: Matrix4.identity()
           ..setEntry(3, 2, 0.001)
           ..rotateX(_cardTiltX.value)
+          // ignore: deprecated_member_use
           ..translate(0.0, _cardSlideY.value),
         child: GovElevatedCard(
           padding: EdgeInsets.zero,
@@ -1357,7 +1405,7 @@ class _LoginScreenState extends State<LoginScreen>
   }
 
   // ══════════════════════════════════════════════════════════════════════════════
-  // ──  IRCTC PIN SCREEN  (returning user)  ─────────────────────────────────────
+  // ──  PIN SCREEN (returning user)  ─────────────────────────────────────────────
   // ══════════════════════════════════════════════════════════════════════════════
 
   Widget _buildIRCTCPinCard() {
@@ -1371,7 +1419,6 @@ class _LoginScreenState extends State<LoginScreen>
       Padding(
         padding: EdgeInsets.all(20.w),
         child: Form(
-          key: _formKey,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
@@ -1490,7 +1537,7 @@ class _LoginScreenState extends State<LoginScreen>
               SizedBox(height: 14.h),
 
               // ── Biometric Button ─────────────────────────────────────────────
-              if (_biometricEnabled && _biometricSupported) ...[
+              if (_showBiometricOnPinCard) ...[
                 SizedBox(
                   width: double.infinity,
                   child: OutlinedButton(
@@ -1582,7 +1629,7 @@ class _LoginScreenState extends State<LoginScreen>
               ),
               SizedBox(height: 8.h),
               Text(
-                'Change User: full login with password, CAPTCHA & OTP — same as first install.',
+                'Change User: full login with Institute ID, password and CAPTCHA.',
                 textAlign: TextAlign.center,
                 style: TextStyle(
                   fontSize: 10.sp,
@@ -1604,20 +1651,11 @@ class _LoginScreenState extends State<LoginScreen>
   // ──  FULL LOGIN FORM  (first-time / change user)  ────────────────────────────
   // ══════════════════════════════════════════════════════════════════════════════
 
-  String _maskEmail(String email) {
-    if (email.isEmpty) return '—';
-    final at = email.indexOf('@');
-    if (at <= 0) return '***';
-    if (at <= 2) return '${email[0]}***${email.substring(at)}';
-    return '${email.substring(0, 2)}***${email.substring(at)}';
-  }
-
   Widget _buildFullLoginCard() {
     return _wrapCard(
       Padding(
         padding: EdgeInsets.all(20.w),
         child: Form(
-          key: _formKey,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
@@ -1658,224 +1696,155 @@ class _LoginScreenState extends State<LoginScreen>
               SizedBox(height: 6.h),
               const Divider(color: AppTheme.dividerColor, thickness: 1),
 
-              if (!_waitingForEmailOtp) ...[
-                SizedBox(height: 12.h),
-                Container(
-                  padding: EdgeInsets.symmetric(horizontal: 12.w, vertical: 8.h),
-                  decoration: BoxDecoration(
-                    color: AppTheme.primaryBlue.withValues(alpha: 0.06),
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: AppTheme.primaryBlue.withValues(alpha: 0.2)),
-                  ),
-                  child: Row(children: [
-                    const Icon(Icons.info_outline, color: AppTheme.primaryBlue, size: 16),
-                    SizedBox(width: 8.w),
-                    Expanded(
-                      child: Text(
-                        'IRCTC-style: enter User ID, Password and CAPTCHA, then a one-time OTP. Next visits: PIN or biometric. Use Change User on PIN screen for full login again.',
-                        style: TextStyle(color: AppTheme.primaryBlue,
-                            fontSize: 11.sp, fontWeight: FontWeight.w500),
-                      ),
+              SizedBox(height: 12.h),
+              Container(
+                padding: EdgeInsets.symmetric(horizontal: 12.w, vertical: 8.h),
+                decoration: BoxDecoration(
+                  color: AppTheme.primaryBlue.withValues(alpha: 0.06),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: AppTheme.primaryBlue.withValues(alpha: 0.2)),
+                ),
+                child: Row(children: [
+                  const Icon(Icons.info_outline, color: AppTheme.primaryBlue, size: 16),
+                  SizedBox(width: 8.w),
+                  Expanded(
+                    child: Text(
+                      'Enter Institute ID, password and CAPTCHA. Email OTP is only on Sign up / institute registration — not on this login screen. | ईमेल ओटीपी फक्त नोंदणी/साइन अपवर; या लॉगिनवर नाही.',
+                      style: TextStyle(color: AppTheme.primaryBlue,
+                          fontSize: 11.sp, fontWeight: FontWeight.w500),
                     ),
-                  ]),
-                ),
-                SizedBox(height: 18.h),
-                _buildGovTextField(
-                  controller: _emailController,
-                  icon: Icons.email_outlined,
-                  label: 'User ID / Email  |  ईमेल पत्ता',
-                  hint: 'example@gov.in',
-                  keyboardType: TextInputType.emailAddress,
-                  validator: (value) {
-                    if (value == null || value.isEmpty) return 'Email is required';
-                    if (!value.contains('@')) return 'Enter a valid email';
-                    return null;
-                  },
-                ),
-                SizedBox(height: 14.h),
-                _buildGovTextField(
-                  controller: _passwordController,
-                  icon: Icons.lock_outline_rounded,
-                  label: 'Password  |  पासवर्ड',
-                  hint: '••••••••',
-                  isPassword: true,
-                  validator: (value) {
-                    if (value == null || value.isEmpty) return 'Password is required';
-                    return null;
-                  },
-                ),
-                SizedBox(height: 18.h),
-                _buildCaptchaSection(),
-                SizedBox(height: 24.h),
-                _build3DLoginButton(
-                  label: 'VERIFY & SEND OTP  |  ओटीपी पाठवा',
-                  onTap: _handleFullFormLogin,
-                ),
-                SizedBox(height: 16.h),
-                Center(
-                  child: GestureDetector(
-                    onTap: () {
-                      Navigator.push(
-                          context,
-                          MaterialPageRoute(
-                              builder: (_) => const InstituteSearchScreen()));
-                    },
-                    child: RichText(
-                      text: TextSpan(
-                        text: 'New institute? ',
-                        style: TextStyle(
-                            color: AppTheme.textGray, fontSize: 12.sp),
-                        children: [
-                          TextSpan(
-                            text: 'Register here',
-                            style: TextStyle(
-                                color: AppTheme.primaryBlue,
-                                fontSize: 12.sp,
-                                fontWeight: FontWeight.w700,
-                                decoration: TextDecoration.underline),
+                  ),
+                ]),
+              ),
+              SizedBox(height: 18.h),
+              _buildGovTextField(
+                controller: _instituteIdController,
+                icon: Icons.domain_outlined,
+                label: 'Institute ID  |  संस्था आयडी',
+                hint: 'e.g. 00000  |  उदा. ०००००',
+                keyboardType: TextInputType.number,
+                enabled: !_instituteIdFieldDisabled,
+                validator: (value) {
+                  if (value == null || value.isEmpty) return 'Institute ID is required';
+                  if (!RegExp(r'^\d+$').hasMatch(value)) return 'Use numeric Institute ID only';
+                  return null;
+                },
+              ),
+              SizedBox(height: 14.h),
+              _buildGovTextField(
+                controller: _passwordController,
+                icon: Icons.lock_outline_rounded,
+                label: 'Password  |  पासवर्ड',
+                hint: '••••••••',
+                isPassword: true,
+                validator: (value) {
+                  if (value == null || value.isEmpty) return 'Password is required';
+                  return null;
+                },
+              ),
+              SizedBox(height: 18.h),
+              _buildCaptchaSection(),
+              SizedBox(height: 24.h),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  LayoutBuilder(
+                    builder: (context, c) {
+                      final signupBtn = SizedBox(
+                        height: 52.h,
+                        width: double.infinity,
+                        child: OutlinedButton(
+                          onPressed: () {
+                            Navigator.push(
+                              context,
+                              MaterialPageRoute(
+                                builder: (_) => const InstituteSearchScreen(),
+                              ),
+                            );
+                          },
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: AppTheme.primaryBlue,
+                            side: const BorderSide(
+                              color: AppTheme.primaryBlue,
+                              width: 1.5,
+                            ),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            padding: EdgeInsets.symmetric(
+                                horizontal: 6.w, vertical: 8.h),
                           ),
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
-              ] else ...[
-                SizedBox(height: 12.h),
-                Container(
-                  padding: EdgeInsets.symmetric(horizontal: 12.w, vertical: 8.h),
-                  decoration: BoxDecoration(
-                    color: AppTheme.primaryGreen.withValues(alpha: 0.08),
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: AppTheme.primaryGreen.withValues(alpha: 0.25)),
-                  ),
-                  child: Row(children: [
-                    const Icon(Icons.sms_outlined, color: AppTheme.primaryGreen, size: 18),
-                    SizedBox(width: 8.w),
-                    Expanded(
-                      child: Text(
-                        'OTP sent for ${_maskEmail(_emailController.text.trim())}. Enter the 6-digit code. (Debug: see console/snackbar for demo code.)',
-                        style: TextStyle(color: AppTheme.textDark,
-                            fontSize: 11.sp, fontWeight: FontWeight.w500),
-                      ),
-                    ),
-                  ]),
-                ),
-                SizedBox(height: 20.h),
-                TextFormField(
-                  controller: _emailOtpController,
-                  keyboardType: TextInputType.number,
-                  maxLength: 6,
-                  textAlign: TextAlign.center,
-                  inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-                  style: TextStyle(
-                    fontSize: 22.sp,
-                    letterSpacing: 8.w,
-                    fontWeight: FontWeight.bold,
-                    color: AppTheme.primaryBlue,
-                  ),
-                  decoration: InputDecoration(
-                    labelText: 'Enter OTP  |  ओटीपी टाका',
-                    hintText: '• • • • • •',
-                    counterText: '',
-                    prefixIcon: Icon(Icons.pin_rounded, color: AppTheme.textGray, size: 19.sp),
-                    filled: true,
-                    fillColor: Colors.white,
-                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
-                    focusedBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(8),
-                      borderSide: const BorderSide(color: AppTheme.primaryBlue, width: 2),
-                    ),
-                  ),
-                  validator: (value) {
-                    if (value == null || value.isEmpty) return 'OTP required';
-                    if (value.length != 6) return 'OTP must be 6 digits';
-                    return null;
-                  },
-                  readOnly: _loginOtpVerified,
-                ),
-                if (_loginOtpVerified) ...[
-                  SizedBox(height: 12.h),
-                  Container(
-                    padding:
-                        EdgeInsets.symmetric(horizontal: 12.w, vertical: 10.h),
-                    decoration: BoxDecoration(
-                      color: AppTheme.primaryGreen.withValues(alpha: 0.1),
-                      borderRadius: BorderRadius.circular(8),
-                      border: Border.all(
-                        color: AppTheme.primaryGreen.withValues(alpha: 0.35),
-                      ),
-                    ),
-                    child: Row(
-                      children: [
-                        Icon(Icons.check_circle,
-                            color: AppTheme.primaryGreen, size: 20.sp),
-                        SizedBox(width: 10.w),
-                        Expanded(
-                          child: Text(
-                            _isLoading
-                                ? 'OTP verified — signing you in securely…'
-                                : 'OTP verified.',
-                            style: TextStyle(
-                              color: AppTheme.primaryGreen,
-                              fontSize: 12.sp,
-                              fontWeight: FontWeight.w700,
+                          child: FittedBox(
+                            fit: BoxFit.scaleDown,
+                            alignment: Alignment.center,
+                            child: Text(
+                              'SIGN UP',
+                              maxLines: 1,
+                              textAlign: TextAlign.center,
+                              style: TextStyle(
+                                fontSize: 13.sp,
+                                fontWeight: FontWeight.w800,
+                              ),
                             ),
                           ),
                         ),
-                      ],
+                      );
+
+                      if (c.maxWidth < 400) {
+                        return Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            _build3DLoginButton(
+                              label: 'LOGIN  |  लॉगिन',
+                              onTap: _handleFullFormLogin,
+                            ),
+                            SizedBox(height: 12.h),
+                            signupBtn,
+                          ],
+                        );
+                      }
+
+                      return Row(
+                        children: [
+                          Expanded(
+                            child: _build3DLoginButton(
+                              label: 'LOGIN  |  लॉगिन',
+                              onTap: _handleFullFormLogin,
+                            ),
+                          ),
+                          SizedBox(width: 12.w),
+                          Expanded(child: signupBtn),
+                        ],
+                      );
+                    },
+                  ),
+                  SizedBox(height: 10.h),
+                  TextButton(
+                    onPressed: () {
+                      // Use explicit route so this always works even if named routes
+                      // were not hot-restarted after main.dart changes.
+                      Navigator.push<void>(
+                        context,
+                        MaterialPageRoute<void>(
+                          settings: RouteSettings(
+                            name: AttendanceStaffLoginScreen.routeName,
+                          ),
+                          builder: (_) => const AttendanceStaffLoginScreen(),
+                        ),
+                      );
+                    },
+                    child: Text(
+                      'Institute instructor login  |  संस्था प्रशिक्षक लॉगिन',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        fontSize: 13.sp,
+                        fontWeight: FontWeight.w700,
+                        color: AppTheme.primaryBlue,
+                      ),
                     ),
                   ),
                 ],
-                SizedBox(height: 20.h),
-                _build3DLoginButton(
-                  label: 'VERIFY OTP & LOGIN  |  सत्यापन व लॉगिन',
-                  onTap: () {
-                    if (_formKey.currentState?.validate() ?? false) {
-                      _handleEmailOtpVerify();
-                    }
-                  },
-                ),
-                SizedBox(height: 12.h),
-                Wrap(
-                  alignment: WrapAlignment.spaceBetween,
-                  crossAxisAlignment: WrapCrossAlignment.center,
-                  spacing: 8.w,
-                  runSpacing: 6.h,
-                  children: [
-                    TextButton.icon(
-                      onPressed: _isLoading ? null : _cancelEmailOtpStep,
-                      icon: Icon(Icons.arrow_back, size: 18.sp, color: AppTheme.textGray),
-                      label: Text(
-                        'Back to login',
-                        style: TextStyle(color: AppTheme.textGray, fontSize: 12.sp, fontWeight: FontWeight.w600),
-                      ),
-                      style: TextButton.styleFrom(
-                        padding: EdgeInsets.symmetric(horizontal: 4.w),
-                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                        visualDensity: VisualDensity.compact,
-                      ),
-                    ),
-                    TextButton(
-                      onPressed: (_loginOtpCooldownSec > 0 || _isLoading) ? null : _resendLoginOtp,
-                      style: TextButton.styleFrom(
-                        padding: EdgeInsets.symmetric(horizontal: 4.w),
-                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                        visualDensity: VisualDensity.compact,
-                      ),
-                      child: Text(
-                        _loginOtpCooldownSec > 0
-                            ? 'Resend in ${_loginOtpCooldownSec}s'
-                            : 'Resend OTP',
-                        style: TextStyle(
-                          fontSize: 12.sp,
-                          fontWeight: FontWeight.w600,
-                          color: AppTheme.primaryBlue,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ],
+              ),
 
               SizedBox(height: 14.h),
               _buildSecurityInfoRow(context),
@@ -2039,7 +2008,9 @@ class _LoginScreenState extends State<LoginScreen>
             height: 52.h,
             transform: Matrix4.identity()
               ..setEntry(3, 2, 0.001)
+              // ignore: deprecated_member_use
               ..translate(0.0, _buttonPressed ? 3.0 : 0.0)
+              // ignore: deprecated_member_use
               ..scale(_buttonPressed ? 0.97 : (_isLoading ? 1.0 : _buttonPulse.value)),
             transformAlignment: Alignment.center,
             decoration: BoxDecoration(
@@ -2114,10 +2085,14 @@ class _LoginScreenState extends State<LoginScreen>
     TextInputType? keyboardType,
     bool isPassword = false,
     String? Function(String?)? validator,
+    ValueChanged<String>? onChanged,
+    bool enabled = true,
   }) {
     return TextFormField(
       controller: controller,
       keyboardType: keyboardType,
+      onChanged: onChanged,
+      enabled: enabled,
       textCapitalization: keyboardType == TextInputType.emailAddress
           ? TextCapitalization.none : TextCapitalization.sentences,
       obscureText: isPassword && !_isPasswordVisible,
@@ -2156,7 +2131,7 @@ class _LoginScreenState extends State<LoginScreen>
     return TextFormField(
       controller: _pinController,
       keyboardType: TextInputType.number,
-      maxLength: 6,
+      maxLength: 4,
       obscureText: true,
       textAlign: TextAlign.center,
       style: TextStyle(color: AppTheme.primaryBlue, fontSize: 22.sp,
@@ -2164,7 +2139,7 @@ class _LoginScreenState extends State<LoginScreen>
       inputFormatters: [FilteringTextInputFormatter.digitsOnly],
       decoration: InputDecoration(
         labelText: 'Enter PIN  |  पिन टाका',
-        hintText: '• • • •',
+        hintText: '4 digits  |  ४ अंक',
         hintStyle: TextStyle(color: AppTheme.textLightGray, fontSize: 18.sp, letterSpacing: 8),
         prefixIcon: Icon(Icons.pin_rounded, color: AppTheme.textGray, size: 19.sp),
         filled: true, fillColor: Colors.white,
@@ -2184,7 +2159,9 @@ class _LoginScreenState extends State<LoginScreen>
       ),
       validator: (value) {
         if (value == null || value.isEmpty) return 'PIN is required';
-        if (value.length < 4 || value.length > 6) return 'PIN must be 4–6 digits';
+        if (!AuthService.isValidLoginPinLength(value)) {
+          return AuthService.loginPinLengthMessage;
+        }
         return null;
       },
     );
@@ -2280,15 +2257,22 @@ class _LoginScreenState extends State<LoginScreen>
           ],
         ),
         SizedBox(height: 12.h),
-        Text(l10n.footerCredit,
-            style: TextStyle(fontSize: 11.sp, color: AppTheme.textLightGray,
-                fontWeight: FontWeight.w500),
-            textAlign: TextAlign.center),
+        Text(
+          'Maharashtra State Council of Examination | महाराष्ट्र राज्य परीक्षा परिषद',
+          style: TextStyle(
+            fontSize: 10.5.sp,
+            color: AppTheme.textGray,
+            fontWeight: FontWeight.w600,
+          ),
+          textAlign: TextAlign.center,
+        ),
         SizedBox(height: 4.h),
         Text(l10n.loginCopyright('${DateTime.now().year}'),
             style: TextStyle(fontSize: 10.sp, color: AppTheme.textLightGray,
                 fontWeight: FontWeight.w400),
             textAlign: TextAlign.center),
+        SizedBox(height: 8.h),
+        const Center(child: SupportEmailFooter()),
         SizedBox(height: 10.h),
         Row(children: [
           Expanded(child: Container(height: 3, decoration: const BoxDecoration(
@@ -2297,6 +2281,187 @@ class _LoginScreenState extends State<LoginScreen>
           Expanded(child: Container(height: 3, decoration: const BoxDecoration(
               gradient: LinearGradient(colors: [Color(0xFF006600), Color(0xFF138808)])))),
         ]),
+      ],
+    );
+  }
+}
+
+/// PIN setup after password login — shows strength and blocks very weak PINs.
+class _SetLoginPinAlert extends StatefulWidget {
+  const _SetLoginPinAlert({
+    required this.email,
+    required this.authService,
+    required this.userId,
+    required this.accountPassword,
+    required this.onDone,
+  });
+
+  final String email;
+  final AuthService authService;
+  final String userId;
+  final String accountPassword;
+  final Future<void> Function(bool success, String? message) onDone;
+
+  @override
+  State<_SetLoginPinAlert> createState() => _SetLoginPinAlertState();
+}
+
+class _SetLoginPinAlertState extends State<_SetLoginPinAlert> {
+  final TextEditingController _pinCtrl = TextEditingController();
+  final TextEditingController _confirmCtrl = TextEditingController();
+  bool _submitting = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _pinCtrl.addListener(() => setState(() {}));
+    _confirmCtrl.addListener(() => setState(() {}));
+  }
+
+  @override
+  void dispose() {
+    _pinCtrl.dispose();
+    _confirmCtrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    final pin = _pinCtrl.text;
+    final confirmPin = _confirmCtrl.text;
+    if (!AuthService.isValidLoginPinLength(pin)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text(AuthService.loginPinLengthMessage)),
+      );
+      return;
+    }
+    final pa = CredentialStrengthAnalysis.analyzePinFour(pin);
+    if (pa.level == CredentialStrengthLevel.weak) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            pa.hint ?? 'Choose a stronger PIN (avoid 1234, repeating digits, etc.)',
+          ),
+        ),
+      );
+      return;
+    }
+    if (pin != confirmPin) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('PINs do not match')),
+      );
+      return;
+    }
+
+    setState(() => _submitting = true);
+    final result = await widget.authService.setPINWithPassword(
+      userId: widget.userId,
+      pin: pin,
+      password: widget.accountPassword,
+      email: widget.email,
+    );
+    if (!mounted) return;
+    setState(() => _submitting = false);
+
+    final ok = result['success'] == true;
+    final msg = result['message']?.toString();
+    Navigator.of(context).pop();
+    await widget.onDone(ok, msg);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final pinAnalysis = CredentialStrengthAnalysis.analyzePinFour(_pinCtrl.text);
+
+    return AlertDialog(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      titlePadding: const EdgeInsets.fromLTRB(20, 20, 20, 0),
+      title: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: AppTheme.primaryBlue.withValues(alpha: 0.1),
+                  shape: BoxShape.circle,
+                ),
+                child: const Icon(Icons.pin_rounded, color: AppTheme.primaryBlue, size: 22),
+              ),
+              const SizedBox(width: 12),
+              const Expanded(
+                child: Text(
+                  'Set Login PIN',
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          const Text(
+            'Required: exactly 4 digits. Avoid simple patterns (1234, 1111, etc.).',
+            style: TextStyle(fontSize: 12, fontWeight: FontWeight.w400, color: AppTheme.textGray),
+          ),
+        ],
+      ),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const SizedBox(height: 8),
+          TextField(
+            controller: _pinCtrl,
+            keyboardType: TextInputType.number,
+            maxLength: 4,
+            obscureText: true,
+            textAlign: TextAlign.center,
+            style: const TextStyle(fontSize: 22, letterSpacing: 8, fontWeight: FontWeight.bold),
+            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+            decoration: InputDecoration(
+              labelText: 'Enter PIN (4 digits)',
+              border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+              focusedBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(8),
+                borderSide: const BorderSide(color: AppTheme.primaryBlue, width: 2),
+              ),
+            ),
+          ),
+          CredentialStrengthIndicator(analysis: pinAnalysis, dense: true, forPin: true),
+          const SizedBox(height: 10),
+          TextField(
+            controller: _confirmCtrl,
+            keyboardType: TextInputType.number,
+            maxLength: 4,
+            obscureText: true,
+            textAlign: TextAlign.center,
+            style: const TextStyle(fontSize: 22, letterSpacing: 8, fontWeight: FontWeight.bold),
+            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+            decoration: InputDecoration(
+              labelText: 'Confirm PIN',
+              border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+              focusedBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(8),
+                borderSide: const BorderSide(color: AppTheme.primaryBlue, width: 2),
+              ),
+            ),
+          ),
+        ],
+      ),
+      actions: [
+        ElevatedButton(
+          onPressed: _submitting ? null : _submit,
+          style: ElevatedButton.styleFrom(
+            backgroundColor: AppTheme.primaryBlue,
+            foregroundColor: Colors.white,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+          ),
+          child: _submitting
+              ? const SizedBox(
+                  width: 22,
+                  height: 22,
+                  child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                )
+              : const Text('Set PIN'),
+        ),
       ],
     );
   }

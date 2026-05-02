@@ -38,6 +38,17 @@ class _SecureNetworkImageState extends State<SecureNetworkImage> {
   int _retryCount = 0;
   static const int _maxRetries = 2;
 
+  /// Stable cache key so disk cache works across refreshed signed URLs.
+  String? get _diskCacheKey {
+    final p = widget.storagePath?.trim();
+    if (p != null && p.isNotEmpty) return p;
+    final u = widget.imageUrl?.trim();
+    if (u != null && u.isNotEmpty) {
+      return StorageService.b2ObjectPathFromPhotoUrl(u) ?? u;
+    }
+    return null;
+  }
+
   @override
   void initState() {
     super.initState();
@@ -132,6 +143,7 @@ class _SecureNetworkImageState extends State<SecureNetworkImage> {
 
     return CachedNetworkImage(
       imageUrl: _currentUrl!,
+      cacheKey: _diskCacheKey,
       fit: widget.fit,
       width: widget.width,
       height: widget.height,
@@ -145,8 +157,7 @@ class _SecureNetworkImageState extends State<SecureNetworkImage> {
         final errorStr = error.toString();
         
         // Check if it's a 401 error for B2 URL
-        if (errorStr.contains('401') && 
-            url != null && 
+        if (errorStr.contains('401') &&
             url.toString().contains('backblazeb2.com') &&
             _retryCount < _maxRetries) {
           

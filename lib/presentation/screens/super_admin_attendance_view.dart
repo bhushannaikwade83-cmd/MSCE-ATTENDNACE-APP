@@ -6,9 +6,9 @@ import '../../core/time_parse.dart';
 import '../../services/hierarchical_attendance_service.dart';
 
 /// Super Admin Attendance View
-/// 
+///
 /// Displays attendance data organized by:
-/// Year → Semester → Institute Code → Students → Date → In/Out
+/// Year → Institute Code → Students → Date → In/Out
 class SuperAdminAttendanceView extends StatefulWidget {
   static const routeName = '/super-admin-attendance-view';
   const SuperAdminAttendanceView({super.key});
@@ -22,9 +22,6 @@ class _SuperAdminAttendanceViewState extends State<SuperAdminAttendanceView> {
   
   bool _isLoading = true;
   Map<String, dynamic> _attendanceData = {};
-  String? _selectedYear;
-  String? _selectedSemester;
-  String? _selectedInstituteCode;
 
   @override
   void initState() {
@@ -89,11 +86,10 @@ class _SuperAdminAttendanceViewState extends State<SuperAdminAttendanceView> {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
-        // Year Level
         ..._attendanceData.entries.map((yearEntry) {
           final year = yearEntry.key;
-          final semesterData = yearEntry.value as Map<String, dynamic>;
-          
+          final instituteData = yearEntry.value as Map<String, dynamic>;
+
           return ExpansionTile(
             leading: const Icon(Icons.calendar_today, color: AppTheme.primaryBlue),
             title: Text(
@@ -103,66 +99,46 @@ class _SuperAdminAttendanceViewState extends State<SuperAdminAttendanceView> {
                 fontWeight: FontWeight.bold,
               ),
             ),
-            subtitle: Text('${semesterData.length} semester(s)'),
+            subtitle: Text('${instituteData.length} institute(s)'),
             children: [
-              // Semester Level
-              ...semesterData.entries.map((semesterEntry) {
-                final semesterCode = semesterEntry.key;
-                final instituteData = semesterEntry.value as Map<String, dynamic>;
-                
-                return ExpansionTile(
-                  leading: const Icon(Icons.school, color: AppTheme.primaryGreen),
-                  title: Text(
-                    'Semester $semesterCode',
-                    style: const TextStyle(
-                      fontSize: 16,
-                      fontWeight: FontWeight.w600,
+              ...instituteData.entries.map((instituteEntry) {
+                final instituteCode = instituteEntry.key;
+                final stats = instituteEntry.value as Map<String, dynamic>;
+                final totalStudents = stats['totalStudents'] as int? ?? 0;
+                final totalAttendance = stats['totalAttendance'] as int? ?? 0;
+
+                return Card(
+                  margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                  child: ListTile(
+                    leading: Container(
+                      padding: const EdgeInsets.all(8),
+                      decoration: BoxDecoration(
+                        color: AppTheme.primaryBlue.withOpacity(0.1),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: const Icon(Icons.business, color: AppTheme.primaryBlue),
+                    ),
+                    title: Text(
+                      'Institute: $instituteCode',
+                      style: const TextStyle(
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    subtitle: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const SizedBox(height: 4),
+                        Text('Students: $totalStudents'),
+                        Text('Attendance Records: $totalAttendance'),
+                      ],
+                    ),
+                    trailing: IconButton(
+                      icon: const Icon(Icons.arrow_forward_ios, size: 16),
+                      onPressed: () {
+                        _showInstituteDetails(year, instituteCode);
+                      },
                     ),
                   ),
-                  subtitle: Text('${instituteData.length} institute(s)'),
-                  children: [
-                    // Institute Code Level
-                    ...instituteData.entries.map((instituteEntry) {
-                      final instituteCode = instituteEntry.key;
-                      final stats = instituteEntry.value as Map<String, dynamic>;
-                      final totalStudents = stats['totalStudents'] as int? ?? 0;
-                      final totalAttendance = stats['totalAttendance'] as int? ?? 0;
-                      
-                      return Card(
-                        margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-                        child: ListTile(
-                          leading: Container(
-                            padding: const EdgeInsets.all(8),
-                            decoration: BoxDecoration(
-                              color: AppTheme.primaryBlue.withOpacity(0.1),
-                              borderRadius: BorderRadius.circular(8),
-                            ),
-                            child: const Icon(Icons.business, color: AppTheme.primaryBlue),
-                          ),
-                          title: Text(
-                            'Institute: $instituteCode',
-                            style: const TextStyle(
-                              fontWeight: FontWeight.w600,
-                            ),
-                          ),
-                          subtitle: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              const SizedBox(height: 4),
-                              Text('Students: $totalStudents'),
-                              Text('Attendance Records: $totalAttendance'),
-                            ],
-                          ),
-                          trailing: IconButton(
-                            icon: const Icon(Icons.arrow_forward_ios, size: 16),
-                            onPressed: () {
-                              _showInstituteDetails(year, semesterCode, instituteCode);
-                            },
-                          ),
-                        ),
-                      );
-                    }).toList(),
-                  ],
                 );
               }).toList(),
             ],
@@ -172,7 +148,7 @@ class _SuperAdminAttendanceViewState extends State<SuperAdminAttendanceView> {
     );
   }
 
-  Future<void> _showInstituteDetails(String year, String semesterCode, String instituteCode) async {
+  Future<void> _showInstituteDetails(String year, String instituteCode) async {
     showDialog(
       context: context,
       builder: (context) => Dialog(
@@ -201,8 +177,7 @@ class _SuperAdminAttendanceViewState extends State<SuperAdminAttendanceView> {
               ),
               const Divider(),
               Text('Year: $year'),
-              Text('Semester: $semesterCode'),
-              Text('Institute Code: $instituteCode'),
+              Text('Inst ID: $instituteCode'),
               const SizedBox(height: 16),
               const Text(
                 'Students & Attendance:',
@@ -236,7 +211,6 @@ class _SuperAdminAttendanceViewState extends State<SuperAdminAttendanceView> {
                             instituteCode: instituteCode,
                             studentId: sid,
                             year: year,
-                            semesterCode: semesterCode,
                           ),
                           builder: (context, attendanceSnapshot) {
                             final attendanceCount = attendanceSnapshot.data ?? 0;
@@ -249,7 +223,6 @@ class _SuperAdminAttendanceViewState extends State<SuperAdminAttendanceView> {
                                 onPressed: () {
                                   _showStudentDetails(
                                     year,
-                                    semesterCode,
                                     instituteCode,
                                     sid,
                                   );
@@ -282,7 +255,6 @@ class _SuperAdminAttendanceViewState extends State<SuperAdminAttendanceView> {
     required String instituteCode,
     required String studentId,
     required String year,
-    required String semesterCode,
   }) async {
     final yearInt = int.tryParse(year) ?? 0;
     final rows = await appDb
@@ -290,14 +262,12 @@ class _SuperAdminAttendanceViewState extends State<SuperAdminAttendanceView> {
         .select('id')
         .eq('institute_code', instituteCode)
         .eq('student_id', studentId)
-        .eq('year', yearInt)
-        .eq('semester_code', semesterCode);
+        .eq('year', yearInt);
     return rows.length;
   }
 
   Future<List<Map<String, dynamic>>> _loadStudentAttendanceRows({
     required String year,
-    required String semesterCode,
     required String instituteCode,
     required String studentId,
   }) async {
@@ -308,14 +278,12 @@ class _SuperAdminAttendanceViewState extends State<SuperAdminAttendanceView> {
         .eq('institute_code', instituteCode)
         .eq('student_id', studentId)
         .eq('year', yearInt)
-        .eq('semester_code', semesterCode)
         .order('attendance_date', ascending: false);
     return rows.map((e) => Map<String, dynamic>.from(e as Map)).toList();
   }
 
   Future<void> _showStudentDetails(
     String year,
-    String semesterCode,
     String instituteCode,
     String studentId,
   ) async {
@@ -357,7 +325,6 @@ class _SuperAdminAttendanceViewState extends State<SuperAdminAttendanceView> {
                 child: FutureBuilder<List<Map<String, dynamic>>>(
                   future: _loadStudentAttendanceRows(
                     year: year,
-                    semesterCode: semesterCode,
                     instituteCode: instituteCode,
                     studentId: studentId,
                   ),

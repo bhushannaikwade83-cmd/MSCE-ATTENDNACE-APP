@@ -1,7 +1,8 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
+import '../../core/root_navigator.dart';
 import '../../services/session_manager.dart';
-import '../../services/biometric_service.dart';
 import '../../core/theme/app_theme.dart';
 import '../screens/login_screen.dart';
 import '../screens/biometric_lock_screen.dart';
@@ -10,6 +11,35 @@ import '../screens/biometric_lock_screen.dart';
 /// Monitors user session and shows expiry dialog when session is about to expire
 class SessionMonitor extends StatefulWidget {
   final Widget child;
+
+  /// Camera / image_picker and other flows pause the app without "leaving" it.
+  /// When > 0, we do not show the PIN lock on resume.
+  static int _suppressResumeLockDepth = 0;
+  static DateTime? _suppressResumeLockUntil;
+  static const Duration _resumeLockGracePeriod = Duration(seconds: 3);
+
+  /// Call when opening in-app or native camera (or [ImagePicker]).
+  /// Pair with [endSuppressResumeLock] in `finally` after capture ends.
+  static void beginSuppressResumeLock() {
+    _suppressResumeLockDepth++;
+    _suppressResumeLockUntil = DateTime.now().add(_resumeLockGracePeriod);
+  }
+
+  static void endSuppressResumeLock() {
+    if (_suppressResumeLockDepth > 0) {
+      _suppressResumeLockDepth--;
+    }
+    // Keep a short grace window after the camera/plugin returns because some
+    // devices dispatch resumed slightly after the picker Future completes.
+    _suppressResumeLockUntil = DateTime.now().add(_resumeLockGracePeriod);
+  }
+
+  static bool get shouldSkipResumeLockForCamera {
+    if (_suppressResumeLockDepth > 0) return true;
+    final until = _suppressResumeLockUntil;
+    if (until == null) return false;
+    return DateTime.now().isBefore(until);
+  }
 
   const SessionMonitor({
     super.key,
@@ -25,6 +55,9 @@ class _SessionMonitorState extends State<SessionMonitor> with WidgetsBindingObse
   Timer? _autoLogoutTimer;
   bool _isDialogShowing = false;
   final ValueNotifier<int> _countdownNotifier = ValueNotifier<int>(5);
+  /// True after `AppLifecycleState.paused`. That state also fires when the
+  /// in-app camera opens (face capture / attendance), not only when leaving the app.
+  bool _expectResumeFromBackground = false;
 
   @override
   void initState() {
@@ -38,38 +71,75 @@ class _SessionMonitorState extends State<SessionMonitor> with WidgetsBindingObse
     WidgetsBinding.instance.removeObserver(this);
     _sessionCheckTimer?.cancel();
     _autoLogoutTimer?.cancel();
+    // Dismiss the dialog before disposing the notifier it depends on,
+    // so no listeners remain when dispose() is called.
+    if (_isDialogShowing) {
+      rootNavigatorKey.currentState?.popUntil((route) {
+        _isDialogShowing = false;
+        return true;
+      });
+    }
     _countdownNotifier.dispose();
     super.dispose();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.paused || state == AppLifecycleState.inactive) {
-      // App went to background - track the time
+    if (state == AppLifecycleState.paused) {
+      _expectResumeFromBackground = true;
       SessionManager.setBackgroundTime();
-    } else if (state == AppLifecycleState.resumed) {
-      // App resumed - check if session expired while in background
+      return;
+    }
+    if (state == AppLifecycleState.resumed) {
       SessionManager.clearBackgroundTime();
-      
-      if (SessionManager.isAuthenticated()) {
-        // Check if session expired while in background
-        if (!SessionManager.isSessionValid()) {
-          // Session expired - auto logout
-          _performAutoLogout();
-          return;
-        }
-        
-        // Check if biometric is enabled - if yes, show lock screen (IRCTC style)
-        BiometricService.isBiometricEnabled().then((isEnabled) {
-          if (isEnabled && mounted) {
-            // Show biometric lock screen when app resumes
-            Navigator.pushNamed(context, BiometricLockScreen.routeName);
-          } else {
-            // Just update activity if biometric not enabled
-            SessionManager.updateActivity();
-          }
-        });
+
+      final cameFromRealBackground = _expectResumeFromBackground;
+      _expectResumeFromBackground = false;
+
+      // inactive→resumed without paused: ignore (keyboard, system sheets).
+      if (!cameFromRealBackground) {
+        return;
       }
+
+      if (!SessionManager.isAuthenticated()) {
+        return;
+      }
+      if (!SessionManager.isSessionValid()) {
+        _performAutoLogout();
+        return;
+      }
+
+      if (SessionMonitor.shouldSkipResumeLockForCamera) {
+        if (kDebugMode) {
+          debugPrint('🔓 Skipping PIN lock — camera/protected flow');
+        }
+        SessionManager.updateActivity();
+        return;
+      }
+
+      // ✅ PIN lock EVERY TIME app resumes from background
+      // Show PIN/biometric on every resume (no grace period)
+      if (kDebugMode) {
+        debugPrint('🔒 App resumed from background - showing PIN/biometric lock');
+      }
+      _showBiometricLockOnResume();
+
+      SessionManager.updateActivity();
+    }
+  }
+
+  void _showBiometricLockOnResume() {
+    final nav = rootNavigatorKey.currentState;
+    final navCtx = rootNavigatorKey.currentContext;
+
+    if (nav != null && navCtx != null && navCtx.mounted) {
+      // Push BiometricLockScreen on top
+      nav.push(
+        MaterialPageRoute(
+          builder: (_) => const BiometricLockScreen(),
+          fullscreenDialog: true,
+        ),
+      );
     }
   }
 
@@ -96,6 +166,9 @@ class _SessionMonitorState extends State<SessionMonitor> with WidgetsBindingObse
   void _showSessionExpiredDialog() {
     if (_isDialogShowing || !mounted) return;
 
+    final dialogContext = rootNavigatorKey.currentContext;
+    if (dialogContext == null || !dialogContext.mounted) return;
+
     setState(() {
       _isDialogShowing = true;
       _countdownNotifier.value = 5;
@@ -118,7 +191,7 @@ class _SessionMonitorState extends State<SessionMonitor> with WidgetsBindingObse
     });
 
     showDialog(
-      context: context,
+      context: dialogContext,
       barrierDismissible: false,
       builder: (context) => _SessionExpiredDialog(
         countdown: _countdownNotifier.value,
@@ -141,9 +214,10 @@ class _SessionMonitorState extends State<SessionMonitor> with WidgetsBindingObse
   void _extendSession() {
     SessionManager.extendSession();
     _autoLogoutTimer?.cancel();
-    if (mounted) {
-      Navigator.of(context).pop();
-      ScaffoldMessenger.of(context).showSnackBar(
+    final navCtx = rootNavigatorKey.currentContext;
+    if (mounted && navCtx != null && navCtx.mounted) {
+      rootNavigatorKey.currentState?.pop();
+      ScaffoldMessenger.of(navCtx).showSnackBar(
         SnackBar(
           content: const Row(
             children: [
@@ -163,15 +237,23 @@ class _SessionMonitorState extends State<SessionMonitor> with WidgetsBindingObse
 
   void _performAutoLogout() async {
     _autoLogoutTimer?.cancel();
-    if (mounted) {
-      Navigator.of(context).pop(); // Close dialog
+    final nav = rootNavigatorKey.currentState;
+    final navCtx = rootNavigatorKey.currentContext;
+    if (mounted && nav != null && navCtx != null && navCtx.mounted) {
+      if (_isDialogShowing) {
+        nav.pop(); // Close session-expired dialog only
+      }
+
+      // ✅ Clear session and biometric lock
       await SessionManager.signOut();
-      if (mounted) {
-        Navigator.of(context).pushAndRemoveUntil(
+      _expectResumeFromBackground = false; // Reset background flag
+
+      if (navCtx.mounted) {
+        nav.pushAndRemoveUntil(
           MaterialPageRoute(builder: (_) => const LoginScreen()),
           (route) => false,
         );
-        ScaffoldMessenger.of(context).showSnackBar(
+        ScaffoldMessenger.of(navCtx).showSnackBar(
           SnackBar(
             content: const Row(
               children: [
@@ -234,19 +316,25 @@ class _SessionExpiredDialog extends StatefulWidget {
 }
 
 class _SessionExpiredDialogState extends State<_SessionExpiredDialog> {
+  late final VoidCallback _countdownListener;
+
   @override
   void initState() {
     super.initState();
-    widget.countdownNotifier.addListener(() {
-      if (mounted) {
-        setState(() {});
-      }
-    });
+    _countdownListener = () {
+      if (mounted) setState(() {});
+    };
+    widget.countdownNotifier.addListener(_countdownListener);
+  }
+
+  @override
+  void dispose() {
+    widget.countdownNotifier.removeListener(_countdownListener);
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    final isDark = Theme.of(context).brightness == Brightness.dark;
     final currentCountdown = widget.countdownNotifier.value;
 
     return PopScope(

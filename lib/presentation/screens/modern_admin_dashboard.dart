@@ -6,6 +6,7 @@ import '../../core/app_db.dart';
 import '../../core/supabase_maps.dart';
 import '../../core/utils/responsive.dart';
 import '../../core/theme/app_theme.dart';
+import '../../services/institute_realtime_sync_service.dart';
 import '../../services/offline_service.dart';
 
 /// Modern Admin Dashboard - Similar to the reference design
@@ -19,11 +20,22 @@ class ModernAdminDashboard extends StatefulWidget {
 
 class _ModernAdminDashboardState extends State<ModernAdminDashboard> {
   String? _instituteId;
+  StreamSubscription<InstituteSyncEvent>? _syncSubscription;
 
   @override
   void initState() {
     super.initState();
     _loadInstituteId();
+  }
+
+  @override
+  void dispose() {
+    _syncSubscription?.cancel();
+    final iid = _instituteId;
+    if (iid != null && iid.isNotEmpty) {
+      InstituteRealtimeSyncService.instance.release(iid);
+    }
+    super.dispose();
   }
 
   Future<void> _loadInstituteId() async {
@@ -33,6 +45,13 @@ class _ModernAdminDashboardState extends State<ModernAdminDashboard> {
     final row = await appDb.from('profiles').select('institute_id').eq('id', user.id).maybeSingle();
     final iid = row?['institute_id'] as String?;
     if (iid != null && iid.isNotEmpty) {
+      await InstituteRealtimeSyncService.instance.retain(iid);
+      _syncSubscription?.cancel();
+      _syncSubscription = InstituteRealtimeSyncService.instance
+          .watch(iid)
+          .listen((_) {
+        if (mounted) setState(() {});
+      });
       setState(() => _instituteId = iid);
     }
   }

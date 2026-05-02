@@ -6,6 +6,7 @@ import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
+import 'session_monitor.dart';
 
 /// Face ID-like scanner widget with live camera preview and scanning animation
 class FaceScannerWidget extends StatefulWidget {
@@ -36,6 +37,7 @@ class _FaceScannerWidgetState extends State<FaceScannerWidget>
     with TickerProviderStateMixin {
   CameraController? _cameraController;
   List<CameraDescription>? _cameras;
+  CameraDescription? _activeCamera;
   bool _isInitialized = false;
   bool _isScanning = false;
   String? _statusMessage;
@@ -45,22 +47,22 @@ class _FaceScannerWidgetState extends State<FaceScannerWidget>
 
   // Multi-angle capture state - 3 angles: front, left, right
   int _currentAngleIndex = 0;
-  List<String> _capturedAngles = [];
-  List<bool> _angleCompleted = [false, false, false]; // 3 angles: front, left, right
-  List<String> _angleInstructions = [
+  final List<String> _capturedAngles = [];
+  final List<bool> _angleCompleted = [false, false, false]; // 3 angles: front, left, right
+  final List<String> _angleInstructions = [
     'Look straight ahead',
-    'Turn your head slightly to the left',
-    'Turn your head slightly to the right',
+    'Turn your head strongly to the left',
+    'Turn your head strongly to the right',
   ];
-  List<Map<String, double>> _angleRequirements = [
-    {'y': 0.0, 'z': 0.0, 'tolerance': 15.0}, // Front - straight ahead
-    {'y': -25.0, 'z': 0.0, 'tolerance': 20.0}, // Left - slight left turn
-    {'y': 25.0, 'z': 0.0, 'tolerance': 20.0}, // Right - slight right turn
+  final List<Map<String, double>> _angleRequirements = [
+    {'y': 0.0, 'z': 0.0, 'tolerance': 12.0}, // Front - straight ahead
+    {'y': -50.0, 'z': 0.0, 'tolerance': 15.0}, // Left - strong left turn
+    {'y': 50.0, 'z': 0.0, 'tolerance': 15.0}, // Right - strong right turn
   ];
   
   // Simple mode: Manual photo capture
-  List<String?> _simpleModePhotos = [null, null, null]; // Front, Left, Right
-  List<String> _simpleModeLabels = ['Front', 'Left', 'Right'];
+  final List<String?> _simpleModePhotos = [null, null, null]; // Front, Left, Right
+  final List<String> _simpleModeLabels = ['Front', 'Left', 'Right'];
 
   late AnimationController _scanAnimationController;
   late Animation<double> _scanAnimation;
@@ -89,6 +91,10 @@ class _FaceScannerWidgetState extends State<FaceScannerWidget>
   Timer? _faceDetectionTimer;
   bool _isProcessingFrame = false; // Prevent overlapping captures
   DateTime? _lastFrameProcessed; // Throttle frame processing
+  static const int _requiredStableFrames = 4;
+  int _noFaceFrameCount = 0;
+  /// Pauses app-resume PIN lock while in-app camera is active.
+  bool _cameraResumeSuppressActive = false;
 
   @override
   void initState() {
@@ -140,11 +146,15 @@ class _FaceScannerWidgetState extends State<FaceScannerWidget>
         (camera) => camera.lensDirection == CameraLensDirection.front,
         orElse: () => _cameras!.first,
       );
+      _activeCamera = frontCamera;
 
       _cameraController = CameraController(
         frontCamera,
-        ResolutionPreset.high,
+        ResolutionPreset.medium,
         enableAudio: false,
+        imageFormatGroup: Platform.isIOS
+            ? ImageFormatGroup.bgra8888
+            : ImageFormatGroup.yuv420,
       );
 
       await _cameraController!.initialize();
@@ -156,19 +166,23 @@ class _FaceScannerWidgetState extends State<FaceScannerWidget>
       
       setState(() {
         _isInitialized = true;
-        _isScanning = true; // Always start scanning for auto-capture
+        _isScanning = !widget.simpleMode;
         if (widget.simpleMode) {
-          _statusMessage = 'Position your face - Auto capturing...';
+          _statusMessage = 'Use the preview and capture Front, Left, and Right manually.';
         } else if (widget.multiAngleMode) {
           _statusMessage = _angleInstructions[0]; // First instruction
         } else {
           _statusMessage = 'Position your face in the frame';
         }
       });
+      SessionMonitor.beginSuppressResumeLock();
+      _cameraResumeSuppressActive = true;
 
-      // Start face detection with small delay to ensure camera is ready
-      await Future.delayed(const Duration(milliseconds: 500));
-      _startFaceDetection();
+      if (!widget.simpleMode) {
+        // Start face detection with small delay to ensure camera is ready
+        await Future.delayed(const Duration(milliseconds: 500));
+        _startFaceDetection();
+      }
     } catch (e) {
       if (kDebugMode) debugPrint('Error initializing camera: $e');
       setState(() {
@@ -255,16 +269,20 @@ class _FaceScannerWidgetState extends State<FaceScannerWidget>
         if (kDebugMode) debugPrint('👤 Faces detected: ${faces.length}');
 
         if (faces.isEmpty) {
-          setState(() {
-            _detectedFace = null;
-            _isFaceValid = false;
-            _statusMessage = 'No face detected. Position your face in the frame.';
-            _scanAttempts = 0; // Reset attempts when no face
-          });
+          _noFaceFrameCount++;
+          if (_noFaceFrameCount >= 3) {
+            setState(() {
+              _detectedFace = null;
+              _isFaceValid = false;
+              _statusMessage = 'No face detected. Position your face in the frame.';
+              _scanAttempts = 0;
+            });
+          }
           _isProcessingFrame = false;
           return;
         }
 
+        _noFaceFrameCount = 0;
         final face = faces.first;
         final qualityCheck = _checkFaceQuality(face);
 
@@ -288,11 +306,11 @@ class _FaceScannerWidgetState extends State<FaceScannerWidget>
             if (!_angleCompleted[_currentAngleIndex]) {
               _scanAttempts++;
               if (kDebugMode) debugPrint('📊 Scan attempts: $_scanAttempts/2 for angle ${_currentAngleIndex + 1}');
-              if (_scanAttempts >= 2) { // Require 2 consecutive valid detections
+              if (_scanAttempts >= _requiredStableFrames) {
                 if (kDebugMode) debugPrint('🎯 Ready to capture angle ${_currentAngleIndex + 1}');
                 // Mark as processing to prevent multiple captures
                 _isProcessingFrame = true;
-                await Future.delayed(const Duration(milliseconds: 600)); // Hold for stability
+                await Future.delayed(const Duration(milliseconds: 750));
                 if (_isScanning && !_angleCompleted[_currentAngleIndex]) {
                   await _captureAngle();
                 }
@@ -303,11 +321,11 @@ class _FaceScannerWidgetState extends State<FaceScannerWidget>
             // Single capture mode
             _scanAttempts++;
             if (kDebugMode) debugPrint('📊 Scan attempts: $_scanAttempts/2');
-            if (_scanAttempts >= 2) { // Require 2 consecutive valid detections
+            if (_scanAttempts >= _requiredStableFrames) {
               if (kDebugMode) debugPrint('🎯 Ready to capture face');
               // Mark as processing to prevent multiple captures
               _isProcessingFrame = true;
-              await Future.delayed(const Duration(milliseconds: 400));
+              await Future.delayed(const Duration(milliseconds: 600));
               if (_isScanning) {
                 await _captureFace();
               }
@@ -347,8 +365,10 @@ class _FaceScannerWidgetState extends State<FaceScannerWidget>
   /// Convert CameraImage to InputImage for ML Kit
   InputImage? _cameraImageToInputImage(CameraImage cameraImage) {
     try {
-      // Get image rotation (0 for front camera)
-      final rotation = InputImageRotation.rotation0deg;
+      final sensorOrientation = _activeCamera?.sensorOrientation ?? 0;
+      final rotation =
+          InputImageRotationValue.fromRawValue(sensorOrientation) ??
+              InputImageRotation.rotation0deg;
       
       // Get image size
       final size = Size(
@@ -450,7 +470,7 @@ class _FaceScannerWidgetState extends State<FaceScannerWidget>
       }
       
       // Fallback: Try single plane format
-      if (cameraImage.planes.length >= 1) {
+      if (cameraImage.planes.isNotEmpty) {
         try {
           final plane = cameraImage.planes[0];
           if (plane.bytes.isEmpty) {
@@ -519,7 +539,8 @@ class _FaceScannerWidgetState extends State<FaceScannerWidget>
 
     // For multi-angle mode, check if current angle matches requirement
     if (widget.multiAngleMode && _currentAngleIndex < _angleRequirements.length) {
-      final angleY = face.headEulerAngleY ?? 0.0;
+      final rawAngleY = face.headEulerAngleY ?? 0.0;
+      final angleY = -rawAngleY;
       final angleZ = face.headEulerAngleZ ?? 0.0;
       final requirement = _angleRequirements[_currentAngleIndex];
       final targetY = requirement['y']!;
@@ -532,13 +553,20 @@ class _FaceScannerWidgetState extends State<FaceScannerWidget>
       // More forgiving: only check the relevant angle (Y for left/right, Z for up/down)
       bool isValid = false;
       String message = _angleInstructions[_currentAngleIndex];
+
+      if (kDebugMode) {
+        debugPrint(
+          '📐 Live angle check index=$_currentAngleIndex rawY=${rawAngleY.toStringAsFixed(1)} '
+          'effectiveY=${angleY.toStringAsFixed(1)} z=${angleZ.toStringAsFixed(1)}',
+        );
+      }
       
       if (_currentAngleIndex == 0) {
         // Center: check both Y and Z are close to 0
         isValid = yDiff <= tolerance && zDiff <= tolerance;
         if (!isValid) {
           if (yDiff > tolerance) {
-            message = angleY < 0 ? 'Turn head more to the right' : 'Turn head more to the left';
+            message = angleY < 0 ? 'Turn head a little to the right' : 'Turn head a little to the left';
           } else if (zDiff > tolerance) {
             message = angleZ < 0 ? 'Tilt head down more' : 'Tilt head up more';
           }
@@ -550,7 +578,7 @@ class _FaceScannerWidgetState extends State<FaceScannerWidget>
           if (angleY > targetY + tolerance) {
             message = 'Turn your head more to the left';
           } else if (angleY < targetY - tolerance) {
-            message = 'Turn your head less (back toward center)';
+            message = 'Turn slightly back toward center';
           } else {
             message = 'Keep head level while turning left';
           }
@@ -562,7 +590,7 @@ class _FaceScannerWidgetState extends State<FaceScannerWidget>
           if (angleY < targetY - tolerance) {
             message = 'Turn your head more to the right';
           } else if (angleY > targetY + tolerance) {
-            message = 'Turn your head less (back toward center)';
+            message = 'Turn slightly back toward center';
           } else {
             message = 'Keep head level while turning right';
           }
@@ -647,7 +675,7 @@ class _FaceScannerWidgetState extends State<FaceScannerWidget>
       }
 
       // Return captured image path
-      if (mounted && widget.onFaceScanned != null) {
+      if (mounted) {
         if (kDebugMode) debugPrint('✅ Returning captured image: ${image.path}');
         widget.onFaceScanned(image.path);
       }
@@ -663,8 +691,7 @@ class _FaceScannerWidgetState extends State<FaceScannerWidget>
   }
 
   // Simple mode: Auto-capture logic
-  int _simpleModeCurrentIndex = 0;
-  Map<int, int> _simpleModeAttempts = {0: 0, 1: 0, 2: 0};
+  final Map<int, int> _simpleModeAttempts = {0: 0, 1: 0, 2: 0};
   
   Future<void> _handleSimpleModeAutoCapture() async {
     // Find next photo that needs to be captured
@@ -686,7 +713,8 @@ class _FaceScannerWidgetState extends State<FaceScannerWidget>
     
     // Check head angle for current photo
     if (_detectedFace != null) {
-      final angleY = _detectedFace!.headEulerAngleY ?? 0.0;
+      final rawAngleY = _detectedFace!.headEulerAngleY ?? 0.0;
+      final angleY = -rawAngleY;
       final angleZ = _detectedFace!.headEulerAngleZ ?? 0.0;
       
       bool angleMatches = false;
@@ -694,9 +722,9 @@ class _FaceScannerWidgetState extends State<FaceScannerWidget>
       
       if (nextIndex == 0) {
         // Front: both angles should be close to 0
-        angleMatches = angleY.abs() < 15 && angleZ.abs() < 15;
+        angleMatches = angleY.abs() < 12 && angleZ.abs() < 12;
         if (!angleMatches) {
-          if (angleY.abs() > 15) {
+          if (angleY.abs() > 12) {
             angleMessage = angleY < 0 ? 'Turn right' : 'Turn left';
           } else {
             angleMessage = angleZ < 0 ? 'Look up' : 'Look down';
@@ -704,11 +732,11 @@ class _FaceScannerWidgetState extends State<FaceScannerWidget>
         }
       } else if (nextIndex == 1) {
         // Left: Y should be negative (left turn)
-        angleMatches = angleY < -15 && angleY > -35 && angleZ.abs() < 15;
+        angleMatches = angleY < -35 && angleY > -65 && angleZ.abs() < 15;
         if (!angleMatches) {
-          if (angleY > -15) {
+          if (angleY > -35) {
             angleMessage = 'Turn more to the left';
-          } else if (angleY < -35) {
+          } else if (angleY < -65) {
             angleMessage = 'Turn less (back to center)';
           } else {
             angleMessage = 'Keep head level';
@@ -716,11 +744,11 @@ class _FaceScannerWidgetState extends State<FaceScannerWidget>
         }
       } else if (nextIndex == 2) {
         // Right: Y should be positive (right turn)
-        angleMatches = angleY > 15 && angleY < 35 && angleZ.abs() < 15;
+        angleMatches = angleY > 35 && angleY < 65 && angleZ.abs() < 15;
         if (!angleMatches) {
-          if (angleY < 15) {
+          if (angleY < 35) {
             angleMessage = 'Turn more to the right';
-          } else if (angleY > 35) {
+          } else if (angleY > 65) {
             angleMessage = 'Turn less (back to center)';
           } else {
             angleMessage = 'Keep head level';
@@ -731,11 +759,11 @@ class _FaceScannerWidgetState extends State<FaceScannerWidget>
       if (angleMatches) {
         _simpleModeAttempts[nextIndex] = (_simpleModeAttempts[nextIndex] ?? 0) + 1;
         
-        if (_simpleModeAttempts[nextIndex]! >= 2) {
+        if (_simpleModeAttempts[nextIndex]! >= _requiredStableFrames) {
           // Ready to capture - prevent multiple captures
           if (!_isProcessingFrame && _simpleModePhotos[nextIndex] == null) {
             _isProcessingFrame = true;
-            await Future.delayed(const Duration(milliseconds: 400)); // Hold for stability
+            await Future.delayed(const Duration(milliseconds: 600));
             if (_isScanning && _simpleModePhotos[nextIndex] == null) {
               await _autoCaptureSimplePhoto(nextIndex);
             }
@@ -847,7 +875,7 @@ class _FaceScannerWidgetState extends State<FaceScannerWidget>
     if (mounted) {
       if (widget.onMultiAngleScanned != null) {
         widget.onMultiAngleScanned!(capturedPaths);
-      } else if (widget.onFaceScanned != null) {
+      } else {
         // Fallback to single callback with first image
         widget.onFaceScanned(capturedPaths.first);
       }
@@ -929,7 +957,7 @@ class _FaceScannerWidgetState extends State<FaceScannerWidget>
           }
           if (widget.onMultiAngleScanned != null) {
             widget.onMultiAngleScanned!(_capturedAngles);
-          } else if (widget.onFaceScanned != null) {
+          } else {
             // Fallback to single callback with first image
             widget.onFaceScanned(_capturedAngles.first);
           }
@@ -948,6 +976,12 @@ class _FaceScannerWidgetState extends State<FaceScannerWidget>
 
   @override
   void dispose() {
+    if (_cameraResumeSuppressActive) {
+      _cameraResumeSuppressActive = false;
+      Future<void>.delayed(const Duration(milliseconds: 300), () {
+        SessionMonitor.endSuppressResumeLock();
+      });
+    }
     _faceDetectionTimer?.cancel();
     _scanAnimationController.dispose();
     _pulseController.dispose();
@@ -999,13 +1033,54 @@ class _FaceScannerWidgetState extends State<FaceScannerWidget>
           children: [
             // Camera preview
             Expanded(
-              child: CameraPreview(_cameraController!),
+              child: Stack(
+                children: [
+                  Positioned.fill(
+                    child: CameraPreview(_cameraController!),
+                  ),
+                  Positioned(
+                    left: 16,
+                    right: 16,
+                    bottom: 16,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                      decoration: BoxDecoration(
+                        color: Colors.black.withValues(alpha: 0.68),
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Text(
+                            'Manual Guided Capture',
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontSize: 16,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                          const SizedBox(height: 6),
+                          Text(
+                            _statusMessage ??
+                                'Front: look straight. Left/Right: turn strongly, but keep one eye and nose slightly visible.',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                              color: Colors.white.withValues(alpha: 0.86),
+                              fontSize: 12,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+              ),
             ),
             
             // Captured photos thumbnails
             Container(
               height: 100,
-              color: Colors.black.withOpacity(0.8),
+              color: Colors.black.withValues(alpha: 0.8),
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.spaceEvenly,
@@ -1024,7 +1099,7 @@ class _FaceScannerWidgetState extends State<FaceScannerWidget>
                           height: 70,
                           decoration: BoxDecoration(
                             border: Border.all(
-                              color: photoPath != null ? Colors.green : Colors.white.withOpacity(0.3),
+                              color: photoPath != null ? Colors.green : Colors.white.withValues(alpha: 0.3),
                               width: 2,
                             ),
                             borderRadius: BorderRadius.circular(8),
@@ -1039,7 +1114,7 @@ class _FaceScannerWidgetState extends State<FaceScannerWidget>
                                 )
                               : Icon(
                                   Icons.camera_alt,
-                                  color: Colors.white.withOpacity(0.5),
+                                  color: Colors.white.withValues(alpha: 0.5),
                                   size: 30,
                                 ),
                         ),
@@ -1048,7 +1123,7 @@ class _FaceScannerWidgetState extends State<FaceScannerWidget>
                       Text(
                         label,
                         style: TextStyle(
-                          color: photoPath != null ? Colors.green : Colors.white.withOpacity(0.7),
+                          color: photoPath != null ? Colors.green : Colors.white.withValues(alpha: 0.7),
                           fontSize: 12,
                           fontWeight: photoPath != null ? FontWeight.bold : FontWeight.normal,
                         ),
@@ -1124,7 +1199,7 @@ class _FaceScannerWidgetState extends State<FaceScannerWidget>
                     padding: const EdgeInsets.symmetric(vertical: 16),
                   ),
                   child: const Text(
-                    'Done - Send to Backend',
+                    'Done',
                     style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
                   ),
                 ),
@@ -1183,7 +1258,7 @@ class _FaceScannerWidgetState extends State<FaceScannerWidget>
                 constraints: const BoxConstraints(maxWidth: 400),
                 padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
                 decoration: BoxDecoration(
-                  color: Colors.black.withOpacity(0.7),
+                  color: Colors.black.withValues(alpha: 0.7),
                   borderRadius: BorderRadius.circular(20),
                 ),
                 child: Column(
@@ -1218,7 +1293,7 @@ class _FaceScannerWidgetState extends State<FaceScannerWidget>
                       Text(
                         widget.subtitle!,
                         style: TextStyle(
-                          color: Colors.white.withOpacity(0.7),
+                          color: Colors.white.withValues(alpha: 0.7),
                           fontSize: 12,
                         ),
                         textAlign: TextAlign.center,
@@ -1243,7 +1318,7 @@ class _FaceScannerWidgetState extends State<FaceScannerWidget>
                   constraints: const BoxConstraints(maxWidth: 300),
                   padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
                   decoration: BoxDecoration(
-                    color: Colors.black.withOpacity(0.6),
+                    color: Colors.black.withValues(alpha: 0.6),
                     borderRadius: BorderRadius.circular(30),
                   ),
                   child: Row(
@@ -1263,7 +1338,7 @@ class _FaceScannerWidgetState extends State<FaceScannerWidget>
                               ? Colors.green
                               : isCurrent
                                   ? Colors.blue
-                                  : Colors.white.withOpacity(0.3),
+                                  : Colors.white.withValues(alpha: 0.3),
                           border: isCurrent
                               ? Border.all(color: Colors.blue, width: 2)
                               : null,
@@ -1322,13 +1397,6 @@ class FaceScannerOverlayPainter extends CustomPainter {
       ..style = PaintingStyle.stroke
       ..strokeWidth = 3.0;
 
-    // Draw semi-transparent overlay
-    final overlayPaint = Paint()
-      ..color = Colors.black.withOpacity(0.5)
-      ..style = PaintingStyle.fill;
-
-    canvas.drawRect(Rect.fromLTWH(0, 0, size.width, size.height), overlayPaint);
-
     // Calculate circular face frame position (center of screen)
     final centerX = size.width / 2;
     final centerY = size.height / 2;
@@ -1337,36 +1405,73 @@ class FaceScannerOverlayPainter extends CustomPainter {
     final radius = maxRadius.clamp(150.0, 300.0); // Min 150, max 300 for larger circle
     final center = Offset(centerX, centerY);
 
+    // Professional dimmed overlay with transparent cutout
+    final fullScreen = Path()..addRect(Rect.fromLTWH(0, 0, size.width, size.height));
+    final cutout = Path()..addOval(Rect.fromCircle(center: center, radius: radius + 2));
+    final overlayPath = Path.combine(PathOperation.difference, fullScreen, cutout);
+    final overlayPaint = Paint()
+      ..color = Colors.black.withValues(alpha: 0.55)
+      ..style = PaintingStyle.fill;
+    canvas.drawPath(overlayPath, overlayPaint);
+
+    // Soft outer glow ring
+    final glowPaint = Paint()
+      ..color = (isValid ? Colors.greenAccent : Colors.white).withValues(alpha: 0.18)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 12
+      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 12);
+    canvas.drawCircle(center, radius, glowPaint);
+
     // Draw outer circle border
-    paint.color = isValid ? Colors.green : Colors.white;
+    paint.color = (isValid ? Colors.greenAccent : Colors.white).withValues(alpha: 0.95);
     paint.strokeWidth = 3.0;
     canvas.drawCircle(center, radius, paint);
 
+    // Inner thin ring for premium layered look
+    final innerRingPaint = Paint()
+      ..color = Colors.white.withValues(alpha: isValid ? 0.22 : 0.14)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.5;
+    canvas.drawCircle(center, radius - 10, innerRingPaint);
+
     // Draw scanning arc animation (rotating around the circle like Face ID)
-    if (isValid) {
-      final scanPaint = Paint()
-        ..color = Colors.green.withOpacity(0.6)
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 4.0
-        ..strokeCap = StrokeCap.round;
-      
-      // Animated scanning arc that rotates around the circle
-      final startAngle = scanAnimation * 2 * math.pi; // Full rotation (2π)
-      final sweepAngle = math.pi / 2; // 90 degrees arc (π/2)
-      
-      canvas.drawArc(
-        Rect.fromCircle(center: center, radius: radius),
-        startAngle,
-        sweepAngle,
-        false,
-        scanPaint,
-      );
-    }
+    final scanPaint = Paint()
+      ..shader = SweepGradient(
+        startAngle: 0,
+        endAngle: 2 * math.pi,
+        colors: isValid
+            ? [
+                Colors.greenAccent.withValues(alpha: 0.0),
+                Colors.greenAccent.withValues(alpha: 0.18),
+                Colors.greenAccent.withValues(alpha: 0.95),
+                Colors.greenAccent.withValues(alpha: 0.18),
+                Colors.greenAccent.withValues(alpha: 0.0),
+              ]
+            : [
+                Colors.white.withValues(alpha: 0.0),
+                Colors.white.withValues(alpha: 0.12),
+                Colors.white.withValues(alpha: 0.7),
+                Colors.white.withValues(alpha: 0.12),
+                Colors.white.withValues(alpha: 0.0),
+              ],
+        stops: const [0.0, 0.25, 0.5, 0.75, 1.0],
+        transform: GradientRotation(scanAnimation * 2 * math.pi),
+      ).createShader(Rect.fromCircle(center: center, radius: radius))
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 5.0
+      ..strokeCap = StrokeCap.round;
+    canvas.drawArc(
+      Rect.fromCircle(center: center, radius: radius),
+      0,
+      2 * math.pi,
+      false,
+      scanPaint,
+    );
 
     // Draw pulse animation (expanding circle)
     if (isValid) {
       final pulsePaint = Paint()
-        ..color = Colors.green.withOpacity(0.3 * (1 - pulseAnimation))
+        ..color = Colors.greenAccent.withValues(alpha: 0.28 * (1 - pulseAnimation))
         ..style = PaintingStyle.stroke
         ..strokeWidth = 2.0;
       
@@ -1375,8 +1480,8 @@ class FaceScannerOverlayPainter extends CustomPainter {
     }
 
     // Draw guide dots around the circle (like Face ID)
-    final dotCount = 12;
-    final dotRadius = 4.0;
+    final dotCount = 16;
+    final dotRadius = 2.8;
     final dotPaint = Paint()
       ..style = PaintingStyle.fill;
     
@@ -1385,11 +1490,12 @@ class FaceScannerOverlayPainter extends CustomPainter {
       final dotX = centerX + (radius + 20) * math.cos(angle);
       final dotY = centerY + (radius + 20) * math.sin(angle);
       
-      // Highlight dots based on scan animation
-      final dotOpacity = ((scanAnimation * dotCount + i) % dotCount) < 3 ? 1.0 : 0.5;
+      // Smooth highlight wave based on scan animation
+      final wave = ((scanAnimation * dotCount - i).abs() % dotCount);
+      final dotOpacity = wave < 2 ? 0.95 : (wave < 4 ? 0.65 : 0.28);
       dotPaint.color = isValid 
-          ? Colors.green.withOpacity(dotOpacity)
-          : Colors.white.withOpacity(0.5 * dotOpacity);
+          ? Colors.greenAccent.withValues(alpha: dotOpacity)
+          : Colors.white.withValues(alpha: 0.55 * dotOpacity);
       
       canvas.drawCircle(Offset(dotX, dotY), dotRadius, dotPaint);
     }
@@ -1401,7 +1507,9 @@ class FaceScannerOverlayPainter extends CustomPainter {
       final scaleY = size.height / 480;
 
       final facePaint = Paint()
-        ..color = isValid ? Colors.green.withOpacity(0.3) : Colors.orange.withOpacity(0.3)
+        ..color = isValid
+            ? Colors.greenAccent.withValues(alpha: 0.24)
+            : Colors.orangeAccent.withValues(alpha: 0.26)
         ..style = PaintingStyle.stroke
         ..strokeWidth = 2.0;
 

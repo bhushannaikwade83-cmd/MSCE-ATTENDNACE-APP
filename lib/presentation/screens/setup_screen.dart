@@ -2,7 +2,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_screenutil/flutter_screenutil.dart';
 import '../../core/app_db.dart';
 import '../../core/utils/responsive.dart';
+import '../../core/utils/responsive_page.dart';
 import '../../services/auth_service.dart';
+import '../../services/validation_service.dart';
 import '../../core/theme/app_theme.dart';
 import 'login_screen.dart';
 
@@ -124,8 +126,7 @@ class _SetupScreenState extends State<SetupScreen> {
       return Scaffold(
         backgroundColor: AppTheme.backgroundLight,
         body: SafeArea(
-          child: Center(
-            child: SingleChildScrollView(
+          child: ResponsiveScrollBody(
               physics: const BouncingScrollPhysics(),
               padding: const EdgeInsets.all(20),
               child: Column(
@@ -171,7 +172,6 @@ class _SetupScreenState extends State<SetupScreen> {
                   const SizedBox(height: 40),
                 ],
               ),
-            ),
           ),
         ),
       );
@@ -185,7 +185,7 @@ class _SetupScreenState extends State<SetupScreen> {
         backgroundColor: Colors.transparent,
         elevation: 0,
       ),
-      body: SingleChildScrollView(
+      body: ResponsiveScrollBody(
         padding: const EdgeInsets.all(24),
         child: Form(
           key: _formKey,
@@ -224,7 +224,7 @@ class _SetupScreenState extends State<SetupScreen> {
               ),
               const SizedBox(height: 6),
               Text(
-                'By Digitrix Media',
+                'By MSCE - Maharashtra State Council of Education',
                 style: Theme.of(context).textTheme.titleMedium?.copyWith(
                   color: AppTheme.textGray,
                   fontWeight: FontWeight.w500,
@@ -315,12 +315,12 @@ class _SetupScreenState extends State<SetupScreen> {
                 decoration: const InputDecoration(
                   labelText: 'Password',
                   prefixIcon: Icon(Icons.lock_outlined),
-                  helperText: 'Minimum 6 characters',
+                  helperText:
+                      '8+ characters: upper & lower case, number, symbol (!@#\$%^&*)',
                 ),
                 validator: (v) {
-                  if (v!.isEmpty) return 'Required';
-                  if (v.length < 6) return 'Password too short';
-                  return null;
+                  if (v == null || v.isEmpty) return 'Required';
+                  return ValidationService.validatePassword(v, isRegistration: true);
                 },
               ),
               const SizedBox(height: 40),
@@ -363,4 +363,3 @@ class _SetupScreenState extends State<SetupScreen> {
     super.dispose();
   }
 }
-

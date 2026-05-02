@@ -10,6 +10,13 @@ import '../../core/theme/app_theme.dart';
 import '../../services/storage_service.dart';
 import '../widgets/secure_network_image.dart';
 
+class _StudentPhotosSnapshot {
+  final Map<String, dynamic>? student;
+  final List<Map<String, dynamic>> rows;
+
+  _StudentPhotosSnapshot({required this.student, required this.rows});
+}
+
 class StudentPhotosScreen extends StatefulWidget {
   final String studentName;
   final String rollNumber;
@@ -33,16 +40,16 @@ class _StudentPhotosScreenState extends State<StudentPhotosScreen> {
     final add = row['additional'] is Map
         ? Map<String, dynamic>.from((row['additional'] as Map).cast<String, dynamic>())
         : <String, dynamic>{};
-    final batchName = add['batchName'] as String? ?? stud['batch_name'] as String? ?? 'Unknown Batch';
     final subject =
-        add['subject'] as String? ?? stud['subject'] as String? ?? row['semester_code'] as String? ?? 'Unknown Subject';
+        add['subject'] as String? ?? stud['subject'] as String? ?? 'Unknown Subject';
     final date = row['attendance_date']?.toString() ?? '';
     final type = row['type'] as String? ?? 'entry';
     final photoUrl = (row['photo_url'] as String?) ?? '';
     final photoPath = row['photo_path'] as String?;
+    final entryFromAdd = add['entryTime'];
+    final exitFromAdd = add['exitTime'];
     return {
       ...row,
-      'batchName': batchName,
       'subject': subject,
       'date': date,
       'photoUrl': photoUrl,
@@ -51,25 +58,34 @@ class _StudentPhotosScreenState extends State<StudentPhotosScreen> {
       'exitPhoto': type == 'exit' ? photoUrl : '',
       'entryPhotoPath': type == 'entry' ? photoPath : null,
       'exitPhotoPath': type == 'exit' ? photoPath : null,
-      'timestamp': row['created_at'],
-      'entryTime': type == 'entry' ? row['created_at'] : null,
-      'exitTime': type == 'exit' ? row['created_at'] : null,
+      'timestamp': entryFromAdd ?? exitFromAdd ?? row['created_at'],
+      'entryTime': entryFromAdd ?? (type == 'entry' ? row['created_at'] : null),
+      'exitTime': exitFromAdd ?? (type == 'exit' ? row['created_at'] : null),
     };
   }
 
-  Future<List<Map<String, dynamic>>> _fetchRows() async {
+  bool _rollMatchesStudent(Map<String, dynamic> m, String roll) {
+    final r = roll.trim();
+    final uid = m['user_id']?.toString().trim() ?? '';
+    final sr = m['sr_no']?.toString().trim() ?? '';
+    return uid == r || sr == r;
+  }
+
+  Future<_StudentPhotosSnapshot> _fetchSnapshot() async {
     try {
       final code = await instituteCodeForId(widget.instituteId);
       final list = await appDb.from('students').select().eq('institute_id', widget.instituteId);
       Map<String, dynamic>? stud;
       for (final s in list) {
         final m = s as Map<String, dynamic>;
-        if (m['sr_no'] == widget.rollNumber || m['user_id'] == widget.rollNumber) {
+        if (_rollMatchesStudent(m, widget.rollNumber)) {
           stud = m;
           break;
         }
       }
-      if (stud == null) return [];
+      if (stud == null) {
+        return _StudentPhotosSnapshot(student: null, rows: []);
+      }
       final studMap = Map<String, dynamic>.from(stud);
       final sid = studMap['id'] as String;
       final rows = await appDb
@@ -78,22 +94,77 @@ class _StudentPhotosScreenState extends State<StudentPhotosScreen> {
           .eq('institute_code', code)
           .eq('student_id', sid)
           .order('created_at', ascending: false);
-      return rows.map((r) => _normalizeRow(Map<String, dynamic>.from(r as Map), studMap)).toList();
+      final mapped =
+          rows.map((r) => _normalizeRow(Map<String, dynamic>.from(r as Map), studMap)).toList();
+      return _StudentPhotosSnapshot(student: studMap, rows: mapped);
     } catch (e) {
       if (kDebugMode) debugPrint('StudentPhotos: $e');
-      return [];
+      return _StudentPhotosSnapshot(student: null, rows: []);
     }
   }
 
-  Stream<List<Map<String, dynamic>>> _rowsStream() async* {
-    yield await _fetchRows();
+  Stream<_StudentPhotosSnapshot> _snapshotStream() async* {
+    yield await _fetchSnapshot();
     await for (final _ in Stream.periodic(const Duration(seconds: 4))) {
-      yield await _fetchRows();
+      yield await _fetchSnapshot();
     }
   }
+
+  String? _registrationPhotoUrl(Map<String, dynamic>? stud) {
+    if (stud == null) return null;
+    final f = stud['face_photo_url']?.toString().trim() ?? '';
+    return f.isNotEmpty ? f : null;
+  }
+
+  bool _hasRegistrationPhoto(Map<String, dynamic>? stud) {
+    final u = _registrationPhotoUrl(stud);
+    return (u != null && u.isNotEmpty);
+  }
+
+  Widget _buildRegistrationCard(String? imageUrl, String? storagePath, bool isDark) {
+    final hasUrl = imageUrl != null && imageUrl.isNotEmpty;
+    final hasPath = storagePath != null && storagePath.isNotEmpty;
+    if (!hasUrl && !hasPath) return const SizedBox.shrink();
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'Registration photo',
+            style: TextStyle(
+              fontSize: 16,
+              fontWeight: FontWeight.bold,
+              color: isDark ? Colors.white : AppTheme.textDark,
+            ),
+          ),
+          const SizedBox(height: 8),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(12),
+            child: AspectRatio(
+              aspectRatio: 4 / 3,
+              child: SecureNetworkImage(
+                imageUrl: hasUrl ? imageUrl : null,
+                storagePath: hasPath ? storagePath : null,
+                fit: BoxFit.cover,
+                placeholder: Container(
+                  color: isDark ? Colors.white12 : Colors.grey.shade200,
+                  child: const Center(child: CircularProgressIndicator()),
+                ),
+                errorWidget: Container(
+                  color: isDark ? Colors.white12 : Colors.grey.shade200,
+                  child: const Icon(Icons.broken_image_outlined, size: 48),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
   
-  // Folder navigation state
-  String? _currentBatch;
+  // Folder navigation: Subject → Date → Entry/Exit
   String? _currentSubject;
   String? _currentDate;
   String? _currentPhotoType; // 'entry' or 'exit'
@@ -123,10 +194,6 @@ class _StudentPhotosScreenState extends State<StudentPhotosScreen> {
         } else if (_currentSubject != null) {
           setState(() {
             _currentSubject = null;
-          });
-        } else if (_currentBatch != null) {
-          setState(() {
-            _currentBatch = null;
           });
         } else {
           // At root level - go back to previous screen (student management)
@@ -171,10 +238,6 @@ class _StudentPhotosScreenState extends State<StudentPhotosScreen> {
               } else if (_currentSubject != null) {
                 setState(() {
                   _currentSubject = null;
-                });
-              } else if (_currentBatch != null) {
-                setState(() {
-                  _currentBatch = null;
                 });
               } else {
                 // At root level - go back to previous screen (student management)
@@ -250,8 +313,8 @@ class _StudentPhotosScreenState extends State<StudentPhotosScreen> {
   }
 
   Widget _buildPhotosGrid() {
-    return StreamBuilder<List<Map<String, dynamic>>>(
-      stream: _rowsStream(),
+    return StreamBuilder<_StudentPhotosSnapshot>(
+      stream: _snapshotStream(),
       builder: (context, snapshot) {
         final isDark = Theme.of(context).brightness == Brightness.dark;
         if (snapshot.connectionState == ConnectionState.waiting) {
@@ -271,7 +334,11 @@ class _StudentPhotosScreenState extends State<StudentPhotosScreen> {
           );
         }
 
-        if (!snapshot.hasData || snapshot.data!.isEmpty) {
+        final snap = snapshot.data ?? _StudentPhotosSnapshot(student: null, rows: []);
+        final regUrl = _registrationPhotoUrl(snap.student);
+        final hasReg = _hasRegistrationPhoto(snap.student);
+
+        if (snap.student == null && snap.rows.isEmpty) {
           return Center(
             child: Column(
               mainAxisAlignment: MainAxisAlignment.center,
@@ -291,7 +358,7 @@ class _StudentPhotosScreenState extends State<StudentPhotosScreen> {
                 ),
                 const SizedBox(height: 8),
                 Text(
-                  'Attendance photos will appear here',
+                  'Student or attendance data not found',
                   style: TextStyle(
                     color: isDark ? Colors.white60 : AppTheme.textGray,
                     fontSize: 14,
@@ -302,12 +369,35 @@ class _StudentPhotosScreenState extends State<StudentPhotosScreen> {
           );
         }
 
-        // Filter rows that have a photo URL
-        final filteredDocs = snapshot.data!.where((data) {
-          return (data['photoUrl'] as String? ?? '').isNotEmpty;
+        // Keep rows that have a displayable photo (URL and/or B2 path).
+        final filteredDocs = snap.rows.where((data) {
+          final u = (data['photoUrl'] as String? ?? '').trim();
+          final p = (data['photo_path'] as String? ?? '').trim();
+          return u.isNotEmpty || p.isNotEmpty;
         }).toList();
 
         if (filteredDocs.isEmpty) {
+          if (hasReg) {
+            return SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  _buildRegistrationCard(regUrl, null, isDark),
+                  Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: Text(
+                      'No entry/exit attendance photos yet. They appear here after attendance is marked.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: isDark ? Colors.white70 : AppTheme.textGray,
+                        fontSize: 14,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            );
+          }
           return Center(
             child: Text(
               'No photos found',
@@ -319,81 +409,57 @@ class _StudentPhotosScreenState extends State<StudentPhotosScreen> {
           );
         }
 
-        // Organize photos by Batch -> Subject -> Date -> Entry/Exit
-        final Map<String, Map<String, Map<String, Map<String, List<Map<String, dynamic>>>>>> organizedData = {};
+        // Organize photos by Subject -> Date -> Entry/Exit
+        final Map<String, Map<String, Map<String, List<Map<String, dynamic>>>>> organizedData = {};
 
         for (final data in filteredDocs) {
-          final batchName = data['batchName'] as String? ?? 'Unknown Batch';
           final subject = data['subject'] as String? ?? 'Unknown Subject';
           final date = data['date'] as String? ?? 'Unknown Date';
           final typ = data['type'] as String? ?? 'entry';
 
-          if (!organizedData.containsKey(batchName)) {
-            organizedData[batchName] = {};
-          }
-          if (!organizedData[batchName]!.containsKey(subject)) {
-            organizedData[batchName]![subject] = {};
-          }
-          if (!organizedData[batchName]![subject]!.containsKey(date)) {
-            organizedData[batchName]![subject]![date] = {'entry': [], 'exit': []};
-          }
+          organizedData.putIfAbsent(subject, () => {});
+          organizedData[subject]!.putIfAbsent(date, () => {'entry': [], 'exit': []});
 
           if (typ == 'entry') {
-            organizedData[batchName]![subject]![date]!['entry']!.add(data);
+            organizedData[subject]![date]!['entry']!.add(data);
           } else if (typ == 'exit') {
-            organizedData[batchName]![subject]![date]!['exit']!.add(data);
+            organizedData[subject]![date]!['exit']!.add(data);
           }
         }
 
-        // Sort batches, subjects, and dates
-        final sortedBatches = organizedData.keys.toList()..sort();
-        
-        // Show folders based on current navigation level
-        if (_currentBatch == null) {
-          // Show batch folders
-          return _buildFolderList(
-            folders: sortedBatches.map((batch) => {
-              'name': batch,
-              'type': 'batch',
-              'count': organizedData[batch]!.keys.length,
-              'data': organizedData[batch],
+        final sortedSubjects = organizedData.keys.toList()..sort();
+
+        if (_currentSubject == null) {
+          final folder = _buildFolderList(
+            folders: sortedSubjects.map((subject) {
+              return {
+                'name': subject,
+                'type': 'subject',
+                'count': organizedData[subject]!.keys.length,
+                'data': organizedData[subject],
+              };
             }).toList(),
             onTap: (folder) {
               setState(() {
-                _currentBatch = folder['name'] as String;
-                _currentSubject = null;
+                _currentSubject = folder['name'] as String;
                 _currentDate = null;
               });
             },
           );
-        } else if (_currentSubject == null) {
-          // Show subject folders for current batch
-          final subjects = organizedData[_currentBatch!]!;
-          final sortedSubjects = subjects.keys.toList()..sort();
-          return Column(
-            children: [
-              _buildBreadcrumb(),
-              Expanded(
-                child: _buildFolderList(
-                  folders: sortedSubjects.map((subject) => {
-                    'name': subject,
-                    'type': 'subject',
-                    'count': subjects[subject]!.keys.length,
-                    'data': subjects[subject],
-                  }).toList(),
-                  onTap: (folder) {
-                    setState(() {
-                      _currentSubject = folder['name'] as String;
-                      _currentDate = null;
-                    });
-                  },
-                ),
-              ),
-            ],
-          );
-        } else if (_currentDate == null) {
-          // Show date folders for current batch and subject
-          final dates = organizedData[_currentBatch!]![_currentSubject!]!;
+          if (hasReg) {
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                _buildRegistrationCard(regUrl, null, isDark),
+                Expanded(child: folder),
+              ],
+            );
+          }
+          return folder;
+        }
+
+        if (_currentDate == null) {
+          final dates = organizedData[_currentSubject!]!;
           final sortedDates = dates.keys.toList()..sort((a, b) => b.compareTo(a));
           return Column(
             children: [
@@ -430,12 +496,13 @@ class _StudentPhotosScreenState extends State<StudentPhotosScreen> {
               ),
             ],
           );
-        } else if (_currentPhotoType == null) {
-          // Show Entry/Exit folders for current date
-          final photoTypes = organizedData[_currentBatch!]![_currentSubject!]![_currentDate!]!;
+        }
+
+        if (_currentPhotoType == null) {
+          final photoTypes = organizedData[_currentSubject!]![_currentDate!]!;
           final entryCount = photoTypes['entry']!.length;
           final exitCount = photoTypes['exit']!.length;
-          
+
           return Column(
             children: [
               _buildBreadcrumb(),
@@ -470,18 +537,18 @@ class _StudentPhotosScreenState extends State<StudentPhotosScreen> {
               ),
             ],
           );
-        } else {
-          // Show photos for current batch, subject, date, and photo type (entry/exit)
-          final photos = organizedData[_currentBatch!]![_currentSubject!]![_currentDate!]![_currentPhotoType!]!;
-          return Column(
-            children: [
-              _buildBreadcrumb(),
-              Expanded(
-                child: _buildPhotosGridForDate(photos, photoType: _currentPhotoType!),
-              ),
-            ],
-          );
         }
+
+        final photos =
+            organizedData[_currentSubject!]![_currentDate!]![_currentPhotoType!]!;
+        return Column(
+          children: [
+            _buildBreadcrumb(),
+            Expanded(
+              child: _buildPhotosGridForDate(photos, photoType: _currentPhotoType!),
+            ),
+          ],
+        );
       },
     );
   }
@@ -498,7 +565,7 @@ class _StudentPhotosScreenState extends State<StudentPhotosScreen> {
       ),
       child: Row(
         children: [
-          if (_currentBatch != null || _currentSubject != null || _currentDate != null)
+          if (_currentSubject != null || _currentDate != null)
             IconButton(
               icon: Icon(Icons.arrow_back, color: isDark ? Colors.white : AppTheme.textDark),
               onPressed: () {
@@ -509,8 +576,6 @@ class _StudentPhotosScreenState extends State<StudentPhotosScreen> {
                     _currentDate = null;
                   } else if (_currentSubject != null) {
                     _currentSubject = null;
-                  } else if (_currentBatch != null) {
-                    _currentBatch = null;
                   }
                 });
               },
@@ -520,11 +585,7 @@ class _StudentPhotosScreenState extends State<StudentPhotosScreen> {
               scrollDirection: Axis.horizontal,
               child: Row(
                 children: [
-                  _buildBreadcrumbItem('Batches', _currentBatch == null),
-                  if (_currentBatch != null) ...[
-                    Icon(Icons.chevron_right, color: isDark ? Colors.white70 : AppTheme.textGray, size: 16),
-                    _buildBreadcrumbItem(_currentBatch!, _currentSubject == null),
-                  ],
+                  _buildBreadcrumbItem('Subjects', _currentSubject == null),
                   if (_currentSubject != null) ...[
                     Icon(Icons.chevron_right, color: isDark ? Colors.white70 : AppTheme.textGray, size: 16),
                     _buildBreadcrumbItem(_currentSubject!, _currentDate == null),
@@ -606,7 +667,6 @@ class _StudentPhotosScreenState extends State<StudentPhotosScreen> {
           );
         } else if (type == 'entry' || type == 'exit') {
           final icon = folder['icon'] as IconData? ?? Icons.photo;
-          final countLabel = '$count ${count == 1 ? 'Photo' : 'Photos'}';
           final color = folder['color'] as Color? ?? AppTheme.primaryBlue;
           
           return _buildPhotoTypeFolderCard(
@@ -618,17 +678,9 @@ class _StudentPhotosScreenState extends State<StudentPhotosScreen> {
           );
         }
         
-        // Default for batch and subject
-        IconData icon;
-        String countLabel;
-        
-        if (type == 'batch') {
-          icon = Icons.folder;
-          countLabel = '$count ${count == 1 ? 'Subject' : 'Subjects'}';
-        } else {
-          icon = Icons.book;
-          countLabel = '$count ${count == 1 ? 'Date' : 'Dates'}';
-        }
+        // Subject-level folder (root)
+        IconData icon = Icons.book;
+        String countLabel = '$count ${count == 1 ? 'Date' : 'Dates'}';
         
         return _buildFolderCard(
           name: name,
@@ -955,14 +1007,12 @@ class _StudentPhotosScreenState extends State<StudentPhotosScreen> {
             final photoUrl = item['photoUrl'] as String;
             final subject = data['subject'] as String? ?? 'Unknown';
             final dateStr = data['date'] as String? ?? '';
-            final batchName = data['batchName'] as String? ?? '';
             final photoSizeBytes = data['photoSizeBytes'] as int?;
-            
-            // Determine timestamp and storage path based on photo type
+
             DateTime? timestamp;
             String? storagePath;
             String photoTypeLabel;
-            
+
             if (photoType == 'entry') {
               timestamp = parseAnyTimestamp(data['entryTime'] ?? data['timestamp']);
               storagePath = data['entryPhotoPath'] as String? ?? data['photo_path'] as String?;
@@ -981,7 +1031,6 @@ class _StudentPhotosScreenState extends State<StudentPhotosScreen> {
               photoUrl: photoUrl,
               subject: subject,
               date: dateStr,
-              batchName: batchName,
               timestamp: timestamp,
               photoSizeBytes: photoSizeBytes,
               storagePath: storagePath,
@@ -997,14 +1046,13 @@ class _StudentPhotosScreenState extends State<StudentPhotosScreen> {
     required String photoUrl,
     required String subject,
     required String date,
-    required String batchName,
     DateTime? timestamp,
     int? photoSizeBytes,
     String? storagePath,
     String photoType = 'Photo',
   }) {
     return GestureDetector(
-      onTap: () => _showPhotoDetail(photoUrl, subject, date, batchName, timestamp, photoSizeBytes, storagePath, photoType),
+      onTap: () => _showPhotoDetail(photoUrl, subject, date, timestamp, photoSizeBytes, storagePath, photoType),
       child: Container(
         decoration: BoxDecoration(
           color: Colors.white.withValues(alpha: 0.15),
@@ -1156,7 +1204,7 @@ class _StudentPhotosScreenState extends State<StudentPhotosScreen> {
                             ),
                             const SizedBox(width: 4),
                             Text(
-                              DateFormat('hh:mm a').format(timestamp),
+                              DateFormat('HH:mm').format(timestamp.toLocal()),
                               style: TextStyle(
                                 color: Colors.white.withValues(alpha: 0.9),
                                 fontSize: 11,
@@ -1164,18 +1212,6 @@ class _StudentPhotosScreenState extends State<StudentPhotosScreen> {
                               ),
                             ),
                           ],
-                        ),
-                      ],
-                      if (batchName.isNotEmpty) ...[
-                        const SizedBox(height: 2),
-                        Text(
-                          batchName,
-                          style: TextStyle(
-                            color: Colors.white.withValues(alpha: 0.8),
-                            fontSize: 11,
-                          ),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
                         ),
                       ],
                       if (photoSizeBytes != null) ...[
@@ -1213,7 +1249,6 @@ class _StudentPhotosScreenState extends State<StudentPhotosScreen> {
     String photoUrl,
     String subject,
     String date,
-    String batchName,
     DateTime? timestamp,
     int? photoSizeBytes,
     String? storagePath,
@@ -1221,19 +1256,21 @@ class _StudentPhotosScreenState extends State<StudentPhotosScreen> {
   ) {
     showDialog(
       context: context,
-      builder: (context) => Dialog(
+      builder: (context) {
+        final tsLocal = timestamp?.toLocal();
+        return Dialog(
         backgroundColor: Colors.transparent,
         insetPadding: const EdgeInsets.all(16),
         child: Stack(
           children: [
             // Full screen photo - automatically uses temporary URL
             Center(
-              child: photoUrl.isNotEmpty
+              child: (photoUrl.isNotEmpty || (storagePath != null && storagePath.isNotEmpty))
                   ? InteractiveViewer(
                       minScale: 0.5,
                       maxScale: 4.0,
                       child: SecureNetworkImage(
-                        imageUrl: photoUrl,
+                        imageUrl: photoUrl.isNotEmpty ? photoUrl : null,
                         storagePath: storagePath,
                         fit: BoxFit.contain,
                         placeholder: const Center(
@@ -1281,22 +1318,18 @@ class _StudentPhotosScreenState extends State<StudentPhotosScreen> {
                       'Date', 
                       '${_formatDate(date)}${_getDayName(date).isNotEmpty ? ' (${_getDayName(date)})' : ''}'
                     ),
-                    if (batchName.isNotEmpty) ...[
-                      const SizedBox(height: 12),
-                      _buildDetailRow(Icons.class_, 'Batch', batchName),
-                    ],
                     const SizedBox(height: 12),
                     _buildDetailRow(
                       Icons.label,
                       'Type',
                       photoType,
                     ),
-                    if (timestamp != null) ...[
+                    if (tsLocal != null) ...[
                       const SizedBox(height: 12),
                       _buildDetailRow(
                         Icons.access_time,
                         'Timestamp',
-                        '${DateFormat('MMM dd, yyyy').format(timestamp)} at ${DateFormat('hh:mm a').format(timestamp)}',
+                        '${DateFormat('MMM dd, yyyy').format(tsLocal)} at ${DateFormat('HH:mm').format(tsLocal)}',
                       ),
                     ],
                     if (photoSizeBytes != null) ...[
@@ -1329,7 +1362,8 @@ class _StudentPhotosScreenState extends State<StudentPhotosScreen> {
             ),
           ],
         ),
-      ),
+      );
+      },
     );
   }
 

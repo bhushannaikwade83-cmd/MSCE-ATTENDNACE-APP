@@ -9,10 +9,17 @@ import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 import 'package:flutter_screenutil/flutter_screenutil.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../../core/app_db.dart';
+import '../../core/gps_attendance_constants.dart';
 import '../../core/time_parse.dart';
 import '../../core/utils/responsive.dart';
 import '../widgets/secure_network_image.dart';
 import '../../services/b2b_storage_service.dart';
+import '../../services/face_recognition_service.dart';
+import '../../services/gps_fence_sample.dart';
+import '../../services/photo_verification_service.dart';
+import '../../services/liveness_detection_service.dart';
+import '../../services/institute_status_service.dart';
+import '../widgets/session_monitor.dart';
 
 class TeacherAttendanceScreen extends StatefulWidget {
   static const routeName = '/teacher-attendance';
@@ -122,7 +129,7 @@ class _TeacherAttendanceScreenState extends State<TeacherAttendanceScreen> {
       final data = rows.first as Map<String, dynamic>;
       final latitude = (data['latitude'] as num?)?.toDouble();
       final longitude = (data['longitude'] as num?)?.toDouble();
-      final radius = (data['radius'] as num?)?.toDouble() ?? 30.0;
+      final radius = (data['radius'] as num?)?.toDouble() ?? kAttendanceFenceRadiusMeters;
 
       if (latitude == null || longitude == null) {
         if (mounted) _showErrorDialog("GPS Error", "Institute GPS settings incomplete. Contact admin.");
@@ -138,29 +145,29 @@ class _TeacherAttendanceScreenState extends State<TeacherAttendanceScreen> {
         }
       }
 
-      Position position = await Geolocator.getCurrentPosition(
-        locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.high,
-        ),
+      final sample = await samplePositionAgainstFence(
+        fenceLat: latitude,
+        fenceLng: longitude,
+        radiusMeters: radius,
       );
 
-      if (position.isMocked) {
+      if (sample.mockedDetected) {
         if (mounted) _showErrorDialog("Fake GPS Detected", "Please turn off Mock Location apps.");
         return false;
       }
 
-      double dist = Geolocator.distanceBetween(
-        position.latitude,
-        position.longitude,
-        latitude,
-        longitude,
-      );
+      if (sample.errorMessage != null) {
+        if (mounted) _showErrorDialog("GPS", sample.errorMessage!);
+        return false;
+      }
 
-      if (dist > radius) {
+      if (!sample.isWithinFence) {
         if (mounted) {
           _showErrorDialog(
             "Outside Institute",
-            "You are ${dist.toStringAsFixed(0)}m away.\nAllowed radius: ${radius.toStringAsFixed(0)}m.\nAttendance can only be marked within the institute premises.",
+            "Closest reading about ${sample.bestDistanceMeters.toStringAsFixed(0)}m after several GPS samples.\n"
+            "Indoor signal varies; try a window or open area, or ask your admin to re-save the GPS lock.\n"
+            "Allowed: about ${radius.toStringAsFixed(0)}m plus accuracy when signal is weak.",
           );
         }
         return false;
@@ -173,43 +180,115 @@ class _TeacherAttendanceScreenState extends State<TeacherAttendanceScreen> {
   }
 
   Future<void> _captureAndMarkPresent(String studentId, String studentName) async {
+    // Block if institute is not open or it's a holiday
+    if (_instituteId != null) {
+      final todayStatus = await InstituteStatusService().getTodayStatus(_instituteId!);
+      if (!mounted) return;
+      final instStatus = todayStatus?['status'] as String? ?? '';
+      if (instStatus == 'holiday') {
+        if (mounted) _showErrorDialog('Holiday', 'Today is a holiday. Attendance is not counted on holidays.');
+        return;
+      }
+      if (instStatus != 'open') {
+        if (mounted) _showErrorDialog(
+          'Institute Not Open',
+          instStatus == 'closed'
+              ? 'The institute is closed. Attendance cannot be marked.'
+              : 'The institute has not been opened yet. Ask the admin to open it first.',
+        );
+        return;
+      }
+    }
+
     bool isAllowed = await _isWithinSchoolPremises();
+    if (!mounted) return;
     if (!isAllowed) return;
 
-    final picker = ImagePicker();
-
-    final XFile? photo = await picker.pickImage(
-      source: ImageSource.camera,
-      imageQuality: 35,
-      maxWidth: 600,
-      preferredCameraDevice: CameraDevice.rear,
-    );
-
-    if (photo == null) return;
-
-    setState(() => _uploadingStates[studentId] = true);
-
+    // Suppress PIN lock while camera is open
+    SessionMonitor.beginSuppressResumeLock();
     try {
+      final picker = ImagePicker();
+
+      final XFile? photo = await picker.pickImage(
+        source: ImageSource.camera,
+        imageQuality: 35,
+        maxWidth: 600,
+        preferredCameraDevice: CameraDevice.rear,
+      );
+
+      if (!mounted) return;
+      if (photo == null) return;
+
+      setState(() => _uploadingStates[studentId] = true);
+
+      try {
       if (!kIsWeb) {
         final inputImage = InputImage.fromFilePath(photo.path);
         final List<Face> faces = await _faceDetector.processImage(inputImage);
 
         if (faces.isEmpty) {
           if (mounted) _showErrorDialog("No Face Detected", "No person found.\nPlease retake the photo.");
+          if (mounted) setState(() => _uploadingStates[studentId] = false);
+          return;
+        }
+
+        if (await PhotoVerificationService.detectPhotoOfPhoto(photo.path)) {
+          if (!mounted) return;
+          _showErrorDialog(
+            "Invalid photo",
+            "This looks like a photo of a photo or a screen.\nTake a live picture of the student only.",
+          );
+          setState(() => _uploadingStates[studentId] = false);
+          return;
+        }
+        if (!mounted) return;
+        final live = await LivenessDetectionService.detectLivenessFromPhoto(photoPath: photo.path);
+        if (!mounted) return;
+        if (!LivenessDetectionService.passesLivePersonPreCheck(live)) {
+          _showErrorDialog(
+            "Live face required",
+            "Face the camera directly with eyes open. Do not use a printed photo or another device’s screen.",
+          );
           setState(() => _uploadingStates[studentId] = false);
           return;
         }
       }
 
-      final studRow = await appDb.from('students').select('year,sr_no').eq('id', studentId).maybeSingle();
-      final batchYear = (studRow?['year'] as String?)?.isNotEmpty == true ? studRow!['year'] as String : _todayDateId.substring(0, 4);
-      final roll = (studRow?['sr_no'] as String?)?.isNotEmpty == true ? studRow!['sr_no'] as String : studentId.replaceAll(RegExp(r'[^a-zA-Z0-9]'), '').padRight(4, '0').substring(0, 12);
+      final studRow = await appDb
+          .from('students')
+          .select('year,sr_no,user_id')
+          .eq('id', studentId)
+          .maybeSingle();
+      if (!mounted) return;
+      final folderYear = (studRow?['year'] as String?)?.isNotEmpty == true ? studRow!['year'] as String : _todayDateId.substring(0, 4);
+      final roll = (studRow?['sr_no'] as String?)?.isNotEmpty == true
+          ? studRow!['sr_no'] as String
+          : ((studRow?['user_id'] as String?)?.isNotEmpty == true
+              ? studRow!['user_id'] as String
+              : studentId.replaceAll(RegExp(r'[^a-zA-Z0-9]'), '').padRight(4, '0').substring(0, 12));
+
+      if (!kIsWeb) {
+        final faceResult = await FaceRecognitionService.verifyStudent(
+          photo.path,
+          _instituteId ?? '',
+          roll,
+        );
+        if (!mounted) return;
+        if (!faceResult.isMatch) {
+          _showErrorDialog(
+            'Face Verification Failed',
+            faceResult.message,
+          );
+          setState(() => _uploadingStates[studentId] = false);
+          return;
+        }
+      }
 
       Uint8List imgBytes = await photo.readAsBytes();
 
       final up = await B2BStorageService.uploadAttendancePhoto(
         instituteId: _instituteId ?? '',
-        batchYear: batchYear,
+        folderYear: folderYear,
         rollNumber: roll,
         subject: 'teacher_proof',
         date: _todayDateId,
@@ -242,14 +321,27 @@ class _TeacherAttendanceScreenState extends State<TeacherAttendanceScreen> {
         ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(content: Text("Verified & Saved!"), backgroundColor: Colors.green));
       }
-    } catch (e) {
-      if (mounted) _showErrorDialog("Error", "Could not verify: $e");
+      } catch (e) {
+        if (mounted) _showErrorDialog("Error", "Could not verify: $e");
+      } finally {
+        if (mounted) setState(() => _uploadingStates[studentId] = false);
+      }
     } finally {
-      if (mounted) setState(() => _uploadingStates[studentId] = false);
+      SessionMonitor.endSuppressResumeLock();
     }
   }
 
   Future<void> _markAbsent(String studentId, String studentName) async {
+    if (_instituteId != null) {
+      final blockMessage =
+          await InstituteStatusService().attendanceBlockMessage(_instituteId!);
+      if (!mounted) return;
+      if (blockMessage != null) {
+        _showErrorDialog('Attendance Blocked', blockMessage);
+        return;
+      }
+    }
+
     final docId = '${studentId}_$_todayDateId';
     final ts = DateTime.now().toUtc().toIso8601String();
     await appDb.from('teacher_attendance').upsert({
@@ -363,7 +455,7 @@ class _TeacherAttendanceScreenState extends State<TeacherAttendanceScreen> {
               String time = "Unknown";
               final ts = record != null ? record['timestamp'] as DateTime? : null;
               if (ts != null) {
-                time = DateFormat('h:mm a').format(ts.toLocal());
+                time = DateFormat('HH:mm').format(ts.toLocal());
               }
 
               return Card(

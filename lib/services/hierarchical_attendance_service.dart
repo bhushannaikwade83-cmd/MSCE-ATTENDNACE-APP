@@ -4,12 +4,11 @@ import 'package:intl/intl.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../core/app_db.dart';
-import 'semester_service.dart';
+import 'institute_status_service.dart';
 
 /// Attendance stored in `attendance_in_out` (Supabase). B2 holds photo files; URLs stored here.
 class HierarchicalAttendanceService {
   final SupabaseClient _db = appDb;
-  final SemesterService _semesterService = SemesterService();
 
   Future<String> _instituteCode(String instituteCode) async {
     if (instituteCode.isEmpty) return instituteCode;
@@ -29,13 +28,23 @@ class HierarchicalAttendanceService {
     required String type,
     required String photoUrl,
     String? photoPath,
+    String? photoFileId,
     Map<String, dynamic>? additionalData,
+    /// When set, stored as `created_at` so it matches the attendance event (not insert latency).
+    String? recordedAtUtcIso,
   }) async {
     try {
+      final today = DateFormat('yyyy-MM-dd').format(DateTime.now());
+      if (date == today) {
+        final blockMessage =
+            await InstituteStatusService().attendanceBlockMessage(instituteCode);
+        if (blockMessage != null) {
+          return {'success': false, 'message': blockMessage, 'blocked': true};
+        }
+      }
+
       final dateTime = DateTime.parse(date);
       final year = dateTime.year;
-      final semester = _semesterService.getCurrentSemester();
-      final semesterCode = _semesterService.getSemesterCode(semester, year);
       final code = await _instituteCode(instituteCode);
       final timestamp = DateTime.now();
       final timestampStr = DateFormat('yyyyMMddHHmmss').format(timestamp);
@@ -47,14 +56,16 @@ class HierarchicalAttendanceService {
         'student_name': studentName,
         'sr_no': srNo,
         'year': year,
-        'semester_code': semesterCode,
         'attendance_date': date,
         'type': type,
         'photo_url': photoUrl,
         if (photoPath != null) 'photo_path': photoPath,
+        if (photoFileId != null && photoFileId.isNotEmpty) 'photo_file_id': photoFileId,
         'unique_id': uniqueDocId,
         'additional': additionalData ?? {},
-        'created_at': DateTime.now().toUtc().toIso8601String(),
+        'created_at': (recordedAtUtcIso != null && recordedAtUtcIso.trim().isNotEmpty)
+            ? recordedAtUtcIso.trim()
+            : DateTime.now().toUtc().toIso8601String(),
       };
 
       await _db.from('attendance_in_out').insert(payload);
@@ -73,11 +84,11 @@ class HierarchicalAttendanceService {
       'studentName': row['student_name'],
       'srNo': row['sr_no'],
       'year': row['year'],
-      'semesterCode': row['semester_code'],
       'date': row['attendance_date'],
       'type': row['type'],
       'photoUrl': row['photo_url'],
       'photoPath': row['photo_path'],
+      'photoFileId': row['photo_file_id'],
       'timestamp': row['created_at'],
       'createdAt': row['created_at'],
       ...?((row['additional'] as Map?)?.cast<String, dynamic>()),
@@ -174,7 +185,6 @@ class HierarchicalAttendanceService {
   Future<List<Map<String, dynamic>>> getInstituteAttendance({
     required String instituteCode,
     required int year,
-    required String semesterCode,
     String? date,
   }) async {
     try {
@@ -183,8 +193,7 @@ class HierarchicalAttendanceService {
           .from('attendance_in_out')
           .select()
           .eq('institute_code', code)
-          .eq('year', year)
-          .eq('semester_code', semesterCode);
+          .eq('year', year);
       final results = <Map<String, dynamic>>[];
       for (final r in rows) {
         final d = r['attendance_date']?.toString() ?? '';
@@ -205,26 +214,22 @@ class HierarchicalAttendanceService {
 
   Future<Map<String, dynamic>> getAttendanceSummary() async {
     try {
-      final rows = await _db.from('attendance_in_out').select('year, semester_code, institute_code');
-      final triples = <String>{};
+      final rows = await _db.from('attendance_in_out').select('year, institute_code');
+      final pairs = <String>{};
       for (final r in rows) {
         final y = r['year']?.toString() ?? '';
-        final sem = r['semester_code']?.toString() ?? '';
         final code = r['institute_code']?.toString() ?? '';
-        if (y.isEmpty || sem.isEmpty || code.isEmpty) continue;
-        triples.add('$y|$sem|$code');
+        if (y.isEmpty || code.isEmpty) continue;
+        pairs.add('$y|$code');
       }
       final summary = <String, dynamic>{};
-      for (final t in triples) {
+      for (final t in pairs) {
         final parts = t.split('|');
         final y = parts[0];
-        final sem = parts[1];
-        final code = parts[2];
+        final code = parts[1];
         summary.putIfAbsent(y, () => <String, dynamic>{});
         final yMap = summary[y] as Map<String, dynamic>;
-        yMap.putIfAbsent(sem, () => <String, Map<String, dynamic>>{});
-        final semMap = yMap[sem] as Map<String, Map<String, dynamic>>;
-        if (semMap.containsKey(code)) continue;
+        if (yMap.containsKey(code)) continue;
 
         final instRow = await _db.from('institutes').select('id').eq('institute_code', code).maybeSingle();
         final iid = instRow?['id'] as String?;
@@ -238,9 +243,8 @@ class HierarchicalAttendanceService {
             .from('attendance_in_out')
             .select('id')
             .eq('institute_code', code)
-            .eq('semester_code', sem)
             .eq('year', yearInt);
-        semMap[code] = {
+        yMap[code] = {
           'totalStudents': totalStudents,
           'totalAttendance': attRows.length,
         };

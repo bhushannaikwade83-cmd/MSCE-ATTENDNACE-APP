@@ -1,24 +1,19 @@
 import 'dart:io';
-import '../../core/app_db.dart';
+import 'dart:typed_data';
+
 import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
-import 'package:image/image.dart' as img;
-import 'dart:ui';
+
+import '../../core/app_db.dart';
 import '../../core/theme/app_theme.dart';
-import '../../services/auth_service.dart';
-import '../../services/batch_service.dart';
-import '../../services/semester_service.dart';
-import '../../services/subject_service.dart';
-import '../../services/error_handler.dart';
 import '../../core/utils/professional_messaging.dart';
-// Face recognition enabled - save face template for attendance verification
+import '../../services/auth_service.dart';
+import '../../services/b2b_storage_service.dart';
 import '../../services/face_recognition_service.dart';
-import '../../services/arcface_backend_service.dart';
-import '../../services/photo_verification_service.dart';
-import '../../services/liveness_detection_service.dart';
-import '../widgets/face_scanning_widget.dart';
-import '../widgets/face_scanner_widget.dart';
+import '../../services/photo_compression_service.dart';
+import '../../services/subject_service.dart';
+import '../widgets/session_monitor.dart';
 import 'help_desk_screen.dart';
 
 class AddStudentScreen extends StatefulWidget {
@@ -31,29 +26,25 @@ class AddStudentScreen extends StatefulWidget {
 
 class _AddStudentScreenState extends State<AddStudentScreen> with TickerProviderStateMixin {
   final _formKey = GlobalKey<FormState>();
-  final _nameController = TextEditingController();
-  final _rollController = TextEditingController();
+  final _firstNameController = TextEditingController();
+  final _middleNameController = TextEditingController();
+  final _lastNameController = TextEditingController();
   final _yearController = TextEditingController();
-  final _contactController = TextEditingController();
   final AuthService _authService = AuthService();
-  final BatchService _batchService = BatchService();
-  final SemesterService _semesterService = SemesterService();
   final SubjectService _subjectService = SubjectService();
   final ImagePicker _picker = ImagePicker();
 
   bool _isLoading = false;
   bool _isCapturingFace = false;
-  bool _isLoadingBatches = false;
   bool _isLoadingSubjects = false;
   String? _facePhotoPath;
-  bool _faceRegistered = false; // Track if face was successfully registered
+  bool _faceRegistered = false; // Set after one camera capture + embedding extracted
+  List<double>? _faceEmbedding;
+  Uint8List? _facePhotoBytes;
   String? _instituteId;
-  List<Map<String, dynamic>> _batches = [];
-  List<String> _selectedBatchIds = []; // Multiple batches
+  String? _srNo; // Dense institute serial (1, 2, 3 …), matches DB after save
   List<Map<String, dynamic>> _availableSubjects = [];
   List<String> _selectedSubjects = []; // Multiple subjects
-  Map<String, dynamic>? _selectedSemester;
-  List<Map<String, dynamic>> _availableSemesters = [];
 
   late AnimationController _fadeController;
   late Animation<double> _fadeAnimation;
@@ -69,15 +60,20 @@ class _AddStudentScreenState extends State<AddStudentScreen> with TickerProvider
       CurvedAnimation(parent: _fadeController, curve: Curves.easeOut),
     );
     _fadeController.forward();
+
+    // Auto-populate year with current year
+    final currentYear = DateTime.now().year;
+    _yearController.text = 'Year $currentYear';
+
     _loadInstituteId();
   }
 
   @override
   void dispose() {
-    _nameController.dispose();
-    _rollController.dispose();
+    _firstNameController.dispose();
+    _middleNameController.dispose();
+    _lastNameController.dispose();
     _yearController.dispose();
-    _contactController.dispose();
     _fadeController.dispose();
     super.dispose();
   }
@@ -99,9 +95,7 @@ class _AddStudentScreenState extends State<AddStudentScreen> with TickerProvider
         setState(() {
           _instituteId = foundInstituteId;
         });
-        await _loadBatches();
         await _loadSubjects();
-        await _loadSemesters();
         return;
       }
 
@@ -164,306 +158,187 @@ class _AddStudentScreenState extends State<AddStudentScreen> with TickerProvider
     }
   }
 
-  Future<void> _loadSemesters() async {
-    _availableSemesters = _semesterService.getSemestersForSelection();
-    final currentYear = _semesterService.getCurrentYear();
-    final currentSemester = _semesterService.getCurrentSemester();
-    
-    // Set default to current semester - find by matching semester and year
-    if (_availableSemesters.isNotEmpty) {
-      try {
-        _selectedSemester = _availableSemesters.firstWhere(
-          (sem) => sem['semester'] == currentSemester && sem['year'] == currentYear,
-        );
-      } catch (e) {
-        // If not found, use first available
-        _selectedSemester = _availableSemesters.first;
-      }
-    }
-  }
-
-  Future<void> _loadBatches() async {
-    if (_instituteId == null) {
-      if (kDebugMode) debugPrint('⚠️ Cannot load batches: instituteId is null');
-      return;
-    }
-
-    setState(() => _isLoadingBatches = true);
+  /// Next dense serial for this institute (matches server [AuthService.addStudentManually]).
+  Future<String> _generateNextSRNumber() async {
     try {
-      if (kDebugMode) debugPrint('Loading batches for institute: $_instituteId');
-      _batches = await _batchService.getBatches(_instituteId!);
-      if (kDebugMode) debugPrint('✅ Loaded ${_batches.length} batches');
-      
-      if (_batches.isEmpty && mounted) {
-        ProfessionalMessaging.showWarning(
-          context,
-          title: 'No Batches Found',
-          message: 'Please create batches first before adding students. Go to Batch Management to create batches.',
-        );
+      if (_instituteId == null) {
+        throw Exception('Institute ID not found');
       }
+      final s = await _authService.previewNextStudentSrNo(_instituteId!);
+      if (kDebugMode) debugPrint('✅ Generated SR_NO: $s');
+      return s;
     } catch (e) {
-      if (kDebugMode) debugPrint('❌ Batch load error: $e');
-      if (mounted) {
-        ProfessionalMessaging.showError(
-          context,
-          title: 'Failed to Load Batches',
-          message: ProfessionalMessaging.getProfessionalErrorMessage(e.toString()),
-        );
-      }
-    } finally {
-      if (mounted) {
-        setState(() => _isLoadingBatches = false);
-      }
+      if (kDebugMode) debugPrint('❌ Error generating SR_NO: $e');
+      return '${DateTime.now().millisecondsSinceEpoch}';
     }
   }
+
 
   Future<void> _captureFacePhoto() async {
     setState(() => _isCapturingFace = true);
-    
+
     try {
-      // Use simple mobile camera to take single photo
-      final photo = await _picker.pickImage(
-        source: ImageSource.camera,
-        imageQuality: 85,
-        preferredCameraDevice: CameraDevice.front,
-      );
-      
-      if (photo == null) {
-        setState(() => _isCapturingFace = false);
-        return;
+      if (_instituteId == null) {
+        throw Exception('Institute ID not found');
       }
-      
-      final capturedPhotoPath = photo.path;
-      
-      // Store captured image
-      setState(() {
-        _facePhotoPath = capturedPhotoPath;
-        _faceRegistered = false; // Reset registration status
-      });
-      
-      // Show processing overlay
-      if (mounted) {
-        showDialog(
-          context: context,
-          barrierDismissible: false,
-          builder: (context) => FaceScanningOverlay(
-            message: 'Processing photo...',
-          ),
+
+      _srNo ??= await _generateNextSRNumber();
+
+      SessionMonitor.beginSuppressResumeLock();
+      XFile? picked;
+      try {
+        picked = await _picker.pickImage(
+          source: ImageSource.camera,
+          preferredCameraDevice: CameraDevice.front,
         );
+      } finally {
+        await Future<void>.delayed(const Duration(milliseconds: 400));
+        SessionMonitor.endSuppressResumeLock();
       }
-      
-      // Basic validation on photo (quick check)
-      final imageFile = File(capturedPhotoPath);
-      if (!await imageFile.exists() || await imageFile.length() < 1024) {
-        if (mounted) {
-          Navigator.of(context).pop();
-          ProfessionalMessaging.showError(
-            context,
-            title: 'Invalid Photo',
-            message: 'Photo file is invalid. Please try again.',
-          );
-        }
+
+      final xfile = picked;
+      if (xfile == null) {
+        // User cancelled
         setState(() => _isCapturingFace = false);
         return;
       }
 
-      // Close processing overlay
-      if (mounted) {
-        Navigator.of(context).pop();
+      // Fix iOS/Android EXIF: ML Kit + TFLite must use the same upright pixels
+      final workPath = await FaceRecognitionService.ensureNormalizedJpegForFacePipeline(xfile.path);
+
+      if (kDebugMode) {
+        debugPrint('📸 Photo captured: ${xfile.path} (face pipeline: $workPath)');
       }
 
-      // Immediately register face with single image
-      await _registerFaceImmediately(
-        capturedPhotoPath,
-        additionalImages: null, // No additional images - single photo only
-      );
-    } catch (e) {
-      final error = ErrorHandler.formatErrorForUI(e, context: 'captureFacePhoto');
+      // Show processing message at bottom (like face registration message)
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text(error['message']),
-            backgroundColor: AppTheme.accentRed,
+            content: const Text('🔄 Processing face...'),
+            backgroundColor: Colors.blue,
+            duration: const Duration(seconds: 90),
             behavior: SnackBarBehavior.floating,
             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
           ),
         );
       }
-    }
-    setState(() => _isCapturingFace = false);
-  }
 
-  /// Register face immediately after capture (before student creation)
-  /// Uses single image only - additional images parameter is ignored
-  Future<void> _registerFaceImmediately(String photoPath, {List<String>? additionalImages}) async {
-    if (_instituteId == null) {
-      if (kDebugMode) {
-        debugPrint('⚠️ Cannot register face: Institute ID is null');
-      }
-      return;
-    }
-
-    try {
-      // Generate a temporary student ID for face registration
-      // We'll use a placeholder that will be replaced when student is created
-      final tempStudentId = 'temp_${DateTime.now().millisecondsSinceEpoch}';
-      final rollNumber = _rollController.text.trim();
-      final studentName = _nameController.text.trim();
+      // Extract embedding and photo data (aligned with detection / embedding)
+      final photoBytes = await File(workPath).readAsBytes();
 
       if (kDebugMode) {
-        debugPrint('📸 Registering face for Roll $rollNumber with single image...');
+        debugPrint('🔄 Extracting face features...');
       }
 
-      // Register face with backend (single image only)
-      final faceRegistered = await ArcFaceBackendService.registerStudentFace(
-        imagePath: photoPath,
-        additionalImagePaths: null, // Single image only - no additional images
-        instituteId: _instituteId!,
-        studentId: tempStudentId, // Temporary ID
-        rollNumber: rollNumber,
-        name: studentName,
+      // Extract face features (async operation)
+      final features = await FaceRecognitionService.extractFaceFeatures(workPath);
+      if (features == null) {
+        final detail = await FaceRecognitionService.getDiagnosticReasonForInvalidFace(workPath);
+        throw Exception(detail ?? 'Could not extract face. Use good lighting, one person, facing the camera.');
+      }
+
+      if (kDebugMode) {
+        debugPrint('✅ Face features extracted');
+        debugPrint('🧠 Extracting neural embedding...');
+      }
+
+      // Extract embedding using MobileFaceNet
+      final embedding = await FaceRecognitionService.extractNeuralEmbedding(
+        workPath,
+        features,
       );
 
-      if (faceRegistered) {
-        setState(() {
-          _faceRegistered = true; // Mark as registered
-        });
-        
-        if (kDebugMode) {
-          debugPrint('✅ Face registered successfully for Roll $rollNumber');
-        }
-        
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('✅ Face registered successfully'),
-              backgroundColor: AppTheme.accentGreen,
-              duration: Duration(seconds: 2),
-            ),
-          );
-        }
-      } else {
-        setState(() {
-          _faceRegistered = false;
-          _facePhotoPath = null; // Clear photo path to force re-scan
-        });
-        
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('❌ Face registration failed. Please try again.'),
-              backgroundColor: AppTheme.accentRed,
-              duration: Duration(seconds: 3),
-            ),
-          );
-        }
-      }
-    } catch (e) {
-      setState(() {
-        _faceRegistered = false;
-        _facePhotoPath = null; // Clear photo path to force re-scan
-      });
-      
-      if (kDebugMode) {
-        debugPrint('❌ Error registering face: $e');
-      }
-      
-      String errorMessage = 'Face registration failed';
-      final errorStr = e.toString();
-      
-      if (kDebugMode) {
-        debugPrint('🔍 Parsing error message: $errorStr');
-      }
-      
-      // First, try to extract the actual error message from Exception(...)
-      // This handles cases like: Exception: 🚨 SPOOF DETECTED: ...
-      final exceptionMatch = RegExp(r'Exception:\s*(.+)', caseSensitive: false).firstMatch(errorStr);
-      if (exceptionMatch != null) {
-        final extractedMessage = exceptionMatch.group(1)?.trim() ?? '';
-        if (extractedMessage.isNotEmpty && 
-            !extractedMessage.contains('500') && 
-            !extractedMessage.contains('503') &&
-            !extractedMessage.contains('Backend Error:')) {
-          errorMessage = extractedMessage;
-          if (kDebugMode) {
-            debugPrint('✅ Extracted error message: $errorMessage');
-          }
-        }
-      }
-      
-      // If we still have the default message, try other patterns
-      if (errorMessage == 'Face registration failed') {
-        // Check for specific error types
-        if (errorStr.contains('SPOOF DETECTED') || errorStr.contains('Spoof detected')) {
-          // Extract spoof detection message
-          final spoofMatch = RegExp(r'(SPOOF DETECTED[^\n]*)', caseSensitive: false).firstMatch(errorStr);
-          if (spoofMatch != null) {
-            errorMessage = spoofMatch.group(1) ?? '🚨 SPOOF DETECTED: Please use a live photo.';
-          } else {
-            errorMessage = '🚨 SPOOF DETECTED: Please use a live photo, not a printed photo or phone screen.';
-          }
-        } else if (errorStr.contains('No face detected') || errorStr.contains('no face detected')) {
-          errorMessage = '❌ No face detected. Take a clear photo with face visible.';
-        } else if (errorStr.contains('timeout') || errorStr.contains('Timeout')) {
-          errorMessage = '❌ Timeout. Please try again.';
-        } else if (errorStr.contains('Backend Error:')) {
-          // Extract the actual backend error message
-          final match = RegExp(r'Backend Error:\s*(.+)', caseSensitive: false).firstMatch(errorStr);
-          if (match != null) {
-            errorMessage = match.group(1)?.trim() ?? '❌ Backend error occurred.';
-          }
-        } else if (errorStr.contains('400')) {
-          errorMessage = '❌ Invalid photo. Please take a clear photo.';
-        } else if (errorStr.contains('500') || errorStr.contains('503')) {
-          // Try to extract actual error from exception
-          final match = RegExp(r'Exception:\s*(.+)', caseSensitive: false).firstMatch(errorStr);
-          if (match != null && 
-              !match.group(1)!.contains('500') && 
-              !match.group(1)!.contains('503')) {
-            errorMessage = match.group(1)?.trim() ?? '❌ Server error occurred.';
-          } else {
-            errorMessage = '❌ Server error. Please try again.';
-          }
-        }
-      }
-      
-      // Final fallback - use the full exception string if we still have default
-      if (errorMessage == 'Face registration failed') {
-        errorMessage = errorStr.replaceAll('Exception: ', '').trim();
-        if (errorMessage.isEmpty) {
-          errorMessage = '❌ Registration failed. Please try again.';
-        }
-      }
-      
-      if (kDebugMode) {
-        debugPrint('📱 Final error message to display: $errorMessage');
-      }
-      
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(errorMessage),
-            backgroundColor: AppTheme.accentRed,
-            duration: const Duration(seconds: 3),
-          ),
+      if (embedding == null || embedding.isEmpty) {
+        throw Exception(
+          'Neural face model failed. Reopen the app and try again, or check that the face model is installed.',
         );
       }
+
+      if (kDebugMode) {
+        debugPrint('✅ Face embedding extracted successfully');
+      }
+
+      // Dismiss "Processing face..." before duplicate check (may take a moment on slow networks).
+      if (mounted) {
+        ScaffoldMessenger.of(context).clearSnackBars();
+      }
+
+      // Check for duplicate registration (on main thread - database access)
+      final duplicateError = await FaceRecognitionService.duplicateRegistrationBlockedMessageForEmbedding(
+        embedding,
+        _instituteId!,
+        excludeStudentId: null,
+      );
+
+      if (duplicateError != null) {
+        if (!mounted) return;
+        ProfessionalMessaging.showError(
+          context,
+          title: 'Face Already Registered',
+          message: duplicateError,
+          durationSeconds: 5,
+        );
+        setState(() => _isCapturingFace = false);
+        return;
+      }
+
+      // Face is valid and unique
+      if (!mounted) return;
+
+      // Store embedding and photo for later save
+      setState(() {
+        _facePhotoPath = workPath;
+        _faceEmbedding = embedding;
+        _facePhotoBytes = photoBytes;
+        _faceRegistered = true;
+        _isCapturingFace = false;
+      });
+
+      // Show success message
+      if (mounted) {
+        ProfessionalMessaging.showSuccess(
+          context,
+          title: 'Face saved',
+          message: 'You can continue and submit the student form.',
+          durationSeconds: 3,
+        );
+      }
+
+      if (kDebugMode) {
+        debugPrint('✅ Face registration complete');
+        debugPrint('   _faceRegistered = $_faceRegistered');
+        debugPrint('   Embedding: ${embedding.length}D vector');
+        debugPrint('   Photo bytes: ${(photoBytes.length / 1024).toStringAsFixed(1)} KB');
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).clearSnackBars();
+        ProfessionalMessaging.showError(
+          context,
+          title: 'Face not saved',
+          message: ProfessionalMessaging.messageForFaceProcessingError(e),
+          durationSeconds: 5,
+        );
+      }
+      setState(() => _isCapturingFace = false);
     }
   }
 
   Future<void> _submit() async {
-    if (!_formKey.currentState!.validate()) return;
+    if (kDebugMode) {
+      debugPrint('🔵 _submit() called');
+      debugPrint('   _faceRegistered: $_faceRegistered');
+      debugPrint('   _faceEmbedding: ${_faceEmbedding != null}');
+      debugPrint('   _selectedSubjects: ${_selectedSubjects.length}');
+    }
 
-    if (_selectedBatchIds.isEmpty) {
-      ProfessionalMessaging.showWarning(
-        context,
-        title: 'Batch Selection Required',
-        message: 'Please select at least one batch for this student. Students can be assigned to multiple batches.',
-      );
+    if (!_formKey.currentState!.validate()) {
+      if (kDebugMode) debugPrint('❌ Form validation failed');
       return;
     }
 
     if (_selectedSubjects.isEmpty) {
+      if (kDebugMode) debugPrint('❌ No subjects selected');
       ProfessionalMessaging.showWarning(
         context,
         title: 'Subject Selection Required',
@@ -472,27 +347,22 @@ class _AddStudentScreenState extends State<AddStudentScreen> with TickerProvider
       return;
     }
 
-    if (_selectedSemester == null) {
-      ProfessionalMessaging.showWarning(
-        context,
-        title: 'Semester Selection Required',
-        message: 'Please select a semester for this student. The year will be automatically set based on your selection.',
-      );
-      return;
-    }
-
-    // Require face photo AND successful face registration
-    if (_facePhotoPath == null || !_faceRegistered) {
+    if (!_faceRegistered || _faceEmbedding == null || _facePhotoBytes == null) {
+      if (kDebugMode) {
+        debugPrint(
+          '❌ Face not registered - registered=$_faceRegistered embedding=${_faceEmbedding != null} bytes=${_facePhotoBytes != null}',
+        );
+      }
       ProfessionalMessaging.showError(
         context,
         title: 'Face Registration Required',
-        message: _facePhotoPath == null
-            ? 'Please capture and register the student\'s face first. Face registration is mandatory for student creation.'
-            : 'Face registration failed. Please scan the face again and ensure registration succeeds before adding the student.\n\nStudent will NOT be added until face registration is successful.',
+        message: 'Please capture and register the student\'s face first. Click "Capture Face" button to take a photo.',
         durationSeconds: 5,
       );
       return;
     }
+
+    if (kDebugMode) debugPrint('✅ All validations passed - proceeding with student creation');
 
     // Validate institute ID
     if (_instituteId == null || _instituteId!.isEmpty) {
@@ -508,81 +378,110 @@ class _AddStudentScreenState extends State<AddStudentScreen> with TickerProvider
     setState(() => _isLoading = true);
 
     try {
-      // Get batch names and timings
-      final selectedBatches = _batches.where((b) => _selectedBatchIds.contains(b['id'])).toList();
-      if (selectedBatches.isEmpty) {
-        setState(() => _isLoading = false);
-        ProfessionalMessaging.showError(
-          context,
-          title: 'Invalid Batch Selection',
-          message: 'Selected batches could not be found. Please select valid batches.',
-        );
-        return;
-      }
-      
-      final batchNames = selectedBatches.map((b) => b['name'] as String).join(', ');
-      final batchTimings = selectedBatches.map((b) => b['timing'] as String).join('; ');
+      final firstName = _firstNameController.text.trim();
+      final middleName = _middleNameController.text.trim();
+      final lastName = _lastNameController.text.trim();
 
       if (kDebugMode) {
         debugPrint('📝 Adding student:');
-        debugPrint('   Name: ${_nameController.text.trim()}');
-        debugPrint('   Roll: ${_rollController.text.trim()}');
+        debugPrint('   Name: $firstName $middleName $lastName');
+        debugPrint('   SR_NO: $_srNo');
         debugPrint('   Institute ID: $_instituteId');
-        debugPrint('   Batches: $_selectedBatchIds');
         debugPrint('   Subjects: $_selectedSubjects');
       }
 
       final result = await _authService.addStudentManually(
-        name: _nameController.text.trim(),
-        rollNumber: _rollController.text.trim(),
+        firstName: firstName,
+        middleName: middleName,
+        lastName: lastName,
         year: _yearController.text.trim(),
-        contactNo: _contactController.text.trim(),
-        batchId: _selectedBatchIds.first, // Primary batch ID
-        batchName: batchNames,
-        batchTiming: batchTimings,
         subject: _selectedSubjects.join(', '),
-        semester: _selectedSemester!['code'] as String,
-        semesterName: _selectedSemester!['name'] as String,
-        batchIds: _selectedBatchIds, // All selected batch IDs
-        subjects: _selectedSubjects, // Selected subjects
+        subjects: _selectedSubjects,
         instituteId: _instituteId,
       );
 
-      // Face is already registered before student creation
-      // Update face registration with actual student ID
-      if (result['success'] && _faceRegistered && _facePhotoPath != null && _instituteId != null) {
-        final studentId = result['studentId'] as String?;
-        final rollNumber = _rollController.text.trim();
-        final studentName = _nameController.text.trim();
-        
-        if (studentId != null) {
-          // Re-register face with actual student ID (replaces temp registration)
-          try {
-            final faceReRegistered = await ArcFaceBackendService.registerStudentFace(
-              imagePath: _facePhotoPath!,
-              instituteId: _instituteId!,
-              studentId: studentId,
-              rollNumber: rollNumber,
-              name: studentName,
-            );
-            
-            if (faceReRegistered) {
-              if (kDebugMode) {
-                debugPrint('✅ Face registration updated with actual student ID: $studentId');
-              }
-            } else {
-              if (kDebugMode) {
-                debugPrint('⚠️ Failed to update face registration with actual student ID');
-              }
-              // This is not critical - face is already registered with temp ID
-              // The roll number and institute ID are the same, so it will work
-            }
-          } catch (e) {
-            if (kDebugMode) {
-              debugPrint('❌ Error updating face registration: $e');
-            }
-            // Not critical - face is already registered
+      if (result['success'] == true) {
+        final assignedSr = result['srNo']?.toString().trim();
+        if (assignedSr != null && assignedSr.isNotEmpty) {
+          _srNo = assignedSr;
+        }
+      }
+
+      final resolvedInstituteId = (result['instituteId'] as String?)?.trim();
+      if (result['success'] == true &&
+          resolvedInstituteId != null &&
+          _instituteId != null &&
+          resolvedInstituteId != _instituteId) {
+        setState(() => _isLoading = false);
+        ProfessionalMessaging.showError(
+          context,
+          title: 'Institute Mismatch',
+          message:
+              'This device resolved a different institute while saving the student. Please logout and login again on this phone before retrying.',
+        );
+        return;
+      }
+
+      final studentId = result['studentId'] as String?;
+
+      // One camera photo → embedding + B2 registration photo after student insert
+      if (result['success'] &&
+          _faceRegistered &&
+          resolvedInstituteId != null &&
+          studentId != null &&
+          _faceEmbedding != null &&
+          _facePhotoBytes != null) {
+        try {
+          if (kDebugMode) {
+            debugPrint('📸 Saving face embedding + photo for student $studentId...');
           }
+
+          final timestamp = DateTime.now().millisecondsSinceEpoch.toString();
+          final currentYear = DateTime.now().year.toString();
+
+          if (kDebugMode) {
+            debugPrint(
+              '🗜️ Registration photo size: ${(_facePhotoBytes!.length / 1024).toStringAsFixed(1)} KB',
+            );
+          }
+          final compressedPhotoBytes = await PhotoCompressionService.compressPhotoBytes(_facePhotoBytes!);
+          if (kDebugMode) {
+            debugPrint('✅ Compressed to: ${(compressedPhotoBytes.length / 1024).toStringAsFixed(1)} KB');
+          }
+
+          final uploadResult = await B2BStorageService.uploadAttendancePhoto(
+            instituteId: resolvedInstituteId,
+            folderYear: currentYear,
+            rollNumber: _srNo!,
+            subject: 'registration',
+            date: timestamp,
+            photoBytes: compressedPhotoBytes,
+          );
+
+          if (uploadResult['url'] != null && uploadResult['url']!.isNotEmpty) {
+            final photoUrl = uploadResult['url']!;
+
+            final embeddingMap = {
+              'version': 2,
+              'embedding': _faceEmbedding,
+              'modelVersion': 'mobilefacenet_tflite_v1',
+              'qualityScore': 95.0,
+              'registrationMethod': 'mobile_camera_single',
+            };
+
+            await appDb.from('students').update({
+              'face_embedding': embeddingMap,
+              'face_photo_url': photoUrl,
+            }).eq('id', studentId);
+
+            if (kDebugMode) {
+              debugPrint('✅ Face registration saved (single camera)');
+              debugPrint('   Photo URL: $photoUrl');
+              debugPrint('   Embedding: ${_faceEmbedding!.length}D');
+            }
+          }
+        } catch (e) {
+          if (kDebugMode) debugPrint('⚠️ Error saving face registration: $e');
         }
       } else if (result['success'] && !_faceRegistered) {
         // This should not happen as we check _faceRegistered before submit
@@ -608,14 +507,12 @@ class _AddStudentScreenState extends State<AddStudentScreen> with TickerProvider
         ProfessionalMessaging.showSuccess(
           context,
           title: 'Student Added Successfully',
-          message: '${_nameController.text.trim()} has been registered. Face recognition is enabled for attendance marking.',
+          message: '${_firstNameController.text.trim()} ${_middleNameController.text.trim()} ${_lastNameController.text.trim()}\n\nSR_NO: $_srNo\n\nFace recognition enabled for attendance marking.',
           actionLabel: 'Done',
-          onAction: () => Navigator.pop(context, true),
+          onAction: () {
+            if (mounted) Navigator.pop(context, true);
+          },
         );
-        // Close screen after short delay
-        Future.delayed(const Duration(milliseconds: 500), () {
-          if (mounted) Navigator.pop(context, true);
-        });
       } else {
         ProfessionalMessaging.showError(
           context,
@@ -698,167 +595,43 @@ class _AddStudentScreenState extends State<AddStudentScreen> with TickerProvider
                             child: Column(
                               mainAxisSize: MainAxisSize.min,
                               children: [
+                                // First Name Field
                                 _buildModernTextField(
-                                  controller: _nameController,
+                                  controller: _firstNameController,
                                   icon: Icons.person_outline,
-                                  label: 'Full Name',
-                                  hint: 'Enter student name',
-                                  validator: (v) => v!.isEmpty ? 'Required' : null,
+                                  label: 'First Name',
+                                  hint: 'Enter first name',
+                                  validator: (v) => v!.isEmpty ? 'First name is required' : null,
                                 ),
                                 const SizedBox(height: 20),
+                                // Middle Name Field
                                 _buildModernTextField(
-                                  controller: _rollController,
-                                  icon: Icons.badge_outlined,
-                                  label: 'Roll Number',
-                                  hint: 'Enter roll number',
-                                  validator: (v) => v!.isEmpty ? 'Required' : null,
+                                  controller: _middleNameController,
+                                  icon: Icons.person_outline,
+                                  label: 'Middle Name',
+                                  hint: 'Enter middle name',
+                                  validator: (v) => v!.isEmpty ? 'Middle name is required' : null,
                                 ),
                                 const SizedBox(height: 20),
+                                // Last Name Field
+                                _buildModernTextField(
+                                  controller: _lastNameController,
+                                  icon: Icons.person_outline,
+                                  label: 'Last Name',
+                                  hint: 'Enter last name',
+                                  validator: (v) => v!.isEmpty ? 'Last name is required' : null,
+                                ),
+                                const SizedBox(height: 20),
+                                // Year Field (Auto-populated)
                                 _buildModernTextField(
                                   controller: _yearController,
                                   icon: Icons.calendar_today_outlined,
                                   label: 'Year',
-                                  hint: 'e.g., First Year',
+                                  hint: 'Auto-generated from current date',
+                                  readOnly: true,
                                   validator: (v) => v!.isEmpty ? 'Required' : null,
                                 ),
                                 const SizedBox(height: 16),
-                                if (_isLoadingBatches)
-                                        Padding(
-                                          padding: const EdgeInsets.symmetric(vertical: 16),
-                                          child: Center(
-                                            child: CircularProgressIndicator(
-                                              color: Theme.of(context).brightness == Brightness.dark 
-                                                  ? Colors.white 
-                                                  : AppTheme.primaryBlue,
-                                            ),
-                                          ),
-                                  ),
-                                if (!_isLoadingBatches && _batches.isEmpty)
-                                  Padding(
-                                    padding: const EdgeInsets.symmetric(vertical: 16),
-                                    child: Text(
-                                      'No batches available. Please create a batch first.',
-                                      style: TextStyle(
-                                              color: Theme.of(context).brightness == Brightness.dark
-                                                  ? Colors.white.withValues(alpha: 0.8)
-                                                  : AppTheme.textDark.withValues(alpha: 0.7),
-                                        fontSize: 14,
-                                      ),
-                                      textAlign: TextAlign.center,
-                                    ),
-                                  ),
-                                // Semester Selection
-                                if (_availableSemesters.isNotEmpty) ...[
-                                  Builder(
-                                    builder: (context) {
-                                      final isDark = Theme.of(context).brightness == Brightness.dark;
-                                      // Use semester code as unique identifier for dropdown
-                                      final selectedCode = _selectedSemester?['code'] as String?;
-                                      return _buildModernDropdown<String>(
-                                        value: selectedCode,
-                                        label: 'Semester',
-                                        icon: Icons.calendar_month,
-                                        items: _availableSemesters
-                                            .map((sem) {
-                                              final code = sem['code'] as String;
-                                              return DropdownMenuItem<String>(
-                                                value: code,
-                                              child: Text(
-                                                  sem['name'] as String,
-                                                  style: TextStyle(
-                                                    color: isDark ? Colors.white : AppTheme.textDark,
-                                                    fontSize: 15,
-                                                    fontWeight: FontWeight.w500,
-                                                ),
-                                                overflow: TextOverflow.ellipsis,
-                                              ),
-                                              );
-                                            })
-                                        .toList(),
-                                        onChanged: (code) {
-                                          if (code != null) {
-                                      setState(() {
-                                              _selectedSemester = _availableSemesters.firstWhere(
-                                                (sem) => sem['code'] == code,
-                                              );
-                                            });
-                                          }
-                                        },
-                                      );
-                                    },
-                                  ),
-                                  const SizedBox(height: 20),
-                                ],
-                                
-                                // Multiple Batch Selection
-                                if (!_isLoadingBatches && _batches.isNotEmpty) ...[
-                                  Text(
-                                    'Select Batches (Multiple)',
-                                        style: TextStyle(
-                                      color: Theme.of(context).brightness == Brightness.dark
-                                          ? Colors.white.withValues(alpha: 0.9)
-                                          : AppTheme.textDark,
-                                      fontSize: 16,
-                                      fontWeight: FontWeight.w600,
-                                    ),
-                                  ),
-                                  const SizedBox(height: 12),
-                                  Container(
-                                    constraints: const BoxConstraints(maxHeight: 200),
-                                    decoration: BoxDecoration(
-                                      color: Theme.of(context).brightness == Brightness.dark
-                                          ? Colors.white.withValues(alpha: 0.1)
-                                          : Colors.grey.withValues(alpha: 0.1),
-                                      borderRadius: BorderRadius.circular(14),
-                                      border: Border.all(
-                                        color: Theme.of(context).brightness == Brightness.dark
-                                            ? Colors.white.withValues(alpha: 0.3)
-                                            : AppTheme.textGray.withValues(alpha: 0.3),
-                                      ),
-                                    ),
-                                    child: ListView.builder(
-                                      shrinkWrap: true,
-                                      itemCount: _batches.length,
-                                      itemBuilder: (context, index) {
-                                        final batch = _batches[index];
-                                        final batchId = batch['id'] as String;
-                                        final isSelected = _selectedBatchIds.contains(batchId);
-                                        return CheckboxListTile(
-                                          title: Text(
-                                            '${batch['name']} (${batch['year']})',
-                                            style: TextStyle(
-                                              color: Theme.of(context).brightness == Brightness.dark
-                                                  ? Colors.white
-                                                  : AppTheme.textDark,
-                                            ),
-                                          ),
-                                          subtitle: Text(
-                                            batch['timing'] ?? '',
-                                            style: TextStyle(
-                                              color: Theme.of(context).brightness == Brightness.dark
-                                                  ? Colors.white.withValues(alpha: 0.7)
-                                                  : AppTheme.textGray,
-                                          fontSize: 12,
-                                        ),
-                                          ),
-                                          value: isSelected,
-                                          onChanged: (value) {
-                                            setState(() {
-                                              if (value == true) {
-                                                _selectedBatchIds.add(batchId);
-                                              } else {
-                                                _selectedBatchIds.remove(batchId);
-                                              }
-                                            });
-                                          },
-                                          activeColor: AppTheme.primaryBlue,
-                                        );
-                                      },
-                                    ),
-                                  ),
-                                  const SizedBox(height: 20),
-                                ],
-                                
                                 // Multiple Subject Selection
                                 if (!_isLoadingSubjects && _availableSubjects.isNotEmpty) ...[
                                   Text(
@@ -918,18 +691,7 @@ class _AddStudentScreenState extends State<AddStudentScreen> with TickerProvider
                                   ),
                                   const SizedBox(height: 20),
                                 ],
-                                
-                                // Contact Number
-                                  _buildModernTextField(
-                                    controller: _contactController,
-                                    icon: Icons.phone_outlined,
-                                    label: 'Contact Number',
-                                    hint: 'Enter contact number',
-                                    keyboardType: TextInputType.phone,
-                                    validator: (v) => v!.isEmpty ? 'Required' : null,
-                                  ),
-                                  const SizedBox(height: 24),
-                                  _buildFaceCaptureButton(),
+                                _buildFaceCaptureButton(),
                                   const SizedBox(height: 24),
                                   _buildSubmitButton(),
                               ],
@@ -1041,11 +803,13 @@ class _AddStudentScreenState extends State<AddStudentScreen> with TickerProvider
     required String hint,
     TextInputType? keyboardType,
     String? Function(String?)? validator,
+    bool readOnly = false,
   }) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
     return TextFormField(
       controller: controller,
       keyboardType: keyboardType,
+      readOnly: readOnly,
       style: TextStyle(
         color: isDark ? Colors.white : AppTheme.textDark,
         fontSize: 15,
@@ -1191,24 +955,28 @@ class _AddStudentScreenState extends State<AddStudentScreen> with TickerProvider
 
   Widget _buildFaceCaptureButton() {
     final isDark = Theme.of(context).brightness == Brightness.dark;
+    // Check if face is registered via either photo path or video embedding
+    final isFaceRegistered =
+        _faceRegistered && _faceEmbedding != null && _facePhotoBytes != null;
+
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: isDark 
-            ? Colors.white.withValues(alpha: 0.1) 
+        color: isDark
+            ? Colors.white.withValues(alpha: 0.1)
             : AppTheme.primaryBlue.withValues(alpha: 0.05),
         borderRadius: BorderRadius.circular(14),
         border: Border.all(
-          color: isDark 
-              ? Colors.white.withValues(alpha: 0.3) 
+          color: isDark
+              ? Colors.white.withValues(alpha: 0.3)
               : AppTheme.primaryBlue.withValues(alpha: 0.3),
         ),
       ),
       child: Row(
         children: [
           Icon(
-            _facePhotoPath != null ? Icons.face_retouching_natural : Icons.face,
-            color: _facePhotoPath != null 
+            isFaceRegistered ? Icons.face_retouching_natural : Icons.face,
+            color: isFaceRegistered
                 ? (isDark ? Colors.green : Colors.green.shade700)
                 : (isDark ? Colors.white : AppTheme.primaryBlue),
             size: 28,
@@ -1220,24 +988,26 @@ class _AddStudentScreenState extends State<AddStudentScreen> with TickerProvider
               mainAxisSize: MainAxisSize.min,
               children: [
                 Text(
-                  _facePhotoPath == null 
-                      ? '📸 Take Photo' 
-                      : '✅ Photo Captured',
+                  isFaceRegistered
+                      ? '✅ Face Successfully Registered'
+                      : '📸 Capture Face',
                   style: TextStyle(
-                    color: isDark ? Colors.white : AppTheme.textDark,
+                    color: isFaceRegistered
+                        ? (isDark ? Colors.green : Colors.green.shade700)
+                        : (isDark ? Colors.white : AppTheme.textDark),
                     fontSize: 16,
                     fontWeight: FontWeight.w600,
                   ),
                   overflow: TextOverflow.ellipsis,
                   maxLines: 1,
                 ),
-                if (_facePhotoPath == null) ...[
+                if (!isFaceRegistered) ...[
                   const SizedBox(height: 4),
                   Text(
-                    'Take a live photo of the student (not a photo of their photo)',
+                    'Take a live photo of the student\'s face',
                     style: TextStyle(
-                      color: isDark 
-                          ? Colors.white.withValues(alpha: 0.7) 
+                      color: isDark
+                          ? Colors.white.withValues(alpha: 0.7)
                           : AppTheme.textDark.withValues(alpha: 0.7),
                       fontSize: 12,
                     ),
@@ -1247,10 +1017,10 @@ class _AddStudentScreenState extends State<AddStudentScreen> with TickerProvider
                 ] else ...[
                   const SizedBox(height: 4),
                   Text(
-                    'Photo captured. Face recognition will be enabled later.',
+                    'Ready to add student - click "Add Student" below',
                     style: TextStyle(
-                      color: isDark 
-                          ? Colors.green.withValues(alpha: 0.9) 
+                      color: isDark
+                          ? Colors.green.withValues(alpha: 0.9)
                           : Colors.green.shade700,
                       fontSize: 12,
                       fontWeight: FontWeight.w500,
@@ -1262,7 +1032,7 @@ class _AddStudentScreenState extends State<AddStudentScreen> with TickerProvider
               ],
             ),
           ),
-          if (_facePhotoPath == null) ...[
+          if (!isFaceRegistered) ...[
             TextButton(
               onPressed: _isCapturingFace ? null : _captureFacePhoto,
               child: _isCapturingFace
@@ -1275,206 +1045,104 @@ class _AddStudentScreenState extends State<AddStudentScreen> with TickerProvider
                       ),
                     )
                   : Text(
-                      'Capture Face Photo',
+                      'Capture Now',
                       style: TextStyle(
                         color: isDark ? Colors.white : AppTheme.primaryBlue,
                         fontWeight: FontWeight.w600,
                       ),
                     ),
             ),
-          ],
-        ],
-      ),
-    );
-  }
-
-  Widget _buildBatchTimingInfo() {
-    final isDark = Theme.of(context).brightness == Brightness.dark;
-    // Get timing from first selected batch (if any)
-    String timing = 'Not set';
-    if (_selectedBatchIds.isNotEmpty) {
-      final firstBatch = _batches.firstWhere(
-        (b) => b['id'] == _selectedBatchIds.first,
-        orElse: () => {},
-      );
-      timing = firstBatch['timing'] as String? ?? 'Not set';
-    }
-    
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: isDark ? Colors.white.withValues(alpha: 0.05) : Colors.white,
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(
-          color: isDark 
-              ? Colors.white.withValues(alpha: 0.2) 
-              : AppTheme.primaryBlue.withValues(alpha: 0.3),
-        ),
-      ),
-      child: Row(
-        children: [
-          Icon(
-            Icons.access_time,
-            color: isDark 
-                ? Colors.white.withValues(alpha: 0.8) 
-                : AppTheme.primaryBlue,
-            size: 20,
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  'Batch Timing',
-                  style: TextStyle(
-                    color: isDark 
-                        ? Colors.white.withValues(alpha: 0.6) 
-                        : AppTheme.textGray,
-                    fontSize: 12,
-                  ),
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  timing,
-                  style: TextStyle(
-                    color: isDark 
-                        ? Colors.white.withValues(alpha: 0.9) 
-                        : AppTheme.textDark,
-                    fontSize: 14,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildBatchSubjectsInfo() {
-    final isDark = Theme.of(context).brightness == Brightness.dark;
-    // Show selected subjects
-    final subjects = _selectedSubjects;
-    
-    if (subjects.isEmpty) {
-      return const SizedBox.shrink();
-    }
-    
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: isDark ? Colors.white.withValues(alpha: 0.05) : Colors.white,
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(
-          color: isDark 
-              ? Colors.white.withValues(alpha: 0.2) 
-              : AppTheme.primaryBlue.withValues(alpha: 0.3),
-        ),
-      ),
-      child: Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
-          children: [
-            Icon(
-              Icons.book_outlined,
-                color: isDark 
-                    ? Colors.white.withValues(alpha: 0.8) 
-                    : AppTheme.primaryBlue,
-              size: 20,
-            ),
-              const SizedBox(width: 12),
-            Text(
-                'Batch Subjects',
-              style: TextStyle(
-                  color: isDark 
-                      ? Colors.white.withValues(alpha: 0.8) 
-                      : AppTheme.textDark,
-                fontSize: 14,
-                  fontWeight: FontWeight.w600,
+          ] else ...[
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(
+                color: isDark
+                    ? Colors.green.withValues(alpha: 0.2)
+                    : Colors.green.withValues(alpha: 0.1),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: const Icon(
+                Icons.check_circle,
+                color: Colors.green,
+                size: 24,
               ),
             ),
           ],
-        ),
-        const SizedBox(height: 12),
-        Wrap(
-          spacing: 8,
-          runSpacing: 8,
-          children: subjects.map((subject) {
-              return Container(
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                decoration: BoxDecoration(
-                  color: isDark 
-                      ? Colors.white.withValues(alpha: 0.1) 
-                      : AppTheme.primaryBlue.withValues(alpha: 0.1),
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(
-                    color: isDark 
-                        ? Colors.white.withValues(alpha: 0.3) 
-                        : AppTheme.primaryBlue.withValues(alpha: 0.3),
-                  ),
-                ),
-                child: Text(
-                subject,
-                style: TextStyle(
-                    color: isDark 
-                        ? Colors.white.withValues(alpha: 0.9) 
-                        : AppTheme.primaryBlue,
-                  fontSize: 13,
-                    fontWeight: FontWeight.w500,
-                ),
-              ),
-            );
-          }).toList(),
-        ),
         ],
       ),
     );
   }
 
   Widget _buildSubmitButton() {
+    final faceReady = _faceRegistered && _faceEmbedding != null && _facePhotoBytes != null;
+    final isEnabled = !_isLoading && faceReady;
+
     return Container(
       height: 56,
       decoration: BoxDecoration(
-        gradient: const LinearGradient(colors: [Colors.white, Color(0xFFF3F4F6)]),
+        gradient: isEnabled
+            ? const LinearGradient(
+                colors: [Color(0xFF4CAF50), Color(0xFF45a049)],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              )
+            : LinearGradient(
+                colors: [Colors.grey.shade300, Colors.grey.shade400],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              ),
         borderRadius: BorderRadius.circular(14),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withValues(alpha: 0.2),
-            blurRadius: 12,
-            spreadRadius: 2,
-          ),
-        ],
+        boxShadow: isEnabled
+            ? [
+                BoxShadow(
+                  color: const Color(0xFF4CAF50).withValues(alpha: 0.4),
+                  blurRadius: 12,
+                  spreadRadius: 2,
+                ),
+              ]
+            : [
+                BoxShadow(
+                  color: Colors.grey.withValues(alpha: 0.2),
+                  blurRadius: 8,
+                  spreadRadius: 1,
+                ),
+              ],
       ),
       child: ElevatedButton(
-        onPressed: _isLoading ? null : _submit,
+        onPressed: isEnabled ? _submit : null,
         style: ElevatedButton.styleFrom(
           backgroundColor: Colors.transparent,
           shadowColor: Colors.transparent,
           elevation: 0,
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+          disabledBackgroundColor: Colors.transparent,
         ),
         child: _isLoading
             ? const SizedBox(
                 height: 24,
                 width: 24,
-                child: CircularProgressIndicator(color: AppTheme.primaryBlue, strokeWidth: 3),
+                child: CircularProgressIndicator(color: Colors.white, strokeWidth: 3),
               )
             : Row(
                 mainAxisAlignment: MainAxisAlignment.center,
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  const Icon(Icons.person_add, color: AppTheme.primaryBlue, size: 22),
-                  const SizedBox(width: 10),
+                  Icon(
+                    faceReady ? Icons.person_add_alt_1 : Icons.info_outline,
+                    color: faceReady ? Colors.white : Colors.grey.shade600,
+                    size: 24,
+                  ),
+                  const SizedBox(width: 12),
                   Flexible(
                     child: Text(
-                    'Add Student',
-                      style: const TextStyle(
-                      color: AppTheme.primaryBlue,
-                      fontSize: 16,
-                      fontWeight: FontWeight.bold,
+                      faceReady
+                          ? 'Add Student to System'
+                          : 'Complete Face Registration First',
+                      style: TextStyle(
+                        color: faceReady ? Colors.white : Colors.grey.shade600,
+                        fontSize: 16,
+                        fontWeight: FontWeight.w700,
+                        letterSpacing: 0.5,
                       ),
                       overflow: TextOverflow.ellipsis,
                       maxLines: 1,

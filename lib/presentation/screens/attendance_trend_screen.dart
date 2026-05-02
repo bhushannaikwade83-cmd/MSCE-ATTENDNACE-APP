@@ -4,18 +4,17 @@ import 'package:flutter_screenutil/flutter_screenutil.dart';
 import '../../core/app_db.dart';
 import '../../core/supabase_maps.dart';
 import '../../core/utils/responsive.dart';
+import '../../core/utils/responsive_page.dart';
 import '../widgets/attendance_chart_widget.dart';
 import '../../core/theme/app_theme.dart';
 
 /// Attendance Trend Screen - Shows attendance trends and analytics
 class AttendanceTrendScreen extends StatefulWidget {
   final String instituteId;
-  final String? batchId;
 
   const AttendanceTrendScreen({
     super.key,
     required this.instituteId,
-    this.batchId,
   });
 
   @override
@@ -33,7 +32,7 @@ class _AttendanceTrendScreenState extends State<AttendanceTrendScreen> {
       appBar: AppBar(
         title: const Text('Attendance Trend'),
       ),
-      body: SingleChildScrollView(
+      body: ResponsiveScrollBody(
         padding: const EdgeInsets.all(20),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -64,12 +63,12 @@ class _AttendanceTrendScreenState extends State<AttendanceTrendScreen> {
                     ),
                   ),
                   const SizedBox(height: 12),
-                  Row(
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
                     children: [
                       _buildPeriodButton(7, '7 Days'),
-                      const SizedBox(width: 8),
                       _buildPeriodButton(14, '14 Days'),
-                      const SizedBox(width: 8),
                       _buildPeriodButton(30, '30 Days'),
                     ],
                   ),
@@ -80,7 +79,6 @@ class _AttendanceTrendScreenState extends State<AttendanceTrendScreen> {
             // Attendance Chart
             AttendanceChartWidget(
               instituteId: widget.instituteId,
-              batchId: widget.batchId,
               days: _selectedDays,
             ),
             const SizedBox(height: 24),
@@ -96,43 +94,42 @@ class _AttendanceTrendScreenState extends State<AttendanceTrendScreen> {
     final isSelected = _selectedDays == days;
     final isDark = Theme.of(context).brightness == Brightness.dark;
 
-    return Expanded(
-      child: GestureDetector(
-        onTap: () {
-          setState(() {
-            _selectedDays = days;
-          });
-        },
-        child: Container(
-          padding: const EdgeInsets.symmetric(vertical: 12),
-          decoration: BoxDecoration(
+    return GestureDetector(
+      onTap: () {
+        setState(() {
+          _selectedDays = days;
+        });
+      },
+      child: Container(
+        constraints: const BoxConstraints(minWidth: 88),
+        padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 14),
+        decoration: BoxDecoration(
+          color: isSelected
+              ? AppTheme.primaryBlue
+              : isDark
+                  ? Colors.white.withValues(alpha: 0.05)
+                  : Colors.grey.shade100,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(
             color: isSelected
                 ? AppTheme.primaryBlue
                 : isDark
-                    ? Colors.white.withValues(alpha: 0.05)
-                    : Colors.grey.shade100,
-            borderRadius: BorderRadius.circular(12),
-            border: Border.all(
-              color: isSelected
-                  ? AppTheme.primaryBlue
-                  : isDark
-                      ? Colors.white.withValues(alpha: 0.1)
-                      : Colors.grey.shade300,
-              width: isSelected ? 2 : 1,
-            ),
+                    ? Colors.white.withValues(alpha: 0.1)
+                    : Colors.grey.shade300,
+            width: isSelected ? 2 : 1,
           ),
-          child: Text(
-            label,
-            textAlign: TextAlign.center,
-            style: TextStyle(
-              fontSize: 14,
-              fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-              color: isSelected
-                  ? Colors.white
-                  : isDark
-                      ? Colors.white
-                      : AppTheme.textDark,
-            ),
+        ),
+        child: Text(
+          label,
+          textAlign: TextAlign.center,
+          style: TextStyle(
+            fontSize: 14,
+            fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+            color: isSelected
+                ? Colors.white
+                : isDark
+                    ? Colors.white
+                    : AppTheme.textDark,
           ),
         ),
       ),

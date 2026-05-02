@@ -4,15 +4,15 @@
   "portalSecondaryLineDefault": "MSCE Smart Attendance Management System",
   "officialBadge": "OFFICIAL",
   "footerOfficialUse": "OFFICIAL USE ONLY",
-  "footerCredit": "Powered by Digitrix Media",
+  "footerCredit": "Powered by MSCE - Maharashtra State Council of Education",
   "mainNavSubtitleAdmin": "Admin dashboard  |  प्रशासक डॅशबोर्ड",
-  "mainNavSubtitleBatch": "Batch management  |  तुकडी व्यवस्थापन",
+  "mainNavSubtitleInstructor": "Instructor user  |  प्रशिक्षक वापरकर्ता",
   "mainNavSubtitleStudent": "Student records  |  विद्यार्थी नोंदी",
   "mainNavSubtitleGps": "GPS geofence  |  स्थान सीमा सेटिंग्ज",
   "mainNavSubtitleReports": "Attendance reports  |  उपस्थिती अहवाल",
   "splashTitle": "MSCE Attendance",
   "splashSubtitle": "MSCE Smart Attendance Management System",
-  "splashCredit": "Powered by Digitrix Media",
+  "splashCredit": "Powered by MSCE - Maharashtra State Council of Education",
   "splashLoading": "Loading…",
   "languageEnglish": "English",
   "languageMarathi": "मराठी",
@@ -29,8 +29,5 @@
   },
   "chipEncrypted": "Encrypted",
   "chipGovtPortal": "Govt. Portal",
-  "chipSecure": "Secure",
-  "badgeGovtCertified": "Govt. Certified  |  सरकारी प्रमाणित",
-  "badgeSslSecured": "SSL Secured  |  SSL सुरक्षित",
-  "badgeCertInCompliant": "CERT-In Compliant  |  CERT-In अनुपालन"
+  "chipSecure": "Secure"
 }

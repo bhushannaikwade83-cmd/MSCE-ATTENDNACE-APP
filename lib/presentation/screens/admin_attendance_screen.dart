@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui';
 import 'package:flutter/material.dart';
@@ -9,10 +10,11 @@ import 'package:flutter/foundation.dart' show kDebugMode, debugPrint, kIsWeb;
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../../core/app_db.dart';
+import '../../core/attendance_auto_close_policy.dart';
 import '../../core/time_parse.dart';
 import 'package:flutter_screenutil/flutter_screenutil.dart';
 import 'package:image/image.dart' as img;
-import '../../services/batch_service.dart';
+import '../../services/institute_lecture_timing_service.dart';
 import '../../services/storage_service.dart';
 import '../../services/device_fingerprint_service.dart';
 import '../../services/photo_verification_service.dart';
@@ -20,25 +22,47 @@ import '../../services/network_verification_service.dart';
 import '../../services/suspicious_activity_service.dart';
 import '../../services/firestore_retry_service.dart';
 import '../../services/geofence_service.dart';
-// Face recognition enabled - mandatory security
+import '../../services/gps_fence_sample.dart';
+import '../../services/hierarchical_attendance_service.dart';
+import '../../services/stale_attendance_reconciliation_service.dart';
+import '../../services/institute_notification_service.dart';
+// Face recognition enabled - mandatory security (on-device MobileFaceNet)
 import '../../services/face_recognition_service.dart';
-import '../../services/arcface_backend_service.dart';
 import '../../services/liveness_detection_service.dart';
+import '../../services/institute_status_service.dart';
+import '../../services/student_validation_service.dart';
+import '../../services/session_manager.dart';
 import '../../core/theme/app_theme.dart';
+import '../../core/gps_attendance_constants.dart';
+import '../../core/utils/responsive_page.dart';
 import '../../core/utils/professional_messaging.dart';
+import '../../utils/performance_utils.dart';
 import 'help_desk_screen.dart';
+import 'login_screen.dart';
 import '../widgets/secure_network_image.dart';
+import '../widgets/session_monitor.dart';
 // import '../widgets/face_scanner_widget.dart';
 
 class AdminAttendanceScreen extends StatefulWidget {
   static const routeName = '/admin-attendance';
-  const AdminAttendanceScreen({super.key});
+
+  /// When set (e.g. from Student Management), opens attendance with this roll pre-selected.
+  final String? initialRollNumber;
+
+  /// When true, user is `attendance_user`: back button becomes sign-out; GPS uses institute admin fence.
+  final bool restrictToAttendanceOnly;
+
+  const AdminAttendanceScreen({
+    super.key,
+    this.initialRollNumber,
+    this.restrictToAttendanceOnly = false,
+  });
 
   @override
   State<AdminAttendanceScreen> createState() => _AdminAttendanceScreenState();
 }
 
-class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with TickerProviderStateMixin {
+class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with TickerProviderStateMixin, WidgetsBindingObserver {
   SupabaseClient get _db => appDb;
 
   String _teacherAttendanceId(String roll, String date) => '${instituteId}_${roll}_$date';
@@ -51,6 +75,73 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
     if (p is Map<String, dynamic>) return Map<String, dynamic>.from(p);
     if (p is Map) return p.map((k, v) => MapEntry(k.toString(), v));
     return <String, dynamic>{};
+  }
+
+  /// Mirror entry/exit into `attendance_in_out` (student_id = students.id) for reports & Student Photos.
+  Future<void> _syncAttendanceInOut({
+    required String roll,
+    required String date,
+    required String type,
+    required String photoUrl,
+    String? photoPath,
+    String? photoFileId,
+    required String recordedAtUtc,
+    String? subject,
+    String? sessionEntryUtc,
+    String? sessionExitUtc,
+    double? hours,
+    String? status,
+  }) async {
+    if (instituteId == null) return;
+    try {
+      final key = roll.trim();
+      var row = await _db
+          .from('students')
+          .select('id,name,user_id,sr_no')
+          .eq('institute_id', instituteId!)
+          .eq('user_id', key)
+          .maybeSingle();
+      row ??= await _db
+          .from('students')
+          .select('id,name,user_id,sr_no')
+          .eq('institute_id', instituteId!)
+          .eq('sr_no', key)
+          .maybeSingle();
+      if (row == null) {
+        if (kDebugMode) debugPrint('⚠️ attendance_in_out sync: no student row for roll $roll');
+        return;
+      }
+      final sid = row['id'] as String;
+      final name = row['name'] as String? ?? '';
+      final srNo = row['sr_no']?.toString() ?? roll;
+      final subj = subject?.trim();
+      await HierarchicalAttendanceService().saveAttendance(
+        instituteCode: instituteId!,
+        studentId: sid,
+        studentName: name,
+        srNo: srNo,
+        date: date,
+        type: type,
+        photoUrl: photoUrl,
+        photoPath: photoPath,
+        photoFileId: photoFileId,
+        recordedAtUtcIso: recordedAtUtc,
+        additionalData: {
+          'rollNumber': roll,
+          'source': 'admin_attendance',
+          if (subj != null && subj.isNotEmpty) 'subject': subj,
+          if (sessionEntryUtc != null && sessionEntryUtc.trim().isNotEmpty)
+            'entryTime': sessionEntryUtc.trim(),
+          if (sessionExitUtc != null && sessionExitUtc.trim().isNotEmpty)
+            'exitTime': sessionExitUtc.trim(),
+          if (hours != null) 'hours': hours,
+          if (status != null && status.isNotEmpty) 'status': status,
+        },
+      );
+      if (kDebugMode) debugPrint('✅ attendance_in_out: $type for roll $roll (student id $sid)');
+    } catch (e) {
+      if (kDebugMode) debugPrint('⚠️ attendance_in_out sync failed: $e');
+    }
   }
 
   Future<void> _upsertTeacherAttendanceDoc({
@@ -80,14 +171,14 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
 
   DateTime? _asDateTime(dynamic v) => parseAnyTimestamp(v);
   final picker = ImagePicker();
-  final BatchService _batchService = BatchService();
+  final InstituteLectureTimingService _lectureTimingService = InstituteLectureTimingService();
   final GeofenceService _geofenceService = GeofenceService();
 
   String? instituteId;
-  Map<String, dynamic>? selectedBatch;
   String? selectedSubject;
   String? selectedTiming;
   String? selectedRollNumber;
+  String? _selectedStudentYear;
   List<String> studentEnrolledSubjects = []; // Store student's enrolled subjects
   String? selectedLectureNumber; // For multiple lectures (e.g., "Lecture 1", "Lecture 2", "Lecture 3")
   bool isEntryPhoto = true; // true = entry photo, false = exit photo
@@ -100,13 +191,28 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
   String? existingMarkTime;
   Map<String, dynamic>? existingAttendanceData; // Store existing attendance to check entry/exit
 
-  List<Map<String, dynamic>> batches = [];
-  List<String> students = [];
-  List<String> filteredStudents = []; // For search
-  bool isLoadingBatches = false;
+  /// One enrolled subject selected for the current entry/exit pair (non-legacy days).
+  String? activeAttendanceSubject;
+  /// True when today's payload uses top-level entry/exit only (older rows until exit completes).
+  bool _legacyDayAttendance = false;
+
+  static const String _kSubjectSessionsKey = 'subjectSessions';
+
+  /// Server-side search; avoids downloading full institute rosters.
+  static const int _kAttendanceRosterLimit = 400;
+
+  List<String> filteredStudents = []; // Roster rows from `institute_attendance_roll_search`
+  bool isLoadingRoster = false;
   final TextEditingController _searchController = TextEditingController();
-  
+  late Debouncer _searchDebouncer; // Debounce search input to prevent rapid rebuilds
+
   Timer? _autoMarkAbsentTimer; // Timer for periodic auto-mark absent check
+  Timer? _gpsServerSyncTimer; // Re-read gps_settings (e.g. web unlock / re-lock)
+  /// Ticks every second while entry is done and exit pending (session duration UI).
+  Timer? _entrySessionTicker;
+  RealtimeChannel? _studentsRealtimeChannel;
+  RealtimeChannel? _attendanceRealtimeChannel;
+  Timer? _realtimeRefreshDebounce;
 
   late AnimationController _fadeController;
   late Animation<double> _fadeAnimation;
@@ -114,6 +220,11 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+
+    // Initialize debouncer for search with 500ms delay to prevent widget tree corruption
+    _searchDebouncer = Debouncer(delay: const Duration(milliseconds: 500));
+
     _fadeController = AnimationController(
       duration: const Duration(milliseconds: 800),
       vsync: this,
@@ -122,26 +233,78 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
       CurvedAnimation(parent: _fadeController, curve: Curves.easeOut),
     );
     _fadeController.forward();
+    _searchController.addListener(_onRosterSearchChanged);
     _init();
   }
 
   @override
   void dispose() {
     _autoMarkAbsentTimer?.cancel();
+    _gpsServerSyncTimer?.cancel();
+    _entrySessionTicker?.cancel();
+    _realtimeRefreshDebounce?.cancel();
+    if (_studentsRealtimeChannel != null) _db.removeChannel(_studentsRealtimeChannel!);
+    if (_attendanceRealtimeChannel != null) _db.removeChannel(_attendanceRealtimeChannel!);
+    _searchController.removeListener(_onRosterSearchChanged);
+    _searchDebouncer.dispose(); // Dispose debouncer to cleanup timer
+    WidgetsBinding.instance.removeObserver(this);
     _fadeController.dispose();
     _searchController.dispose();
     super.dispose();
   }
 
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && mounted) {
+      _checkLocation(showUserMessages: false);
+    }
+  }
+
+  void _startGpsServerSyncTimer() {
+    _gpsServerSyncTimer?.cancel();
+    _gpsServerSyncTimer = Timer.periodic(const Duration(seconds: 25), (_) {
+      if (!mounted) return;
+      _checkLocation(showUserMessages: false);
+    });
+  }
+
   Future<void> _init() async {
     await _loadInstitute();
-    await _loadBatches();
-    await _loadStudentsForBatch(); // Load all students (flexible attendance)
+    await _loadAttendanceRoster();
     await _checkLocation();
+    final pre = widget.initialRollNumber?.trim();
+    if (pre != null && pre.isNotEmpty) {
+      await _applyPreselectedRoll(pre);
+    }
     // Check for missing exit photos and mark as absent
     _checkAndMarkMissingExits();
     // Schedule periodic check every 15 minutes
     _startAutoMarkAbsentTimer();
+    // Pick up GPS lock changes from web / other devices
+    _startGpsServerSyncTimer();
+    await _subscribeRealtime();
+  }
+
+  /// Same as choosing a roll from the dropdown: subject + today's entry/exit state.
+  Future<void> _applyPreselectedRoll(String roll) async {
+    if (!mounted) return;
+    setState(() {
+      selectedRollNumber = roll;
+      isAlreadyMarked = null;
+      existingMarkTime = null;
+      attendanceMode = null;
+      currentLectureIndex = null;
+      selectedSubject = null;
+      selectedTiming = null;
+      _selectedStudentYear = null;
+      studentEnrolledSubjects = [];
+      activeAttendanceSubject = null;
+      _legacyDayAttendance = false;
+      _searchController.text = roll;
+    });
+    await _loadAttendanceRoster();
+    await _fetchStudentDataForRoll(roll);
+    await _checkAttendanceStatus();
   }
   
   /// Start periodic timer to check and mark absent students after institute hours
@@ -155,126 +318,80 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
     });
   }
 
-  /// Check for students who took entry photo but didn't take exit photo
-  /// Mark them as absent automatically after institute hours complete
+  /// After institute hours we **do not** mark absent for missing exits — presence is hours-based;
+  /// stale sessions are reconciled separately when attendance is loaded/marked.
   Future<void> _checkAndMarkMissingExits() async {
     if (instituteId == null) return;
 
     try {
-      final instituteRow = await _db.from('institutes').select('batch_close_time').eq('id', instituteId!).maybeSingle();
+      final blockMessage =
+          await InstituteStatusService().attendanceBlockMessage(instituteId!);
+      if (blockMessage != null) {
+        if (kDebugMode) debugPrint('Skipping post-close attendance sweep: $blockMessage');
+        return;
+      }
+
+      final instituteRow = await _db.from('institutes').select('lecture_close_time').eq('id', instituteId!).maybeSingle();
       if (instituteRow == null) return;
 
-      final closeTimeRaw = instituteRow['batch_close_time'];
+      final closeTimeRaw = instituteRow['lecture_close_time'];
       Map<String, dynamic>? closeTimeData;
       if (closeTimeRaw is Map<String, dynamic>) {
         closeTimeData = closeTimeRaw;
       } else if (closeTimeRaw is Map) {
         closeTimeData = closeTimeRaw.map((k, v) => MapEntry(k.toString(), v));
       }
-      
+
       if (closeTimeData == null) {
         if (kDebugMode) debugPrint('⚠️ Institute close time not set');
         return;
       }
-      
+
       final closeHour = closeTimeData['hour'] as int? ?? 22;
       final closeMinute = closeTimeData['minute'] as int? ?? 0;
       final closeTime = TimeOfDay(hour: closeHour, minute: closeMinute);
-      
-      // Calculate close time in minutes (add 30 minutes buffer after close time)
+
       final closeMinutes = closeTime.hour * 60 + closeTime.minute;
-      final bufferMinutes = 30; // 30 minutes buffer after institute closes
+      const bufferMinutes = 30;
       final finalCloseTime = closeMinutes + bufferMinutes;
-      
+
       final currentTime = DateTime.now();
       final currentMinutes = currentTime.hour * 60 + currentTime.minute;
-      
-      // Only check if institute hours have passed (current time > close time + buffer)
+
       if (currentMinutes <= finalCloseTime) {
         if (kDebugMode) {
           debugPrint('⏰ Institute hours not complete yet. Close time: ${closeTime.hour}:${closeTime.minute.toString().padLeft(2, '0')} (+30 min buffer)');
         }
         return;
       }
-      
-      final today = DateFormat('yyyy-MM-dd').format(DateTime.now());
-      
-      final rows = await _db.from('teacher_attendance').select().eq('institute_id', instituteId!).eq('date', today);
 
-      int markedCount = 0;
-
-      for (final row in rows) {
-        final data = row['payload'];
-        Map<String, dynamic> map;
-        if (data is Map<String, dynamic>) {
-          map = Map<String, dynamic>.from(data);
-        } else if (data is Map) {
-          map = data.map((k, v) => MapEntry(k.toString(), v));
-        } else {
-          continue;
-        }
-        final hasEntry = map['entryPhoto'] != null || map['entryTime'] != null || map['photoUrl'] != null;
-        final hasExit = map['exitPhoto'] != null || map['exitTime'] != null;
-        final status = map['status'] as String?;
-
-        if (hasEntry && !hasExit && status != 'absent') {
-          map['status'] = 'absent';
-          map['absentReason'] = 'No exit photo - automatically marked absent after institute hours completed';
-          map['markedAbsentAt'] = _encodeSv();
-          map['autoMarkedAfterCloseTime'] = true;
-          map['instituteCloseTime'] =
-              '${closeTime.hour.toString().padLeft(2, '0')}:${closeTime.minute.toString().padLeft(2, '0')}';
-
-          await _db.from('teacher_attendance').update({
-            'payload': map,
-            'status': 'absent',
-            'updated_at': DateTime.now().toUtc().toIso8601String(),
-          }).eq('id', row['id'] as String);
-
-          markedCount++;
-
-          if (kDebugMode) {
-            final rollNumber = map['rollNumber'] ?? 'unknown';
-            debugPrint('⚠️ Auto-marked absent: Roll $rollNumber (no exit photo after institute hours)');
-          }
-        }
-      }
-      
-      if (markedCount > 0 && kDebugMode) {
-        debugPrint('✅ Auto-marked $markedCount students as absent after institute hours completed');
+      if (kDebugMode) {
+        debugPrint('✅ Post-close sweep: skip absent-for-missing-exit (hours-based policy).');
       }
     } catch (e) {
       if (kDebugMode) debugPrint('❌ Error checking missing exits: $e');
     }
   }
 
-  Future<void> _loadBatches() async {
-    if (instituteId == null) return;
-
-    setState(() => isLoadingBatches = true);
-    try {
-      final loadedBatches = await _batchService.getBatches(instituteId!);
-      setState(() {
-        batches = loadedBatches;
-        isLoadingBatches = false;
-      });
-    } catch (e) {
-      setState(() => isLoadingBatches = false);
-      if (kDebugMode) debugPrint('Error loading batches: $e');
-    }
-  }
-
-  /// Fetch student data and auto-populate batch, subject, and timing
-  Future<void> _fetchStudentDataAndSetBatch(String rollNumber) async {
+  /// Load subjects and schedule timing for the selected roll (institute hours / legacy row timing).
+  Future<void> _fetchStudentDataForRoll(String rollNumber) async {
     if (instituteId == null) return;
 
     try {
-      final studentRow = await _db
+      final key = rollNumber.trim();
+      var studentRow = await _db
           .from('students')
           .select()
           .eq('institute_id', instituteId!)
-          .eq('user_id', rollNumber)
+          .eq('user_id', key)
           .maybeSingle();
+      studentRow ??= await _db
+          .from('students')
+          .select()
+          .eq('institute_id', instituteId!)
+          .eq('sr_no', key)
+          .maybeSingle();
+      if (!mounted) return;
 
       if (studentRow == null) {
         if (kDebugMode) debugPrint('⚠️ Student not found: $rollNumber');
@@ -282,114 +399,198 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
       }
 
       final studentData = Map<String, dynamic>.from(studentRow);
-      final studentBatchId = studentData['batchId'] as String? ?? studentData['batch_id'] as String?;
-      final studentBatchIds = studentData['batchIds'] as List<dynamic>? ?? studentData['batch_ids'] as List<dynamic>?;
       final studentSubjects = studentData['subjects'] as List<dynamic>?;
-      final studentBatchTiming = studentData['batchTiming'] as String? ?? studentData['batch_timing'] as String?;
+      final studentStoredSlots =
+          studentData['lectureTiming'] as String? ??
+          studentData['lecture_timing'] as String?;
+      final y = studentData['year']?.toString().trim();
 
-      // Get the first batch ID (primary batch or first from batchIds)
-      final primaryBatchId = studentBatchId ?? (studentBatchIds?.isNotEmpty == true ? studentBatchIds!.first.toString() : null);
-      
-      if (primaryBatchId != null) {
-        // Find the batch in the loaded batches
-        final batch = batches.firstWhere(
-          (b) => b['id'] == primaryBatchId,
-          orElse: () => <String, dynamic>{},
-        );
+      final instituteSlots = await _lectureTimingService.buildLectureTimingString(instituteId!);
+      final timing = (studentStoredSlots != null && studentStoredSlots.trim().isNotEmpty)
+          ? studentStoredSlots.trim()
+          : instituteSlots;
 
-        if (batch.isNotEmpty) {
+      if (studentSubjects != null && studentSubjects.isNotEmpty) {
+        final subs = studentSubjects.map((s) => s.toString()).toList();
+        setState(() {
+          studentEnrolledSubjects = subs;
+          selectedSubject = subs.join(', ');
+          selectedTiming = timing;
+          _selectedStudentYear = (y != null && y.isNotEmpty) ? y : null;
+        });
+        if (kDebugMode) {
+          debugPrint('✅ Loaded student $rollNumber: subjects=$selectedSubject timing=$timing');
+        }
+      } else {
+        final singleSubject = studentData['subject']?.toString().trim();
+        if (singleSubject != null && singleSubject.isNotEmpty) {
           setState(() {
-            selectedBatch = batch;
-            selectedTiming = studentBatchTiming ?? batch['timing']?.toString();
-            
-            // Store student's enrolled subjects (all subjects selected for reference)
-            if (studentSubjects != null && studentSubjects.isNotEmpty) {
-              studentEnrolledSubjects = studentSubjects.map((s) => s.toString()).toList();
-              // Select all subjects (for display/reference only, not used for attendance marking)
-              selectedSubject = studentEnrolledSubjects.join(', '); // All subjects as comma-separated string
-            } else {
-              studentEnrolledSubjects = [];
-              selectedSubject = null;
-              // CRITICAL: Student has 0 subjects - cannot mark attendance
-              if (mounted) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  SnackBar(
-                    content: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      crossAxisAlignment: CrossAxisAlignment.start,
+            studentEnrolledSubjects = [singleSubject];
+            selectedSubject = singleSubject;
+            selectedTiming = timing;
+            _selectedStudentYear = (y != null && y.isNotEmpty) ? y : null;
+          });
+          if (kDebugMode) {
+            debugPrint('✅ Loaded student $rollNumber: subject column=$singleSubject timing=$timing');
+          }
+        } else {
+          setState(() {
+            studentEnrolledSubjects = [];
+            selectedSubject = null;
+            selectedTiming = timing;
+            _selectedStudentYear = (y != null && y.isNotEmpty) ? y : null;
+          });
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Row(
                       children: [
-                        const Row(
-                          children: [
-                            Icon(Icons.warning_amber_rounded, color: Colors.white),
-                            SizedBox(width: 8),
-                            Expanded(
-                              child: Text(
-                                '⚠️ Cannot Mark Attendance',
-                                style: TextStyle(
-                                  fontWeight: FontWeight.bold,
-                                  fontSize: 16,
-                                ),
-                              ),
+                        Icon(Icons.warning_amber_rounded, color: Colors.white),
+                        SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            '⚠️ Cannot Mark Attendance',
+                            style: TextStyle(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 16,
                             ),
-                          ],
-                        ),
-                        const SizedBox(height: 8),
-                        Text(
-                          'Student with roll number $rollNumber has 0 subjects assigned.\n\n'
-                          'Attendance can only be marked for students with at least 1 subject.\n\n'
-                          'Please assign subjects to this student first in Batch Management.',
-                          style: const TextStyle(fontSize: 13),
+                          ),
                         ),
                       ],
                     ),
-                    backgroundColor: Colors.orange,
-                    duration: const Duration(seconds: 8),
-                  ),
-                );
-              }
-            }
-          });
-          
-          if (kDebugMode) {
-            debugPrint('✅ Auto-populated batch for roll $rollNumber: ${batch['name']}');
-            debugPrint('   Subject: $selectedSubject');
-            debugPrint('   Timing: $selectedTiming');
+                    const SizedBox(height: 8),
+                    Text(
+                      'Student with roll number $rollNumber has no subjects assigned.\n\n'
+                      'Add subjects for this student in Student Management → Edit.',
+                      style: const TextStyle(fontSize: 13),
+                    ),
+                  ],
+                ),
+                backgroundColor: Colors.orange,
+                duration: const Duration(seconds: 8),
+              ),
+            );
           }
-        } else {
-          if (kDebugMode) debugPrint('⚠️ Batch not found in loaded batches: $primaryBatchId');
         }
-      } else {
-        if (kDebugMode) debugPrint('⚠️ Student has no batch assigned: $rollNumber');
       }
     } catch (e) {
       if (kDebugMode) debugPrint('❌ Error fetching student data: $e');
     }
   }
 
-  Future<void> _loadStudentsForBatch() async {
-    // Flexible attendance: Load ALL students from institute, not just from selected batch
+  void _onRosterSearchChanged() {
+    if (!mounted) return;
+    setState(() {});
+    _searchDebouncer(() {
+      if (mounted) _loadAttendanceRoster();
+    });
+  }
+
+  int _compareRollIds(String a, String b) {
+    final na = int.tryParse(a);
+    final nb = int.tryParse(b);
+    if (na != null && nb != null) return na.compareTo(nb);
+    if (na != null) return -1;
+    if (nb != null) return 1;
+    return a.compareTo(b);
+  }
+
+  Future<void> _loadAttendanceRoster() async {
     if (instituteId == null) return;
 
-    setState(() => isLoadingBatches = true);
+    setState(() => isLoadingRoster = true);
     try {
-      final rows = await _db.from('students').select('user_id').eq('institute_id', instituteId!);
+      final q = _searchController.text.trim();
+      final raw = await _db.rpc(
+        'institute_attendance_roll_search',
+        params: {
+          'p_institute_id': instituteId!,
+          'p_search': q,
+          'p_limit': _kAttendanceRosterLimit,
+        },
+      );
+      if (!mounted) return;
+
+      final rolls = <String>[];
+      if (raw is List) {
+        for (final e in raw) {
+          if (e is Map) {
+            final r = e['roll']?.toString().trim() ?? '';
+            if (r.isNotEmpty) rolls.add(r);
+          }
+        }
+      }
+
+      final sel = selectedRollNumber?.trim();
+      if (sel != null && sel.isNotEmpty && !rolls.contains(sel)) {
+        rolls.add(sel);
+      }
+      rolls.sort(_compareRollIds);
 
       setState(() {
-        students = rows
-            .map((r) => r['user_id'] as String? ?? '')
-            .where((roll) => roll.isNotEmpty)
-            .toSet()
-            .toList()
-          ..sort();
-        filteredStudents = students; // Initialize filtered list
-        isLoadingBatches = false;
+        filteredStudents = rolls;
+        isLoadingRoster = false;
         isLoading = false;
       });
-      
-      // Initialize search
-      _searchController.addListener(_filterStudents);
     } catch (e) {
-      setState(() => isLoading = false);
+      if (kDebugMode) debugPrint('institute_attendance_roll_search failed, legacy roster load: $e');
+      await _loadAttendanceRosterLegacy();
+    }
+  }
+
+  /// If RPC is missing (migration not applied), cap rows transferred to the client.
+  Future<void> _loadAttendanceRosterLegacy() async {
+    if (instituteId == null) return;
+    try {
+      final rows = await _db
+          .from('students')
+          .select('user_id,sr_no')
+          .eq('institute_id', instituteId!)
+          .limit(8000);
+      if (!mounted) return;
+
+      final rollSet = <String>{};
+      for (final r in rows) {
+        final u = (r['user_id'] as String?)?.trim() ?? '';
+        final s = (r['sr_no'] as String?)?.trim() ?? '';
+        if (u.isNotEmpty) rollSet.add(u);
+        if (s.isNotEmpty) rollSet.add(s);
+      }
+
+      final q = _searchController.text.trim().toLowerCase();
+      var list = rollSet.toList();
+      if (q.isNotEmpty) {
+        list = list.where((roll) => roll.toLowerCase().contains(q)).toList();
+      }
+      list.sort(_compareRollIds);
+      if (list.length > _kAttendanceRosterLimit) {
+        list = list.sublist(0, _kAttendanceRosterLimit);
+      }
+
+      final sel = selectedRollNumber?.trim();
+      if (sel != null && sel.isNotEmpty && !list.contains(sel)) {
+        list = [sel, ...list];
+        if (list.length > _kAttendanceRosterLimit) {
+          list = list.sublist(0, _kAttendanceRosterLimit);
+        }
+      }
+
+      setState(() {
+        filteredStudents = list;
+        isLoadingRoster = false;
+        isLoading = false;
+      });
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          isLoadingRoster = false;
+          isLoading = false;
+        });
+      }
       if (kDebugMode) debugPrint('Error loading students: $e');
     }
   }
@@ -403,6 +604,7 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
 
       try {
         final profile = await _db.from('profiles').select('institute_id').eq('id', user.id).maybeSingle();
+        if (!mounted) return;
         final instId = profile?['institute_id'] as String?;
         if (instId != null && instId.isNotEmpty) {
           setState(() {
@@ -415,6 +617,7 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
       }
       try {
         final institutes = await _db.from('institutes').select('id').limit(1);
+        if (!mounted) return;
         if (institutes.isNotEmpty) {
           setState(() {
             instituteId = institutes.first['id'] as String?;
@@ -429,9 +632,100 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
     }
   }
 
+  /// Fence in [gps_settings] — staff uses the institute’s locked attendance row (same as admin’s configured point).
+  Future<String?> _gpsSettingsAdminId() async {
+    final uid = _db.auth.currentUser?.id;
+    if (uid == null || instituteId == null || instituteId!.isEmpty) return uid;
+    try {
+      final me = await _db.from('profiles').select('role').eq('id', uid).maybeSingle();
+      if ((me?['role'] as String?) != 'attendance_user') return uid;
+
+      final fenceAdmin = await _geofenceService.lockedFenceAdminIdForInstitute(instituteId!);
+      if (fenceAdmin != null && fenceAdmin.isNotEmpty) return fenceAdmin;
+
+      final adminRow = await _db
+          .from('profiles')
+          .select('id')
+          .eq('institute_id', instituteId!)
+          .eq('role', 'admin')
+          .limit(1)
+          .maybeSingle();
+      return (adminRow?['id'] as String?) ?? uid;
+    } catch (_) {
+      return uid;
+    }
+  }
+
+  Future<void> _subscribeRealtime() async {
+    if (instituteId == null || instituteId!.isEmpty) return;
+
+    if (_studentsRealtimeChannel != null) {
+      await _db.removeChannel(_studentsRealtimeChannel!);
+      _studentsRealtimeChannel = null;
+    }
+    if (_attendanceRealtimeChannel != null) {
+      await _db.removeChannel(_attendanceRealtimeChannel!);
+      _attendanceRealtimeChannel = null;
+    }
+
+    void scheduleRefresh({bool attendanceOnly = false}) {
+      _realtimeRefreshDebounce?.cancel();
+      _realtimeRefreshDebounce = Timer(const Duration(milliseconds: 600), () async {
+        if (!mounted || instituteId == null) return;
+        if (!attendanceOnly) {
+          await _loadAttendanceRoster();
+        }
+        if (selectedRollNumber != null && selectedRollNumber!.trim().isNotEmpty) {
+          await _fetchStudentDataForRoll(selectedRollNumber!);
+          await _checkAttendanceStatus();
+        }
+      });
+    }
+
+    _studentsRealtimeChannel = _db
+        .channel('admin-attendance-students-$instituteId')
+        .onPostgresChanges(
+          event: PostgresChangeEvent.all,
+          schema: 'public',
+          table: 'students',
+          filter: PostgresChangeFilter(
+            type: PostgresChangeFilterType.eq,
+            column: 'institute_id',
+            value: instituteId!,
+          ),
+          callback: (_) {
+            if (kDebugMode) {
+              debugPrint('🔄 Admin attendance realtime student update for institute $instituteId');
+            }
+            scheduleRefresh();
+          },
+        )
+        .subscribe();
+
+    _attendanceRealtimeChannel = _db
+        .channel('admin-attendance-marks-$instituteId')
+        .onPostgresChanges(
+          event: PostgresChangeEvent.all,
+          schema: 'public',
+          table: 'teacher_attendance',
+          filter: PostgresChangeFilter(
+            type: PostgresChangeFilterType.eq,
+            column: 'institute_id',
+            value: instituteId!,
+          ),
+          callback: (_) {
+            if (kDebugMode) {
+              debugPrint('🔄 Admin attendance realtime mark update for institute $instituteId');
+            }
+            scheduleRefresh(attendanceOnly: true);
+          },
+        )
+        .subscribe();
+  }
+
   /* ---------------- LOCATION ---------------- */
 
-  Future<void> _checkLocation() async {
+  Future<void> _checkLocation({bool showUserMessages = true}) async {
     try {
       LocationPermission p = await Geolocator.checkPermission();
       if (p == LocationPermission.denied) {
@@ -441,28 +735,27 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
           p == LocationPermission.deniedForever) {
         isLocationValid = false;
       } else {
-        // First check location lock status
-        await _checkLocationLockStatus();
-        // Then check if within GPS radius (strict 30m check)
-        final withinRadius = await _checkGPSRadius();
+        await _checkLocationLockStatus(showUserMessages: showUserMessages);
+        final withinRadius = await _checkGPSRadius(showUserMessages: showUserMessages);
         isLocationValid = withinRadius;
       }
     } catch (_) {
       isLocationValid = false;
     }
-    setState(() {});
+    if (mounted) setState(() {});
   }
 
   /// Check location lock status and show appropriate messages
-  Future<void> _checkLocationLockStatus() async {
+  Future<void> _checkLocationLockStatus({bool showUserMessages = true}) async {
     if (instituteId == null || instituteId!.isEmpty) return;
     final currentUser = _db.auth.currentUser;
     if (currentUser == null) return;
 
     try {
+      final gpsUid = await _gpsSettingsAdminId();
       final locationStatus = await _geofenceService.checkAdminLocationStatus(
         instituteId: instituteId!,
-        adminId: currentUser.id,
+        adminId: gpsUid ?? currentUser.id,
       );
 
       final isLocked = locationStatus['isLocked'] as bool;
@@ -470,15 +763,16 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
       final isWithinRadius = locationStatus['isWithinRadius'] as bool?;
       final distance = locationStatus['distance'] as double?;
 
-      // Check radius status (30m is ALWAYS enforced, regardless of lock status)
+      // Check radius status (15 m is enforced from the locked point, regardless of lock label in messages)
       if (hasLocation && isWithinRadius != null) {
+        final rLabel = kAttendanceFenceRadiusMeters.toStringAsFixed(0);
         if (isWithinRadius == false && distance != null) {
-          // Admin is OUT OF RADIUS (more than 30m away) - cannot mark attendance
-          if (mounted) {
+          // Admin is OUT OF RADIUS — cannot mark attendance
+          if (showUserMessages && mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(
                 content: Text(
-                  '❌ Out of radius: You are ${distance.toStringAsFixed(0)}m away. Attendance can only be marked within 30m of the institute.',
+                  '❌ Out of radius: You are ${distance.toStringAsFixed(0)}m away. Attendance can only be marked within ${rLabel}m of the locked point.',
                 ),
                 backgroundColor: Colors.red,
                 duration: const Duration(seconds: 6),
@@ -486,24 +780,23 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
             );
           }
         } else if (isWithinRadius == true) {
-          // Admin is WITHIN 30m radius - can mark attendance
-          if (mounted) {
+          if (showUserMessages && mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(
                 content: Text(
-                  isLocked 
-                      ? '✅ Location is locked - You are within 30m radius. You can mark attendance.'
-                      : '✅ Location is unlocked - You are within 30m radius. You can mark attendance.',
+                  isLocked
+                      ? '✅ Location is locked — you are within ${rLabel}m. You can mark attendance.'
+                      : '⚠️ Save and lock your location in GPS Settings before marking attendance (you are within ${rLabel}m).',
                 ),
-                backgroundColor: Colors.green,
-                duration: const Duration(seconds: 3),
+                backgroundColor: isLocked ? Colors.green : Colors.orange,
+                duration: const Duration(seconds: 4),
               ),
             );
           }
         }
       } else if (!isLocked && hasLocation && isWithinRadius == null) {
         // Location is unlocked but unable to verify radius
-        if (mounted) {
+        if (showUserMessages && mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
               content: Text('🔓 Location is unlocked. Unable to verify your distance from institute.'),
@@ -519,11 +812,25 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
     }
   }
 
-  /// STRICT GPS RADIUS CHECK - Must be within 30m, no buffer
+  /// GPS radius check: fixed fence + accuracy buffer, with multiple samples (indoor drift).
   /// Uses admin's own GPS settings (cross-device locking)
-  Future<bool> _checkGPSRadius() async {
+  Future<bool> _checkGPSRadius({bool showUserMessages = true}) async {
     if (kIsWeb) return true; // Web bypass for testing
-    
+
+    // ✅ DEBUG MODE BYPASS: Allow testing from any location in debug mode
+    if (kDebugMode) {
+      if (showUserMessages && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('🔧 DEBUG MODE: GPS check bypassed. You can test from any location.'),
+            backgroundColor: Colors.blue,
+            duration: Duration(seconds: 3),
+          ),
+        );
+      }
+      return true;
+    }
+
     if (instituteId == null || instituteId!.isEmpty) {
       return false;
     }
@@ -533,16 +840,21 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
       return false;
     }
 
+    final gpsAdminId = await _gpsSettingsAdminId();
+    if (gpsAdminId == null) {
+      return false;
+    }
+
     try {
       final configRow = await _db
           .from('gps_settings')
           .select()
           .eq('institute_id', instituteId!)
-          .eq('admin_id', currentUser.id)
+          .eq('admin_id', gpsAdminId)
           .maybeSingle();
 
       if (configRow == null) {
-        if (mounted) {
+        if (showUserMessages && mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
               content: Text('❌ Location not verified. Please go to GPS Settings and verify your location first.'),
@@ -558,14 +870,11 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
       final latitude = (data['latitude'] as num?)?.toDouble();
       final longitude = (data['longitude'] as num?)?.toDouble();
       final isLocked = data['is_locked'] == true;
-      
-      // RADIUS IS ALWAYS FIXED AT 30M - NEVER CHANGES, EVEN IF UNLOCKED
-      // This is a system-wide constant, not stored in database
-      const double radius = 30.0; // Fixed 30m for all admins, always
 
-      // Validate locked location exists
+      final double radius = kAttendanceFenceRadiusMeters;
+
       if (latitude == null || longitude == null || latitude == 0.0 || longitude == 0.0) {
-        if (mounted) {
+        if (showUserMessages && mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
               content: Text('❌ Location not verified. Please go to GPS Settings and verify your location first.'),
@@ -577,14 +886,12 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
         return false;
       }
 
-      // If location is not locked yet, it means it hasn't been verified
-      // Location should be locked after first verification
       if (!isLocked) {
-        if (mounted) {
+        if (showUserMessages && mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
-              content: Text('⚠️ Location not locked. Please verify location in GPS Settings first.'),
-              backgroundColor: Colors.orange,
+              content: Text('❌ Lock your location in GPS Settings before marking attendance.'),
+              backgroundColor: Colors.red,
               duration: Duration(seconds: 5),
             ),
           );
@@ -592,17 +899,14 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
         return false;
       }
 
-      // Get current position with best accuracy
-      final position = await Geolocator.getCurrentPosition(
-        locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.best, // Use best accuracy for precise location
-          timeLimit: Duration(seconds: 10), // Timeout after 10 seconds
-        ),
+      final sample = await samplePositionAgainstFence(
+        fenceLat: latitude,
+        fenceLng: longitude,
+        radiusMeters: radius,
       );
 
-      // Block fake GPS
-      if (position.isMocked) {
-        if (mounted) {
+      if (sample.mockedDetected) {
+        if (showUserMessages && mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
               content: Text('❌ Fake GPS detected. Please turn off Mock Location apps.'),
@@ -613,36 +917,32 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
         return false;
       }
 
-      // Calculate distance from locked location
-      final distance = Geolocator.distanceBetween(
-        position.latitude,
-        position.longitude,
-        latitude,
-        longitude,
-      );
-
-      // Account for GPS accuracy - add buffer if GPS accuracy is poor
-      // If GPS accuracy is 20m, allow 30m + 20m = 50m total
-      final gpsAccuracy = position.accuracy;
-      final effectiveRadius = radius + (gpsAccuracy > 0 ? gpsAccuracy : 0);
-      
-      // Debug: Log location check
-      if (kDebugMode) {
-        debugPrint('📍 Location Check (Admin: ${currentUser.id}):');
-        debugPrint('   Locked Location: Lat=$latitude, Lng=$longitude');
-        debugPrint('   Current Location: Lat=${position.latitude}, Lng=${position.longitude}');
-        debugPrint('   Distance: ${distance.toStringAsFixed(2)}m');
-        debugPrint('   Required: Within ${radius.toStringAsFixed(0)}m (base)');
-        debugPrint('   GPS Accuracy: ${gpsAccuracy.toStringAsFixed(1)}m');
-        debugPrint('   Effective Radius: ${effectiveRadius.toStringAsFixed(1)}m (${radius.toStringAsFixed(0)}m + ${gpsAccuracy.toStringAsFixed(1)}m accuracy buffer)');
-        debugPrint('   Status: ${distance <= effectiveRadius ? "✅ WITHIN RADIUS" : "❌ OUT OF RADIUS"}');
+      if (sample.errorMessage != null) {
+        if (showUserMessages && mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(sample.errorMessage!),
+              backgroundColor: Colors.orange,
+              duration: const Duration(seconds: 8),
+            ),
+          );
+        }
+        return false;
       }
 
-      // CHECK: Must be within effective radius (30m + GPS accuracy buffer)
-      // This accounts for GPS inaccuracy - if GPS says you're 35m away but accuracy is 10m,
-      // you might actually be within 30m
-      if (distance > effectiveRadius) {
-        if (mounted) {
+      final distance = sample.bestDistanceMeters;
+      final gpsAccuracy = sample.accuracyUsedForMessage;
+      final effectiveRadius = radius + (gpsAccuracy > 0 ? gpsAccuracy.clamp(12.0, 100.0) : 12.0);
+
+      if (kDebugMode) {
+        debugPrint('📍 Location Check (Admin: ${currentUser.id}, multi-sample):');
+        debugPrint('   Locked: Lat=$latitude, Lng=$longitude');
+        debugPrint('   Best distance: ${distance.toStringAsFixed(1)}m');
+        debugPrint('   Within fence: ${sample.isWithinFence}');
+      }
+
+      if (!sample.isWithinFence) {
+        if (showUserMessages && mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
               content: Column(
@@ -650,51 +950,42 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    '❌ Out of radius: You are ${distance.toStringAsFixed(0)}m away',
+                    '❌ Out of radius: closest reading ~${distance.toStringAsFixed(0)}m (several GPS samples)',
                     style: const TextStyle(fontWeight: FontWeight.bold),
                   ),
                   const SizedBox(height: 4),
                   Text(
-                    'Required: Within ${radius.toStringAsFixed(0)}m of the locked location.\n'
-                    'GPS Accuracy: ${gpsAccuracy.toStringAsFixed(1)}m\n'
-                    'Effective Radius: ${effectiveRadius.toStringAsFixed(1)}m\n\n'
-                    'Locked Location: ${latitude.toStringAsFixed(6)}, ${longitude.toStringAsFixed(6)}\n'
-                    'Your Location: ${position.latitude.toStringAsFixed(6)}, ${position.longitude.toStringAsFixed(6)}\n\n'
-                    '💡 If you are at the correct location:\n'
-                    '• The stored coordinates may be incorrect\n'
-                    '• GPS accuracy may be poor (try moving to open area)\n'
-                    '• Please update location in GPS Settings',
+                    'Indoor GPS often jumps; we already tried multiple readings.\n'
+                    'Target: about ${radius.toStringAsFixed(0)}m + accuracy (up to ~${(radius + 100).toStringAsFixed(0)}m when signal is weak).\n\n'
+                    '💡 Try: window/open area, wait a few seconds, or re-save the lock point in GPS Settings if it was set incorrectly.\n'
+                    'Locked: ${latitude.toStringAsFixed(6)}, ${longitude.toStringAsFixed(6)}',
                     style: const TextStyle(fontSize: 12),
                   ),
                 ],
               ),
               backgroundColor: Colors.red,
-              duration: const Duration(seconds: 12),
+              duration: const Duration(seconds: 14),
             ),
           );
         }
         return false;
       }
-      
-      // If within base radius (30m), allow immediately
+
       if (distance <= radius) {
         if (kDebugMode) {
           debugPrint('✅ Within base radius (${radius.toStringAsFixed(0)}m) - Attendance allowed');
         }
         return true;
       }
-      
-      // If between base radius and effective radius, warn but allow
-      // (This accounts for GPS inaccuracy)
+
       if (kDebugMode) {
-        debugPrint('⚠️ Within effective radius (${effectiveRadius.toStringAsFixed(1)}m) but outside base radius (${radius.toStringAsFixed(0)}m)');
-        debugPrint('   Allowing due to GPS accuracy buffer');
+        debugPrint(
+          '⚠️ Allowed within effective radius (~${effectiveRadius.toStringAsFixed(0)}m) using accuracy buffer',
+        );
       }
       return true;
-
-      return true;
     } catch (e) {
-      if (mounted) {
+      if (showUserMessages && mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text('❌ GPS check failed: ${e.toString()}'),
@@ -706,27 +997,506 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
     }
   }
 
+  /// Checks if student has a profile photo in database (registration completion check)
+  /// Prevents marking attendance for students who haven't finished registration
+  Future<bool> _checkStudentProfilePhoto(String rollNumber) async {
+    if (instituteId == null) return false;
+
+    try {
+      final roll = rollNumber.trim();
+
+      // First try matching by user_id (roll number)
+      var studentRow = await _db
+          .from('students')
+          .select('id,face_photo_url,face_embedding')
+          .eq('institute_id', instituteId!)
+          .eq('user_id', roll)
+          .maybeSingle();
+
+      // If not found, try matching by sr_no (serial number)
+      if (studentRow == null) {
+        studentRow = await _db
+            .from('students')
+            .select('id,face_photo_url,face_embedding')
+            .eq('institute_id', instituteId!)
+            .eq('sr_no', roll)
+            .maybeSingle();
+      }
+
+      if (studentRow == null) {
+        return false;  // Student not found
+      }
+
+      final photoUrl = studentRow['face_photo_url'] as String?;
+      final faceEmbedding = studentRow['face_embedding'];
+
+      // Check if BOTH photo AND face embedding exist (indicates completed registration)
+      if ((photoUrl != null && photoUrl.isNotEmpty) && faceEmbedding != null) {
+        if (kDebugMode) {
+          debugPrint('✅ Student has profile photo and face embedding - registration complete');
+        }
+        return true;  // Has both photo and embedding = registration complete
+      }
+
+      if (kDebugMode) {
+        debugPrint('❌ Student profile incomplete - missing photo: ${photoUrl?.isEmpty ?? true}, missing embedding: ${faceEmbedding == null}');
+      }
+      return false;  // Missing photo or embedding = registration incomplete
+    } catch (e) {
+      if (kDebugMode) {
+        debugPrint('❌ Error checking student profile photo: $e');
+      }
+      return false;
+    }
+  }
+
+  /// Validates that the selected student exists in the database
+  /// Prevents marking attendance for non-existent or invalid students
+  Future<bool> _validateStudentExists(String rollNumber) async {
+    if (instituteId == null) return false;
+
+    try {
+      final roll = rollNumber.trim();
+
+      // First try matching by user_id (roll number)
+      var studentRow = await _db
+          .from('students')
+          .select('id,user_id,sr_no,name')
+          .eq('institute_id', instituteId!)
+          .eq('user_id', roll)
+          .maybeSingle();
+
+      // If not found, try matching by sr_no (serial number)
+      if (studentRow == null) {
+        studentRow = await _db
+            .from('students')
+            .select('id,user_id,sr_no,name')
+            .eq('institute_id', instituteId!)
+            .eq('sr_no', roll)
+            .maybeSingle();
+      }
+
+      if (studentRow != null) {
+        if (kDebugMode) {
+          debugPrint('✅ Student validated: ${studentRow['name']} (${studentRow['user_id'] ?? studentRow['sr_no']})');
+        }
+        return true;
+      }
+
+      if (kDebugMode) {
+        debugPrint('❌ Student not found in database: $roll');
+      }
+      return false;
+    } catch (e) {
+      if (kDebugMode) {
+        debugPrint('❌ Student validation error: $e');
+      }
+      return false;
+    }
+  }
+
+  /// Compares the captured attendance photo with the student's face embedding
+  /// Uses SAME face verification logic as student registration
+  /// Returns {isMatch: bool, reason: String?, confidence: double?}
+  Future<Map<String, dynamic>> _compareStudentPhoto(String rollNumber, String capturedPhotoPath) async {
+    if (instituteId == null) {
+      return {'isMatch': false, 'reason': 'Institute ID not found'};
+    }
+
+    try {
+      final roll = rollNumber.trim();
+
+      final workPath = await FaceRecognitionService.ensureNormalizedJpegForFacePipeline(capturedPhotoPath);
+      String? tempToDelete;
+      if (workPath != capturedPhotoPath) {
+        tempToDelete = workPath;
+      }
+
+      // Step 1: Extract face features from captured photo (same as registration)
+      final capturedFeatures = await FaceRecognitionService.extractFaceFeatures(workPath);
+      if (!mounted) {
+        if (tempToDelete != null) {
+          try {
+            await File(tempToDelete).delete();
+          } catch (_) {}
+        }
+        return {'isMatch': false, 'reason': 'Could not extract face features'};
+      }
+      if (capturedFeatures == null) {
+        final reason = await FaceRecognitionService.getDiagnosticReasonForInvalidFace(workPath) ??
+            'Face not accepted. Check lighting, one clear face, and look at the camera.';
+        if (tempToDelete != null) {
+          try {
+            await File(tempToDelete).delete();
+          } catch (_) {}
+        }
+        return {'isMatch': false, 'reason': reason};
+      }
+
+      // Step 2: Extract neural embedding from captured photo
+      final capturedEmbedding = await FaceRecognitionService.extractNeuralEmbedding(
+        workPath,
+        capturedFeatures,
+      );
+      if (tempToDelete != null) {
+        try {
+          await File(tempToDelete).delete();
+        } catch (_) {}
+        tempToDelete = null;
+      }
+      if (!mounted) return {'isMatch': false, 'reason': 'Could not extract face embedding'};
+      if (capturedEmbedding == null) {
+        return {
+          'isMatch': false,
+          'reason': 'Neural face read failed. Try a clearer, closer photo with the face well lit.',
+        };
+      }
+
+      // Step 3: Get student's stored face embedding from database
+      var studentRow = await _db
+          .from('students')
+          .select('id,user_id,sr_no,name,face_embedding')
+          .eq('institute_id', instituteId!)
+          .eq('user_id', roll)
+          .maybeSingle();
+
+      if (studentRow == null) {
+        studentRow = await _db
+            .from('students')
+            .select('id,user_id,sr_no,name,face_embedding')
+            .eq('institute_id', instituteId!)
+            .eq('sr_no', roll)
+            .maybeSingle();
+      }
+
+      if (studentRow == null) {
+        return {'isMatch': false, 'reason': 'Student profile not found'};
+      }
+
+      final studentName = studentRow['name'] as String? ?? 'Unknown';
+      final faceTemplate = studentRow['face_embedding'];
+
+      if (kDebugMode) {
+        debugPrint('🔍 Verifying attendance for $studentName (Roll: $roll)');
+      }
+
+      // If student has no face embedding from registration, can't verify
+      if (faceTemplate == null) {
+        if (kDebugMode) {
+          debugPrint('⚠️ Student $studentName has no face embedding. Student may not have completed registration.');
+        }
+        return {
+          'isMatch': false,
+          'reason': 'Student registration incomplete (missing face data). Please contact administrator.'
+        };
+      }
+
+      // Step 4: Extract stored embedding from face template map
+      final storedEmbedding = (faceTemplate is Map ? faceTemplate['embedding'] : faceTemplate) as List<dynamic>?;
+      if (storedEmbedding == null) {
+        return {
+          'isMatch': false,
+          'reason': 'Stored face embedding is invalid. Please contact administrator.'
+        };
+      }
+
+      // Convert to List<double>
+      final storedEmbeddingList = List<double>.from(storedEmbedding.map((x) => (x as num).toDouble()));
+
+      // Step 5: Compare embeddings using cosine similarity
+      final similarity = FaceRecognitionService.calculateCosineSimilarity(
+        capturedEmbedding,
+        storedEmbeddingList,
+      );
+
+      if (kDebugMode) {
+        debugPrint('🔍 Face match for $studentName:');
+        debugPrint('   Similarity score: ${(similarity * 100).toStringAsFixed(1)}%');
+      }
+
+      // Use same thresholds as student registration
+      if (similarity >= 0.70) {
+        // High confidence match (70%+)
+        return {
+          'isMatch': true,
+          'confidence': similarity,
+          'reason': 'Face verified successfully'
+        };
+      } else if (similarity >= 0.60) {
+        // Medium-high confidence - allow but log
+        if (kDebugMode) {
+          debugPrint('⚠️ Medium confidence face match (${(similarity * 100).toStringAsFixed(1)}%)');
+        }
+        return {
+          'isMatch': true,
+          'confidence': similarity,
+          'reason': 'Face match (${(similarity * 100).toStringAsFixed(0)}% similarity)'
+        };
+      } else {
+        // Low confidence - reject
+        return {
+          'isMatch': false,
+          'confidence': similarity,
+          'reason': 'Face does not match student profile (${(similarity * 100).toStringAsFixed(0)}% similarity)'
+        };
+      }
+    } catch (e) {
+      if (kDebugMode) {
+        debugPrint('❌ Student photo comparison error: $e');
+      }
+      return {'isMatch': false, 'reason': 'Photo verification failed: ${e.toString()}'};
+    }
+  }
+
+  Map<String, Map<String, dynamic>> _mapSubjectSessions(Map<String, dynamic>? payload) {
+    final out = <String, Map<String, dynamic>>{};
+    if (payload == null) return out;
+    final raw = payload[_kSubjectSessionsKey];
+    if (raw is! Map) return out;
+    for (final e in raw.entries) {
+      final v = e.value;
+      if (v is Map) {
+        out[e.key.toString()] =
+            Map<String, dynamic>.from(v.map((k, val) => MapEntry(k.toString(), val)));
+      }
+    }
+    return out;
+  }
+
+  Map<String, dynamic> _sessionForSubject(Map<String, Map<String, dynamic>> sessions, String subject) {
+    return Map<String, dynamic>.from(sessions[subject] ?? {});
+  }
+
+  /// [subjectSessions] keys may differ from enrollment by whitespace-only mismatch.
+  String? _subjectSessionsMapKey(Map<String, Map<String, dynamic>> sessions, String label) {
+    if (sessions.containsKey(label)) return label;
+    final t = label.trim();
+    for (final k in sessions.keys) {
+      if (k.toString().trim() == t) return k.toString();
+    }
+    return null;
+  }
+
+  /// Which subject slice to show for thumbnails, timers (non-legacy).
+  String? _displaySubjectSliceForSessions() {
+    if (_legacyDayAttendance || studentEnrolledSubjects.isEmpty) return null;
+    final payload = existingAttendanceData;
+    if (payload == null) return null;
+    final sessions = _mapSubjectSessions(payload);
+    if (sessions.isEmpty) return null;
+
+    final active = activeAttendanceSubject?.trim();
+    if (active != null && active.isNotEmpty) {
+      final k = _subjectSessionsMapKey(sessions, active);
+      if (k != null) return k;
+    }
+
+    final pending = _pendingSubjectFromPayload(payload);
+    if (pending != null && pending.trim().isNotEmpty) {
+      final k = _subjectSessionsMapKey(sessions, pending);
+      if (k != null) return k;
+    }
+
+    for (final sub in studentEnrolledSubjects) {
+      final k = _subjectSessionsMapKey(sessions, sub);
+      if (k == null) continue;
+      final sess = sessions[k]!;
+      if (_sessionHasEntryMap(sess) || _sessionCompleteMap(sess)) return k;
+    }
+
+    return studentEnrolledSubjects.length == 1
+        ? _subjectSessionsMapKey(sessions, studentEnrolledSubjects.first)
+        : null;
+  }
+
+  bool _sessionHasEntryMap(Map<String, dynamic> s) {
+    return s['entryPhoto'] != null ||
+        s['photoUrl'] != null ||
+        s['entry_photo'] != null ||
+        s['entryTime'] != null ||
+        s['entry_time'] != null ||
+        s['timestamp'] != null;
+  }
+
+  bool _sessionCompleteMap(Map<String, dynamic> s) {
+    return s['exitPhoto'] != null ||
+        s['exit_photo'] != null ||
+        s['exitTime'] != null ||
+        s['exit_time'] != null;
+  }
+
+  /// First non-empty string among keys (camelCase / legacy snake_case in JSON).
+  String? _stringField(Map<String, dynamic> m, List<String> keys) {
+    for (final k in keys) {
+      final v = m[k];
+      if (v is String && v.trim().isNotEmpty) return v.trim();
+    }
+    return null;
+  }
+
+  String? _sessionEntryPhotoUrl(Map<String, dynamic> s) =>
+      _stringField(s, ['entryPhoto', 'photoUrl', 'entry_photo']);
+
+  String? _sessionEntryPhotoPath(Map<String, dynamic> s) =>
+      _stringField(s, ['entryPhotoPath', 'storagePath', 'entry_photo_path']);
+
+  String? _sessionExitPhotoUrl(Map<String, dynamic> s) =>
+      _stringField(s, ['exitPhoto', 'exit_photo']);
+
+  String? _sessionExitPhotoPath(Map<String, dynamic> s) =>
+      _stringField(s, ['exitPhotoPath', 'exit_photo_path']);
+
+  String? _pendingSubjectFromPayload(Map<String, dynamic>? payload) {
+    if (payload == null) return null;
+    final m = _mapSubjectSessions(payload);
+    for (final e in m.entries) {
+      if (_sessionHasEntryMap(e.value) && !_sessionCompleteMap(e.value)) return e.key;
+    }
+    return null;
+  }
+
+  /// Subjects must be finished in list order: no [entry] on a later subject until all prior have entry+exit.
+  String? _sequentialPriorIncomplete(
+    List<String> enrolledOrder,
+    Map<String, Map<String, dynamic>> sessions,
+    String subject,
+  ) {
+    final idx = enrolledOrder.indexOf(subject);
+    if (idx <= 0) return null;
+    for (var j = 0; j < idx; j++) {
+      final prev = enrolledOrder[j];
+      final sess = _sessionForSubject(sessions, prev);
+      if (!_sessionCompleteMap(sess)) return prev;
+    }
+    return null;
+  }
+
+  bool _isLegacyAttendanceDoc(Map<String, dynamic>? data) {
+    if (data == null || data.isEmpty) return false;
+    final ss = data[_kSubjectSessionsKey];
+    if (ss is Map && ss.isNotEmpty) return false;
+    final hasTop = data['entryPhoto'] != null ||
+        data['entryTime'] != null ||
+        data['photoUrl'] != null ||
+        data['exitPhoto'] != null ||
+        data['exitTime'] != null;
+    return hasTop;
+  }
+
+  bool _allSubjectsCompleteInPayload(Map<String, dynamic>? payload, List<String> subjects) {
+    if (subjects.isEmpty) return false;
+    final m = _mapSubjectSessions(payload);
+    for (final s in subjects) {
+      if (!_sessionCompleteMap(_sessionForSubject(m, s))) return false;
+    }
+    return true;
+  }
+
+  double _sumSubjectCreditedHours(Map<String, Map<String, dynamic>> sessions) {
+    double t = 0;
+    for (final s in sessions.values) {
+      final h = s['hours'];
+      if (h is num) t += h.toDouble();
+    }
+    return double.parse(t.toStringAsFixed(6));
+  }
+
   bool canMark() {
-    // Flexible attendance: Allow any student to mark attendance regardless of batch
+    final needsPick = !_legacyDayAttendance &&
+        studentEnrolledSubjects.isNotEmpty &&
+        activeAttendanceSubject == null &&
+        isAlreadyMarked != true;
     return !isLoading &&
         isLocationValid &&
         instituteId != null &&
         selectedRollNumber != null &&
-        isAlreadyMarked != true; // Can't mark if already marked
+        isAlreadyMarked != true &&
+        !needsPick;
   }
 
-  // Filter students based on search query
-  void _filterStudents() {
-    final query = _searchController.text.toLowerCase();
-    setState(() {
-      if (query.isEmpty) {
-        filteredStudents = students;
-      } else {
-        filteredStudents = students
-            .where((roll) => roll.toLowerCase().contains(query))
-            .toList();
+  bool _hasEntryPhoto() {
+    final d = existingAttendanceData;
+    if (d == null) return false;
+    if (_legacyDayAttendance) {
+      return d['entryPhoto'] != null || d['photoUrl'] != null;
+    }
+    if (studentEnrolledSubjects.isEmpty) return false;
+    final subKey = _displaySubjectSliceForSessions();
+    if (subKey == null) return false;
+    final sessions = _mapSubjectSessions(d);
+    final sess = sessions[subKey] ?? {};
+    return _sessionHasEntryMap(sess);
+  }
+
+  bool _hasExitPhoto() {
+    final d = existingAttendanceData;
+    if (d == null) return false;
+    if (_legacyDayAttendance) return d['exitPhoto'] != null;
+    if (studentEnrolledSubjects.isEmpty) return false;
+    final subKey = _displaySubjectSliceForSessions();
+    if (subKey == null) return false;
+    final sess = _mapSubjectSessions(d)[subKey] ?? {};
+    return _sessionCompleteMap(sess);
+  }
+
+  /// Lecture face-scan must be completed (when the institute schedule requires it) before exit.
+  bool _lectureScanBlocksExit() =>
+      _legacyDayAttendance &&
+      attendanceMode == 'lecture_scan' &&
+      currentLectureIndex != null;
+
+  void _syncEntrySessionTicker() {
+    _entrySessionTicker?.cancel();
+    _entrySessionTicker = null;
+    if (!mounted) return;
+
+    DateTime? entryUtc;
+    final d = existingAttendanceData;
+    if (_legacyDayAttendance) {
+      entryUtc = _asDateTime(d?['entryTime']) ??
+          _asDateTime(d?['timestamp']) ??
+          _asDateTime(d?['entry_time']);
+    } else if (studentEnrolledSubjects.isNotEmpty && d != null) {
+      final subKey = _displaySubjectSliceForSessions();
+      if (subKey != null) {
+        final sess = _mapSubjectSessions(d)[subKey] ?? {};
+        entryUtc = _asDateTime(sess['entryTime']) ??
+            _asDateTime(sess['timestamp']) ??
+            _asDateTime(sess['entry_time']);
       }
+    }
+
+    if (entryUtc == null || _hasExitPhoto()) return;
+    _entrySessionTicker = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) setState(() {});
     });
+  }
+
+  String _elapsedSinceEntryLabel() {
+    final d = existingAttendanceData;
+
+    DateTime? entryUtc;
+    if (_legacyDayAttendance) {
+      entryUtc = _asDateTime(d?['entryTime']) ??
+          _asDateTime(d?['timestamp']) ??
+          _asDateTime(d?['entry_time']);
+    } else if (studentEnrolledSubjects.isNotEmpty && d != null) {
+      final subKey = _displaySubjectSliceForSessions();
+      if (subKey != null) {
+        final sess = _mapSubjectSessions(d)[subKey] ?? {};
+        entryUtc = _asDateTime(sess['entryTime']) ??
+            _asDateTime(sess['timestamp']) ??
+            _asDateTime(sess['entry_time']);
+      }
+    }
+
+    if (entryUtc == null || _hasExitPhoto()) return '';
+    final diff = DateTime.now().difference(entryUtc);
+    if (diff.isNegative) return '0:00:00';
+    final h = diff.inHours;
+    final m = diff.inMinutes.remainder(60);
+    final s = diff.inSeconds.remainder(60);
+    return '${h.toString().padLeft(2, '0')}:${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
   }
 
   /// Parse lecture timing string to extract start and end times
@@ -879,14 +1649,6 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
   // Mark student as absent (one-tap, no photo required)
   Future<void> _markAbsent() async {
     if (selectedRollNumber == null || instituteId == null) {
-      if (selectedBatch == null) {
-        ProfessionalMessaging.showWarning(
-          context,
-          title: 'Student Batch Not Found',
-          message: 'This student does not have a batch assigned. Please assign a batch to the student first.',
-        );
-        return;
-      }
       ProfessionalMessaging.showWarning(
         context,
         title: 'Roll Number Required',
@@ -896,6 +1658,23 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
     }
     
     // No subject requirement - attendance is based on entry/exit times only
+
+    // Block absent marking when attendance is disabled for the day.
+    if (instituteId != null) {
+      final blockMessage =
+          await InstituteStatusService().attendanceBlockMessage(instituteId!);
+      if (!mounted) return;
+      if (blockMessage != null) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text(blockMessage),
+            backgroundColor: Colors.orange,
+            duration: const Duration(seconds: 4),
+          ));
+        }
+        return;
+      }
+    }
 
     // Show reason dialog
     final reason = await _showAbsentReasonDialog();
@@ -910,6 +1689,7 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
       final docId = '${selectedRollNumber}_$absentDate';
 
       final existingData = await _getTeacherAttendanceDoc(selectedRollNumber!, absentDate);
+      if (!mounted) return;
 
       if (existingData != null) {
         if (existingData['status'] == 'absent') {
@@ -927,6 +1707,7 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
       // Get device and network info
       final deviceInfo = await DeviceFingerprintService.getDeviceInfoForLogging();
       final networkInfo = await NetworkVerificationService.getNetworkInfoForLogging();
+      if (!mounted) return;
 
       final merged = Map<String, dynamic>.from(existingData ?? {});
       merged.addAll({
@@ -936,8 +1717,6 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
         'reason': reason,
         'timestamp': _encodeSv(),
         'markedBy': _db.auth.currentUser?.id ?? 'unknown',
-        'batchId': selectedBatch?['id'],
-        'batchName': selectedBatch?['name'],
         'instituteId': instituteId,
         'deviceInfo': deviceInfo,
         'networkInfo': networkInfo,
@@ -952,19 +1731,24 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
         status: 'absent',
       );
 
-      setState(() => isLoading = false);
+      if (!mounted) return;
+      _entrySessionTicker?.cancel();
+      _entrySessionTicker = null;
+      setState(() {
+        isLoading = false;
+        selectedRollNumber = null;
+        isAlreadyMarked = null;
+        existingMarkTime = null;
+        existingAttendanceData = null;
+      });
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text('✅ Marked absent: $reason'),
           backgroundColor: Colors.orange,
         ),
       );
-
-      // Reset selections
-      selectedRollNumber = null;
-      isAlreadyMarked = null;
-      existingMarkTime = null;
     } catch (e) {
+      if (!mounted) return;
       setState(() => isLoading = false);
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
@@ -1006,115 +1790,235 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
 
   Future<void> _checkAttendanceStatus() async {
     if (selectedRollNumber == null || instituteId == null) {
+      _entrySessionTicker?.cancel();
+      _entrySessionTicker = null;
       setState(() {
         isAlreadyMarked = null;
         existingMarkTime = null;
         existingAttendanceData = null;
+        activeAttendanceSubject = null;
+        _legacyDayAttendance = false;
       });
       return;
     }
 
     try {
       final today = DateFormat('yyyy-MM-dd').format(DateTime.now());
-      // Changed: Per-day attendance, not per-subject
-      final docId = '${selectedRollNumber}_$today';
-
       final data = await _getTeacherAttendanceDoc(selectedRollNumber!, today);
+      if (!mounted) return;
 
       if (data != null) {
-        final ts = _asDateTime(data['entryTime']) ?? _asDateTime(data['timestamp']);
-        String? timeStr;
-        if (ts != null) {
-          timeStr = DateFormat('hh:mm a').format(ts);
+        final currentStatus = data['status']?.toString();
+        if (currentStatus == 'absent') {
+          setState(() {
+            _legacyDayAttendance = false;
+            activeAttendanceSubject = null;
+            isAlreadyMarked = true;
+            existingMarkTime = null;
+            existingAttendanceData = data;
+            attendanceMode = null;
+            isEntryPhoto = true;
+            currentLectureIndex = null;
+          });
+          return;
         }
 
-        // Check if entry and exit are both marked
-        final hasEntry = data['entryPhoto'] != null || data['photoUrl'] != null;
-        final hasExit = data['exitPhoto'] != null;
-        
-        // Get lecture scans
-        final lectures = data['lectures'] as Map<String, dynamic>? ?? {};
-        final timing = selectedTiming ?? selectedBatch?['timing']?.toString() ?? '';
-        final lectureTimes = _parseLectureTiming(timing);
-        
-        // Determine which lecture needs scanning
-        int? nextLectureIndex;
-        if (hasEntry && !hasExit && lectureTimes.isNotEmpty) {
-          final currentTime = DateTime.now();
-          final currentHour = currentTime.hour;
-          final currentMinute = currentTime.minute;
-          final currentMinutes = currentHour * 60 + currentMinute;
-          
-          for (int i = 0; i < lectureTimes.length; i++) {
-            final lecture = lectureTimes[i];
-            final start = lecture['start'] as TimeOfDay;
-            final end = lecture['end'] as TimeOfDay;
-            final startMinutes = start.hour * 60 + start.minute;
-            final endMinutes = end.hour * 60 + end.minute;
-            
-            // Check if we're within this lecture time
-            if (currentMinutes >= startMinutes && currentMinutes <= endMinutes) {
-              final lectureKey = 'lecture_${i + 1}';
-              if (!lectures.containsKey(lectureKey) || lectures[lectureKey]['faceScanPhoto'] == null) {
-                nextLectureIndex = i;
-                break;
+        final legacy = _isLegacyAttendanceDoc(data);
+
+        if (legacy) {
+          final ts = _asDateTime(data['entryTime']) ?? _asDateTime(data['timestamp']);
+          String? timeStr;
+          if (ts != null) timeStr = DateFormat('HH:mm').format(ts);
+
+          final hasEntry = data['entryPhoto'] != null || data['photoUrl'] != null;
+          final hasExit = data['exitPhoto'] != null;
+
+          final lectures = data['lectures'] as Map<String, dynamic>? ?? {};
+          final timing = selectedTiming ?? '';
+          final lectureTimes = _parseLectureTiming(timing);
+
+          int? nextLectureIndex;
+          if (hasEntry && !hasExit && lectureTimes.isNotEmpty) {
+            final currentTime = DateTime.now();
+            final currentMinutes = currentTime.hour * 60 + currentTime.minute;
+
+            for (int i = 0; i < lectureTimes.length; i++) {
+              final lecture = lectureTimes[i];
+              final start = lecture['start'] as TimeOfDay;
+              final end = lecture['end'] as TimeOfDay;
+              final startMinutes = start.hour * 60 + start.minute;
+              final endMinutes = end.hour * 60 + end.minute;
+
+              if (currentMinutes >= startMinutes && currentMinutes <= endMinutes) {
+                final lectureKey = 'lecture_${i + 1}';
+                if (!lectures.containsKey(lectureKey) || lectures[lectureKey]['faceScanPhoto'] == null) {
+                  nextLectureIndex = i;
+                  break;
+                }
               }
             }
           }
+
+          setState(() {
+            _legacyDayAttendance = true;
+            activeAttendanceSubject = null;
+            isAlreadyMarked = hasEntry && hasExit;
+            existingMarkTime = timeStr;
+            existingAttendanceData = data;
+            currentLectureIndex = nextLectureIndex;
+
+            if (!hasEntry) {
+              attendanceMode = 'entry';
+              isEntryPhoto = true;
+            } else if (hasEntry && !hasExit) {
+              if (nextLectureIndex != null) {
+                attendanceMode = 'lecture_scan';
+                isEntryPhoto = false;
+              } else {
+                attendanceMode = 'exit';
+                isEntryPhoto = false;
+              }
+            } else {
+              attendanceMode = 'entry';
+              isEntryPhoto = true;
+            }
+          });
+          return;
+        }
+
+        // Per-subject: strict — finish pending exit before another subject; list order for new entries.
+        final sessions = _mapSubjectSessions(data);
+        final pending = _pendingSubjectFromPayload(data);
+        final allDone = studentEnrolledSubjects.isNotEmpty &&
+            _allSubjectsCompleteInPayload(data, studentEnrolledSubjects);
+
+        String? active = activeAttendanceSubject;
+        if (pending != null) {
+          active = pending;
+        } else if (active != null &&
+            _sessionCompleteMap(_sessionForSubject(sessions, active))) {
+          active = null;
+        }
+
+        if (active == null &&
+            pending == null &&
+            studentEnrolledSubjects.length == 1 &&
+            !_allSubjectsCompleteInPayload(data, studentEnrolledSubjects)) {
+          active = studentEnrolledSubjects.first;
+        }
+
+        DateTime? entryForActive;
+        if (active != null) {
+          final sess = _sessionForSubject(sessions, active);
+          entryForActive = _asDateTime(sess['entryTime']) ??
+              _asDateTime(sess['timestamp']) ??
+              _asDateTime(sess['entry_time']);
         }
 
         setState(() {
-          isAlreadyMarked = hasEntry && hasExit; // Fully marked if both entry and exit exist
-          existingMarkTime = timeStr;
+          _legacyDayAttendance = false;
+          activeAttendanceSubject = active;
+          isAlreadyMarked = allDone;
           existingAttendanceData = data;
-          currentLectureIndex = nextLectureIndex;
-          
-          // Determine mode: entry, exit, or lecture scan
-          if (!hasEntry) {
-            attendanceMode = 'entry';
-            isEntryPhoto = true;
-          } else if (hasEntry && !hasExit) {
-            if (nextLectureIndex != null) {
-              attendanceMode = 'lecture_scan';
-              isEntryPhoto = false;
-            } else {
+          currentLectureIndex = null;
+          existingMarkTime =
+              entryForActive != null ? DateFormat('HH:mm').format(entryForActive) : null;
+
+          if (active != null) {
+            final sess = _sessionForSubject(sessions, active);
+            if (!_sessionHasEntryMap(sess)) {
+              attendanceMode = 'entry';
+              isEntryPhoto = true;
+            } else if (!_sessionCompleteMap(sess)) {
               attendanceMode = 'exit';
               isEntryPhoto = false;
+            } else {
+              attendanceMode = 'entry';
+              isEntryPhoto = true;
             }
           } else {
-            attendanceMode = 'entry'; // Both marked, start new day
+            attendanceMode = 'entry';
             isEntryPhoto = true;
           }
         });
       } else {
         setState(() {
+          _legacyDayAttendance = false;
+          activeAttendanceSubject = (studentEnrolledSubjects.length == 1)
+              ? studentEnrolledSubjects.first
+              : null;
           isAlreadyMarked = false;
           existingMarkTime = null;
           existingAttendanceData = null;
           attendanceMode = 'entry';
-          isEntryPhoto = true; // Start with entry photo
+          isEntryPhoto = true;
           currentLectureIndex = null;
         });
       }
     } catch (e) {
-      setState(() {
-        isAlreadyMarked = null;
-        existingMarkTime = null;
-        existingAttendanceData = null;
-        attendanceMode = null;
-        currentLectureIndex = null;
-      });
+      if (mounted) {
+        setState(() {
+          isAlreadyMarked = null;
+          existingMarkTime = null;
+          existingAttendanceData = null;
+          attendanceMode = null;
+          currentLectureIndex = null;
+          activeAttendanceSubject = null;
+          _legacyDayAttendance = false;
+        });
+      }
+    } finally {
+      if (mounted) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) _syncEntrySessionTicker();
+        });
+      }
     }
   }
 
   /* ---------------- MARK ATTENDANCE ---------------- */
 
-  Future<void> _markAttendance() async {
+  /// [photoIntent]: `'entry'` | `'exit'` for explicit buttons; `null` for lecture scan / legacy auto mode.
+  Future<void> _markAttendance({String? photoIntent}) async {
     setState(() => isLoading = true);
+
+    // Block attendance if institute is not open
+    if (instituteId != null) {
+      final statusService = InstituteStatusService();
+      final blockMessage = await statusService.attendanceBlockMessage(instituteId!);
+      if (!mounted) return;
+      if (blockMessage != null) {
+        setState(() => isLoading = false);
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text(blockMessage),
+            backgroundColor: Colors.red,
+            duration: const Duration(seconds: 4),
+          ));
+        }
+        return;
+      }
+      final todayStatus = await statusService.getTodayStatus(instituteId!);
+      if (!mounted) return;
+      final instStatus = todayStatus?['status'] as String? ?? '';
+      if (instStatus != 'open') {
+        setState(() => isLoading = false);
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text(instStatus == 'closed'
+                ? '🔴 Institute is closed. Attendance cannot be marked.'
+                : '⚠️ Institute has not been opened yet. Ask the admin to open it first.'),
+            backgroundColor: Colors.red,
+            duration: const Duration(seconds: 4),
+          ));
+        }
+        return;
+      }
+    }
 
     try {
       final markingTime = DateTime.now();
-      
+
       // 🛡️ SECURITY CHECK 1: Prevent backdating and future dating
       final today = DateFormat('yyyy-MM-dd').format(markingTime);
       
@@ -1133,13 +2037,15 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
       // 🛡️ SECURITY CHECK 2: Device fingerprinting
       final deviceInfo = await DeviceFingerprintService.getDeviceInfoForLogging();
       final deviceChanged = await DeviceFingerprintService.hasDeviceChanged();
-      
+      if (!mounted) return;
+
       if (deviceChanged) {
         if (kDebugMode) debugPrint('⚠️ Device change detected - logging for review');
       }
 
       // 🛡️ SECURITY CHECK 3: Network verification
       final networkInfo = await NetworkVerificationService.getNetworkInfoForLogging();
+      if (!mounted) return;
 
       // 🛡️ SECURITY CHECK 4: Suspicious activity check (non-blocking, optimized)
       // Run in background to not delay attendance marking
@@ -1169,35 +2075,113 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
         if (kDebugMode) debugPrint('⚠️ Suspicious activity check failed: $e');
       });
 
-      // 🛡️ SECURITY CHECK 5: STRICT GPS RADIUS CHECK (30m, no buffer)
+      // 🛡️ SECURITY CHECK 5: STRICT GPS RADIUS CHECK
       if (!kIsWeb) {
         final withinRadius = await _checkGPSRadius();
+        if (!mounted) return;
         if (!withinRadius) {
           setState(() => isLoading = false);
-          return; // BLOCK attendance if outside 30m radius
+          return;
         }
       }
 
-      // Use simple ImagePicker for testing (face recognition disabled for now)
-      final photo = await picker.pickImage(
-        source: ImageSource.camera,
-        imageQuality: 50, // Lower quality for smaller file size (was 85)
-        maxWidth: 800, // Limit width to reduce size
-        maxHeight: 800, // Limit height to reduce size
-        preferredCameraDevice: CameraDevice.front,
-      );
+      // 🛡️ SECURITY CHECK 6: STUDENT VALIDATION - Verify student exists in database
+      if (selectedRollNumber == null || selectedRollNumber!.isEmpty) {
+        setState(() => isLoading = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('❌ No student selected. Please select a student first.'),
+            backgroundColor: Colors.red,
+            duration: Duration(seconds: 4),
+          ),
+        );
+        return;
+      }
 
+      final studentExists = await _validateStudentExists(selectedRollNumber!);
+      if (!mounted) return;
+      if (studentExists != true) {
+        setState(() => isLoading = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('❌ Student "$selectedRollNumber" not found in database.\n'
+                'Cannot mark attendance for unknown students.\n'
+                'Please verify the roll number and try again.'),
+            backgroundColor: Colors.red,
+            duration: const Duration(seconds: 5),
+          ),
+        );
+        return;
+      }
+
+      // 🛡️ SECURITY CHECK 6A: Verify student has profile photo (completed registration)
+      final hasProfilePhoto = await _checkStudentProfilePhoto(selectedRollNumber!);
+      if (!mounted) return;
+      if (hasProfilePhoto != true) {
+        setState(() => isLoading = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('❌ Student "$selectedRollNumber" registration incomplete.\n'
+                'Student must complete registration with profile photo first.\n'
+                'Contact the student to finish registration.'),
+            backgroundColor: Colors.red,
+            duration: const Duration(seconds: 6),
+          ),
+        );
+        return;
+      }
+
+      // Use simple ImagePicker for testing (face recognition disabled for now)
+      XFile? photo;
+      // Suppress PIN lock while camera is open
+      SessionMonitor.beginSuppressResumeLock();
+      try {
+        photo = await picker.pickImage(
+          source: ImageSource.camera,
+          imageQuality: 50, // Lower quality for smaller file size (was 85)
+          maxWidth: 800, // Limit width to reduce size
+          maxHeight: 800, // Limit height to reduce size
+          preferredCameraDevice: CameraDevice.front,
+        ).timeout(
+          const Duration(seconds: 60),
+          onTimeout: () {
+            if (kDebugMode) debugPrint('⏱️ Camera timeout - user took too long');
+            return null;
+          },
+        );
+      } catch (e) {
+        if (kDebugMode) {
+          debugPrint('❌ Camera error (interrupted or permission denied): $e');
+        }
+        if (!mounted) return;
+        setState(() => isLoading = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('❌ Camera error: ${e.toString()}\nPlease try again or check camera permissions.'),
+            backgroundColor: Colors.red,
+            duration: const Duration(seconds: 4),
+          ),
+        );
+        return;
+      }
+
+      if (!mounted) return;
       if (photo == null) {
         setState(() => isLoading = false);
         return;
       }
 
+      // Clock at capture — must match EXIF / file time (not [markingTime] from start of flow).
+      final timeAtPhotoCapture = DateTime.now();
+
       // Read and compress photo
       Uint8List bytes = await photo.readAsBytes();
-      
+      if (!mounted) return;
+
       // Compress image if still too large (target: under 50KB)
       if (bytes.length > 50 * 1024) {
         bytes = await _compressImage(bytes, maxSizeKB: 50);
+        if (!mounted) return;
         if (kDebugMode) {
           debugPrint('📸 Photo compressed: ${(bytes.length / 1024).toStringAsFixed(2)} KB');
         }
@@ -1206,10 +2190,11 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
       // 🛡️ SECURITY CHECK 5: Photo verification (EXIF, timestamp, screenshot detection)
       final photoVerification = await PhotoVerificationService.verifyPhoto(
         photoPath: photo.path,
-        markingTime: markingTime,
+        markingTime: timeAtPhotoCapture,
         expectedLocation: null, // Can add location check if needed
       );
 
+      if (!mounted) return;
       if (!photoVerification['isValid']) {
         setState(() => isLoading = false);
         final errors = photoVerification['errors'] as List<String>;
@@ -1223,8 +2208,73 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
         return;
       }
 
-      // 🛡️ SECURITY CHECK 6: Blur detection
+      // 🛡️ SECURITY CHECK 7: Same face verification as student registration
+      // Step 1: Detect photo-of-photo (printed photo / screen)
+      if (!kIsWeb) {
+        final isPhotoOfPhoto = await PhotoVerificationService.detectPhotoOfPhoto(photo.path);
+        if (!mounted) return;
+        if (isPhotoOfPhoto) {
+          setState(() => isLoading = false);
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('❌ This looks like a photo of a photo or screen.\n'
+                  'Point the camera at the student in person only.'),
+              backgroundColor: Colors.red,
+              duration: Duration(seconds: 5),
+            ),
+          );
+          return;
+        }
+      }
+
+      // Step 2: Detect liveness (live person vs recording/mask)
+      if (!kIsWeb) {
+        final liveness = await LivenessDetectionService.detectLivenessFromPhoto(
+          photoPath: photo.path,
+        );
+        if (!mounted) return;
+        if (!LivenessDetectionService.passesLivePersonPreCheck(liveness)) {
+          setState(() => isLoading = false);
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('❌ Liveness check failed.\n'
+                  'Student must face camera directly with eyes open — no masks, recordings, or fake faces.'),
+              backgroundColor: Colors.red,
+              duration: Duration(seconds: 5),
+            ),
+          );
+          return;
+        }
+      }
+
+      // Step 3: Extract face features and compare with student profile
+      final photoMatchResult = await _compareStudentPhoto(selectedRollNumber!, photo.path);
+      if (!mounted) return;
+      if (!photoMatchResult['isMatch']) {
+        setState(() => isLoading = false);
+        final reason = photoMatchResult['reason'] ?? 'Photo does not match student profile';
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('❌ Student verification failed!\n'
+                '$reason\n\n'
+                'Please verify you are marking attendance for the correct student.'),
+            backgroundColor: Colors.red,
+            duration: const Duration(seconds: 6),
+          ),
+        );
+        return;
+      }
+
+      if (photoMatchResult['confidence'] != null) {
+        if (kDebugMode) {
+          final confidence = (photoMatchResult['confidence'] as double) * 100;
+          debugPrint('✅ Face match confidence: ${confidence.toStringAsFixed(1)}%');
+        }
+      }
+
+      // 🛡️ SECURITY CHECK 8: Blur detection
       final isBlurry = await PhotoVerificationService.detectBlur(bytes);
+      if (!mounted) return;
       if (isBlurry) {
         setState(() => isLoading = false);
         ScaffoldMessenger.of(context).showSnackBar(
@@ -1236,8 +2286,9 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
         return;
       }
 
-      // 🛡️ SECURITY CHECK 7: Photo-of-photo detection
+      // 🛡️ SECURITY CHECK 9: Photo-of-photo detection
       final isPhotoOfPhoto = await PhotoVerificationService.detectPhotoOfPhoto(photo.path);
+      if (!mounted) return;
       if (isPhotoOfPhoto) {
         setState(() => isLoading = false);
         ScaffoldMessenger.of(context).showSnackBar(
@@ -1257,24 +2308,19 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
       final livenessResult = await LivenessDetectionService.detectLivenessFromPhoto(
         photoPath: photo.path,
       );
-      if (!livenessResult['isLive'] || (livenessResult['confidence'] as double) < 0.5) {
+      if (!mounted) return;
+      if (!LivenessDetectionService.passesLivePersonPreCheck(livenessResult)) {
         setState(() => isLoading = false);
-        final details = livenessResult['details'] as Map<String, dynamic>;
-        final errorMsg = details['error'] as String?;
+        if (kDebugMode) {
+          debugPrint(
+            '⚠️ Live-person check failed: ${livenessResult.reason}',
+          );
+        }
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text(
-              errorMsg != null
-                  ? '❌ Liveness check failed: $errorMsg\n'
-                      'Please ensure:\n'
-                      '• Student is looking at the camera\n'
-                      '• Eyes are open\n'
-                      '• Face is clearly visible'
-                  : '❌ Liveness check failed.\n'
-                      'Please ensure the student is:\n'
-                      '• Looking directly at the camera\n'
-                      '• Eyes are open\n'
-                      '• Face is clearly visible and well-lit',
+            content: const Text(
+              'Live face check failed. Do not use a printed photo or another phone screen. '
+              'The student must face the camera directly, eyes open, good lighting — then try again.',
             ),
             backgroundColor: Colors.red,
             duration: const Duration(seconds: 6),
@@ -1285,6 +2331,7 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
 
       // 🛡️ SECURITY CHECK 8: Multiple face detection (group photo)
       final faceDetection = await PhotoVerificationService.detectMultipleFaces(photo.path);
+      if (!mounted) return;
       if (faceDetection['isGroupPhoto'] == true) {
         setState(() => isLoading = false);
         ScaffoldMessenger.of(context).showSnackBar(
@@ -1324,7 +2371,7 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
                 Text(
                   'Student with roll number $selectedRollNumber has 0 subjects assigned.\n\n'
                   'Attendance can only be marked for students with at least 1 subject.\n\n'
-                  'Please assign subjects to this student first in Batch Management.',
+                  'Please add subjects for this student in Student Management → Edit.',
                   style: const TextStyle(fontSize: 13),
                 ),
               ],
@@ -1353,10 +2400,8 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
         return;
       }
 
-      // Note: Old face template check and quality checks removed
-      // Backend API (DeepFace) handles face detection and quality automatically
-      
       setState(() => isLoading = true); // Show loading during verification
+      ScaffoldMessenger.of(context).clearSnackBars();
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Row(
@@ -1372,51 +2417,56 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
               SizedBox(width: 12),
               Expanded(
                 child: Text(
-                  '🔐 Face Recognition: Processing with DeepFace API...',
+                  '🔐 Face verification (on-device)...',
                   style: TextStyle(fontWeight: FontWeight.w600),
                 ),
               ),
             ],
           ),
-          duration: Duration(seconds: 10),
+          duration: Duration(seconds: 5),
           backgroundColor: Colors.blue,
         ),
       );
-      
-      // CRITICAL: Verify face match using DIRECT 1:1 matching (faster)
-      // Uses new /verify endpoint: Direct match + Security check
-      // Threshold: 0.70 (70%) - more lenient for same photo matching while still secure
-      final verifyResult = await ArcFaceBackendService.verifyStudentFace(
-        imagePath: photo.path,
-        instituteId: instituteId!,
-        rollNumber: selectedRollNumber!,
-        threshold: 0.70, // 70% - more lenient for same photo, still prevents wrong matches
-      );
-      
-      // Check verification result
-      if (verifyResult == null || verifyResult['match'] != true) {
-        // Verification failed - could be no face registered, face doesn't match, or security check failed
-        setState(() => isLoading = false);
-        
-        String errorMessage = 'Face verification failed.\n\n';
-        if (verifyResult != null && verifyResult['securityCheckPassed'] == false) {
-          errorMessage = '❌ SECURITY ALERT: Wrong Student Detected!\n\n'
-              'The face in the photo matches a DIFFERENT student.\n'
-              'Selected: Roll $selectedRollNumber\n\n'
-              'SECURITY BLOCKED: Wrong person detected!';
-        } else {
-          errorMessage = '❌ Face Recognition Failed\n\n'
-              'Possible reasons:\n'
-              '• Face not registered for this student\n'
-              '• Face does not match registered face\n'
-              '• No face detected in photo\n\n'
-              'Please ensure:\n'
-              '• Student face is registered first\n'
-              '• The CORRECT student is present\n'
-              '• Good lighting and clear face view\n'
-              '• Looking directly at camera';
+
+      // 🔒 STRICT CHECK: Verify student hasn't already marked attendance today
+      if (selectedRollNumber != null && instituteId != null) {
+        final attendanceError = await StudentValidationService.validateAttendanceMarking(
+          studentId: selectedRollNumber!,
+          instituteCode: instituteId ?? '',
+          instituteId: instituteId ?? '',
+          attendanceDate: DateTime.now(),
+          skipDuplicateTodayCheck: true,
+        );
+
+        if (attendanceError != null) {
+          setState(() => isLoading = false);
+          ScaffoldMessenger.of(context).clearSnackBars();
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(attendanceError),
+              backgroundColor: Colors.orange,
+              duration: const Duration(seconds: 6),
+            ),
+          );
+          return;
         }
-        
+      }
+
+      // Location was already enforced at mark start via [_checkGPSRadius] (locked GPS point).
+      // Avoid a second "Verifying location..." pass against institutes.latitude/longitude — it
+      // confused users and could stay visible if the lookup or GPS call stalled.
+
+      final faceResult = await FaceRecognitionService.verifyStudent(
+        photo.path,
+        instituteId!,
+        selectedRollNumber!,
+      );
+      if (!mounted) return;
+
+      if (!faceResult.isMatch) {
+        setState(() => isLoading = false);
+        ScaffoldMessenger.of(context).clearSnackBars();
+        final isWrongStudent = faceResult.message.contains('Wrong student:');
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Column(
@@ -1426,17 +2476,13 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
                 Row(
                   children: [
                     Icon(
-                      verifyResult != null && verifyResult['securityCheckPassed'] == false
-                          ? Icons.security
-                          : Icons.error_outline,
+                      isWrongStudent ? Icons.security : Icons.error_outline,
                       color: Colors.white,
                     ),
                     const SizedBox(width: 8),
                     Expanded(
                       child: Text(
-                        verifyResult != null && verifyResult['securityCheckPassed'] == false
-                            ? '❌ SECURITY: Wrong Student Detected'
-                            : '❌ Face Recognition Failed',
+                        isWrongStudent ? 'Wrong student — blocked' : 'Face check failed',
                         style: const TextStyle(
                           fontWeight: FontWeight.bold,
                           fontSize: 16,
@@ -1447,28 +2493,24 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
                 ),
                 const SizedBox(height: 8),
                 Text(
-                  errorMessage,
+                  faceResult.message,
                   style: const TextStyle(fontSize: 13),
                 ),
               ],
             ),
             backgroundColor: Colors.red,
-            duration: const Duration(seconds: 10),
+            duration: const Duration(seconds: 12),
           ),
         );
         return;
       }
-      
-      // Face verified successfully (like Face ID unlock)
+
       if (kDebugMode) {
-        final similarity = verifyResult['similarity'] as double? ?? 0.0;
-        final processingTime = verifyResult['processingTimeMs'] as double? ?? 0.0;
-        debugPrint('✅ Face ID verification passed for Roll $selectedRollNumber');
-        debugPrint('   Similarity: ${(similarity * 100).toStringAsFixed(1)}%');
-        debugPrint('   Processing time: ${processingTime.toStringAsFixed(0)}ms');
-        debugPrint('   Security check: PASSED');
+        debugPrint('✅ On-device face verification passed for Roll $selectedRollNumber');
       }
-      
+
+      ScaffoldMessenger.of(context).clearSnackBars();
+
       // Check file size - must be under 50KB
       final maxSizeBytes = 50 * 1024; // 50KB
       if (bytes.length > maxSizeBytes) {
@@ -1482,68 +2524,352 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
       // Changed: Per-day attendance document (not per-subject)
       final docId = '${selectedRollNumber}_$today';
 
-      final existingPayload = await FirestoreRetryService.executeWithRetry(
+      var existingPayload = await FirestoreRetryService.executeWithRetry(
         operation: () async => await _getTeacherAttendanceDoc(selectedRollNumber!, today),
         operationName: 'Check existing attendance',
       );
+      if (!mounted) return;
+
+      if (instituteId != null && studentEnrolledSubjects.isNotEmpty) {
+        existingPayload = await StaleAttendanceReconciliationService.ensureReconciled(
+          db: _db,
+          instituteId: instituteId!,
+          roll: selectedRollNumber!,
+          date: today,
+          enrolledSubjects: studentEnrolledSubjects,
+          existingPayload: existingPayload,
+        );
+      }
+
+      if (!mounted) return;
 
       final currentTime = DateTime.now();
       final serverTs = _encodeSv();
-      
-      // Determine mode: entry, exit, or lecture scan
-      String mode = attendanceMode ?? 'entry';
-      if (existingPayload != null) {
-        final existingData = existingPayload;
-        final hasEntry = existingData['entryPhoto'] != null || existingData['photoUrl'] != null;
-        final hasExit = existingData['exitPhoto'] != null;
-        
-        if (hasEntry && hasExit) {
-          // Both entry and exit already marked
-          setState(() => isLoading = false);
-          final entryTime = _asDateTime(existingData['entryTime']) ?? _asDateTime(existingData['timestamp']);
-          final exitTime = _asDateTime(existingData['exitTime']);
-        String timeInfo = '';
-          if (entryTime != null && exitTime != null) {
-            final entry = DateFormat('hh:mm a').format(entryTime);
-            final exit = DateFormat('hh:mm a').format(exitTime);
-            timeInfo = ' (Entry: $entry, Exit: $exit)';
-        }
-        
+
+      final ex = existingPayload;
+      final existingStatus = ex?['status']?.toString();
+      if (existingStatus == 'absent') {
+        setState(() => isLoading = false);
+        final reason = ex?['absentReason']?.toString() ??
+            ex?['reason']?.toString() ??
+            'Already absent for today';
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text(
-                '⚠️ Attendance fully marked for this student$timeInfo.\n\n'
-                'Both entry and exit photos are already recorded.',
-            ),
+            content: Text('⚠️ Student already absent for today.\n$reason'),
             backgroundColor: Colors.orange,
-            duration: const Duration(seconds: 5),
+            duration: const Duration(seconds: 6),
           ),
         );
         return;
-        } else if (!hasEntry) {
-          mode = 'entry';
-        } else if (hasEntry && !hasExit) {
-          // Check if we need lecture scan or exit
-          if (currentLectureIndex != null && attendanceMode == 'lecture_scan') {
-            mode = 'lecture_scan';
-          } else {
+      }
+      final useSubjects =
+          studentEnrolledSubjects.isNotEmpty && (ex == null || !_isLegacyAttendanceDoc(ex));
+
+      if (useSubjects) {
+        if (activeAttendanceSubject == null ||
+            !studentEnrolledSubjects.contains(activeAttendanceSubject)) {
+          setState(() => isLoading = false);
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text(
+                'Select a subject first, then take entry or exit photo.',
+              ),
+              backgroundColor: Colors.orange,
+              duration: Duration(seconds: 4),
+            ),
+          );
+          return;
+        }
+        final pend = _pendingSubjectFromPayload(ex);
+        if (pend != null && pend != activeAttendanceSubject) {
+          setState(() => isLoading = false);
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                'Finish exit photo for "$pend" first, then mark another subject.',
+              ),
+              backgroundColor: Colors.orange,
+              duration: const Duration(seconds: 5),
+            ),
+          );
+          return;
+        }
+      }
+
+      late final bool hasEntry;
+      late final bool hasExit;
+      if (useSubjects) {
+        final sub = activeAttendanceSubject!;
+        final subjectEx = _sessionForSubject(_mapSubjectSessions(ex), sub);
+        hasEntry = _sessionHasEntryMap(subjectEx);
+        hasExit = _sessionCompleteMap(subjectEx);
+      } else {
+        hasEntry = ex != null && (ex['entryPhoto'] != null || ex['photoUrl'] != null);
+        hasExit = ex != null && (ex['exitPhoto'] != null || ex['exitTime'] != null);
+      }
+
+      // Determine mode: entry, exit, or lecture scan
+      String mode = attendanceMode ?? 'entry';
+
+      if (photoIntent == 'entry') {
+        if (useSubjects) {
+          if (_allSubjectsCompleteInPayload(ex, studentEnrolledSubjects)) {
+            setState(() => isLoading = false);
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text(
+                  'All enrolled subjects are complete for today. After midnight (new calendar day) you can mark again.',
+                ),
+                backgroundColor: Colors.orange,
+                duration: Duration(seconds: 6),
+              ),
+            );
+            return;
+          }
+          if (hasEntry && hasExit) {
+            setState(() => isLoading = false);
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text(
+                  '⚠️ "${activeAttendanceSubject!}" is already complete for today. Choose another subject or return after midnight.',
+                ),
+                backgroundColor: Colors.orange,
+                duration: const Duration(seconds: 6),
+              ),
+            );
+            return;
+          }
+        } else if (hasEntry && hasExit) {
+          setState(() => isLoading = false);
+          final doc = ex;
+          final entryTime = _asDateTime(doc!['entryTime']) ?? _asDateTime(doc['timestamp']);
+          final exitTime = _asDateTime(doc['exitTime']);
+          var timeInfo = '';
+          if (entryTime != null && exitTime != null) {
+            timeInfo =
+                ' (Entry: ${DateFormat('HH:mm').format(entryTime)}, Exit: ${DateFormat('HH:mm').format(exitTime)})';
+          }
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                '⚠️ Today is already complete for this student$timeInfo.\n'
+                'A new entry starts after midnight (next calendar day).',
+              ),
+              backgroundColor: Colors.orange,
+              duration: const Duration(seconds: 6),
+            ),
+          );
+          return;
+        }
+        mode = 'entry';
+      } else if (photoIntent == 'exit') {
+        if (!hasEntry) {
+          setState(() => isLoading = false);
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('❌ Take entry photo first for this subject, then exit photo.'),
+              backgroundColor: Colors.red,
+              duration: Duration(seconds: 4),
+            ),
+          );
+          return;
+        }
+        if (hasExit) {
+          setState(() => isLoading = false);
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                useSubjects
+                    ? '⚠️ Exit is already recorded for "${activeAttendanceSubject!}" today. After midnight, this subject unlocks again.'
+                    : '⚠️ Exit is already recorded for today. After midnight, a new day begins.',
+              ),
+              backgroundColor: Colors.orange,
+              duration: const Duration(seconds: 5),
+            ),
+          );
+          return;
+        }
+        if (_lectureScanBlocksExit()) {
+          setState(() => isLoading = false);
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                '❌ Complete lecture ${currentLectureIndex! + 1} face scan first, then use exit photo.',
+              ),
+              backgroundColor: Colors.orange,
+              duration: const Duration(seconds: 5),
+            ),
+          );
+          return;
+        }
+        mode = 'exit';
+      } else if (ex != null) {
+        if (useSubjects) {
+          if (_allSubjectsCompleteInPayload(ex, studentEnrolledSubjects)) {
+            setState(() => isLoading = false);
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text('All subjects complete for today.'),
+                backgroundColor: Colors.orange,
+                duration: Duration(seconds: 5),
+              ),
+            );
+            return;
+          }
+          if (!hasEntry) {
+            mode = 'entry';
+          } else if (!hasExit) {
             mode = 'exit';
+          } else {
+            mode = 'entry';
+          }
+        } else {
+          final existingData = ex;
+          if (hasEntry && hasExit) {
+            setState(() => isLoading = false);
+            final entryTime =
+                _asDateTime(existingData['entryTime']) ?? _asDateTime(existingData['timestamp']);
+            final exitTime = _asDateTime(existingData['exitTime']);
+            var timeInfo = '';
+            if (entryTime != null && exitTime != null) {
+              final entry = DateFormat('HH:mm').format(entryTime);
+              final exit = DateFormat('HH:mm').format(exitTime);
+              timeInfo = ' (Entry: $entry, Exit: $exit)';
+            }
+
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text(
+                  '⚠️ Attendance fully marked for this student$timeInfo.\n\n'
+                  'Both entry and exit photos are already recorded.',
+                ),
+                backgroundColor: Colors.orange,
+                duration: const Duration(seconds: 5),
+              ),
+            );
+            return;
+          } else if (!hasEntry) {
+            mode = 'entry';
+          } else if (hasEntry && !hasExit) {
+            if (currentLectureIndex != null && attendanceMode == 'lecture_scan') {
+              mode = 'lecture_scan';
+            } else {
+              mode = 'exit';
+            }
           }
         }
       }
-      
+
+      if (mode == 'exit' && instituteId != null && selectedRollNumber != null) {
+        DateTime? entryUtc;
+        if (useSubjects && activeAttendanceSubject != null) {
+          final subjectEx = _sessionForSubject(_mapSubjectSessions(ex), activeAttendanceSubject!);
+          entryUtc = _asDateTime(subjectEx['entryTime']) ?? _asDateTime(subjectEx['timestamp']);
+        } else if (ex != null) {
+          entryUtc = _asDateTime(ex['entryTime']) ?? _asDateTime(ex['timestamp']);
+        }
+        if (entryUtc != null && isPastAttendanceExitDeadline(entryUtc.toUtc(), DateTime.now().toUtc())) {
+          Map<String, dynamic>? repaired = ex;
+          if (studentEnrolledSubjects.isNotEmpty) {
+            repaired = await StaleAttendanceReconciliationService.ensureReconciled(
+              db: _db,
+              instituteId: instituteId!,
+              roll: selectedRollNumber!,
+              date: today,
+              enrolledSubjects: studentEnrolledSubjects,
+              existingPayload: ex,
+            );
+          }
+          if (!mounted) return;
+
+          var stillNeedsManualExit = false;
+          if (useSubjects && activeAttendanceSubject != null) {
+            final subjectEx =
+                _sessionForSubject(_mapSubjectSessions(repaired), activeAttendanceSubject!);
+            stillNeedsManualExit =
+                _sessionHasEntryMap(subjectEx) && !_sessionCompleteMap(subjectEx);
+          } else if (repaired != null) {
+            final hasEn = repaired['entryPhoto'] != null || repaired['photoUrl'] != null;
+            final hasEx = repaired['exitPhoto'] != null || repaired['exitTime'] != null;
+            stillNeedsManualExit = hasEn && !hasEx;
+          }
+
+          if (!stillNeedsManualExit) {
+            setState(() {
+              isLoading = false;
+              if (repaired != null) {
+                existingAttendanceData = Map<String, dynamic>.from(repaired);
+              }
+            });
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (mounted) _syncEntrySessionTicker();
+            });
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text(
+                  useSubjects && activeAttendanceSubject != null
+                      ? 'Session auto-closed (${kAttendanceExitDeadlineHours}h rule): "${activeAttendanceSubject!}". No exit photo — 1 h credit.'
+                      : 'Session auto-closed (${kAttendanceExitDeadlineHours}h rule). No exit photo — 1 h credit.',
+                ),
+                backgroundColor: Colors.orange,
+                duration: const Duration(seconds: 6),
+              ),
+            );
+          } else {
+            setState(() => isLoading = false);
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text(
+                  'Exit not allowed: more than ${kAttendanceExitDeadlineHours}h since entry.',
+                ),
+                backgroundColor: Colors.orange,
+                duration: const Duration(seconds: 6),
+              ),
+            );
+          }
+          return;
+        }
+      }
+
       bool isMarkingEntry = (mode == 'entry');
       bool isMarkingExit = (mode == 'exit');
       bool isLectureScan = (mode == 'lecture_scan');
 
-      // Get batch year for folder structure
-      final batchYear = selectedBatch?['year']?.toString() ?? DateTime.now().year.toString();
-      // Parse batch timing to get lecture start/end times (for display only, no validation)
-      final timing = selectedTiming ?? selectedBatch?['timing']?.toString() ?? '';
+      if (useSubjects &&
+          isMarkingEntry &&
+          activeAttendanceSubject != null) {
+        final sessionsMap = _mapSubjectSessions(ex);
+        final subj = activeAttendanceSubject!;
+        final subjectEx = _sessionForSubject(sessionsMap, subj);
+        if (!_sessionHasEntryMap(subjectEx)) {
+          final seq = _sequentialPriorIncomplete(
+            studentEnrolledSubjects,
+            sessionsMap,
+            subj,
+          );
+          if (seq != null) {
+            setState(() => isLoading = false);
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text(
+                  'Finish entry and exit for "$seq" first. '
+                  'The next subject unlocks only after the previous one is fully done.',
+                ),
+                backgroundColor: Colors.orange,
+                duration: const Duration(seconds: 6),
+              ),
+            );
+            return;
+          }
+        }
+      }
+
+      // Calendar year segment in B2 object path (unchanged for existing keys)
+      final folderYear = _selectedStudentYear ?? DateTime.now().year.toString();
+      final timing = selectedTiming ?? '';
       final lectureTimes = _parseLectureTiming(timing);
       
-      // NO TIME RESTRICTIONS - Students can mark entry/exit at any time
-      // Hours are calculated based on actual entry/exit times, not batch timings
+      // Hours are calculated from actual entry/exit times, not scheduled slots.
 
       // Upload photo - different path for entry/exit/lecture_scan
       String photoType;
@@ -1555,18 +2881,25 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
         photoType = 'lecture_scan';
       }
       
+      // Raw subject for validation; [B2BStorageService.generatePhotoPath] sanitizes for the object key.
+      final uploadSubject = useSubjects && activeAttendanceSubject != null
+          ? activeAttendanceSubject!.trim()
+          : 'all';
+
       final uploadResult = await StorageService.uploadAttendancePhoto(
         instituteId: instituteId!,
-        batchYear: batchYear,
+        folderYear: folderYear,
         rollNumber: selectedRollNumber!,
-        subject: 'all', // Not subject-based - use 'all' for per-day attendance
+        subject: uploadSubject,
         date: today,
         photoBytes: bytes,
         photoType: photoType,
       );
 
+      if (!mounted) return;
       final url = uploadResult['url']!;
       final storagePath = uploadResult['path']!;
+      final fileId = uploadResult['fileId'];
       final fileSizeBytes = bytes.length;
 
       debugPrint('📁 Storage Path: $storagePath');
@@ -1578,31 +2911,70 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
           ? Map<String, dynamic>.from(existingPayload!)
           : <String, dynamic>{};
       
-      // Save attendance record with entry/exit/lecture scan support
-      // Note: Attendance is per-day, not per-subject. Subjects stored for reference only.
+      // Save attendance: either per-subject sessions (same doc / calendar day) or legacy top-level row.
       final attendanceData = <String, dynamic>{
         'rollNumber': selectedRollNumber,
         'date': today,
         'markedBy': _db.auth.currentUser?.id ?? 'unknown',
-        'batchId': selectedBatch?['id'],
-        'batchName': selectedBatch?['name'],
-        'batchTiming': timing,
+        'lectureTiming': timing,
         'instituteId': instituteId,
         'updatedAt': serverTs,
-        // Store student's enrolled subjects for reference (not used for attendance marking)
         'subjects': studentEnrolledSubjects,
       };
 
-      if (isMarkingEntry) {
+      if (useSubjects) {
+        final sub = activeAttendanceSubject!;
+        final sessions = _mapSubjectSessions(existingData);
+        var sess = Map<String, dynamic>.from(sessions[sub] ?? {});
+        if (isMarkingEntry) {
+          sess['entryPhoto'] = url;
+          sess['entryTime'] = serverTs;
+          sess['entryPhotoPath'] = storagePath;
+          if (fileId != null && fileId.isNotEmpty) {
+            sess['entryPhotoFileId'] = fileId;
+          }
+          sess['photoUrl'] = url;
+          sess['timestamp'] = serverTs;
+          sess['status'] = 'pending';
+          sess['subjectName'] = sub;
+        } else if (isMarkingExit) {
+          sess['exitPhoto'] = url;
+          sess['exitTime'] = serverTs;
+          sess['exitPhotoPath'] = storagePath;
+          if (fileId != null && fileId.isNotEmpty) {
+            sess['exitPhotoFileId'] = fileId;
+          }
+          final entryTime = _asDateTime(sess['entryTime']) ?? _asDateTime(sess['timestamp']);
+          if (entryTime != null) {
+            final duration = currentTime.difference(entryTime);
+            final rawH = duration.inSeconds / 3600.0;
+            sess['hoursRaw'] = double.parse(rawH.toStringAsFixed(6));
+            sess['hours'] = attendanceCreditedHours(duration);
+          }
+          sess['status'] = 'present';
+        }
+        sessions[sub] = sess;
+
+        final mergedStub = Map<String, dynamic>.from(existingData);
+        mergedStub[_kSubjectSessionsKey] = sessions;
+        final allDone = _allSubjectsCompleteInPayload(mergedStub, studentEnrolledSubjects);
+
+        attendanceData[_kSubjectSessionsKey] = sessions;
+        attendanceData['totalCreditedHoursDay'] = _sumSubjectCreditedHours(sessions);
+        attendanceData['status'] = allDone ? 'present' : 'pending';
+      } else if (isMarkingEntry) {
         // Marking entry - start of day
         // DO NOT mark as present until exit photo is taken
         attendanceData['entryPhoto'] = url;
         attendanceData['entryTime'] = serverTs;
         attendanceData['entryPhotoPath'] = storagePath;
+        if (fileId != null && fileId.isNotEmpty) {
+          attendanceData['entryPhotoFileId'] = fileId;
+        }
         attendanceData['photoUrl'] = url; // For backward compatibility
         attendanceData['timestamp'] = serverTs;
         attendanceData['status'] = 'pending'; // Pending until exit photo is taken
-        
+
         // Do NOT mark lectures as present at entry - only mark at exit
         // Just store lecture structure for reference
         final lectures = <String, dynamic>{};
@@ -1612,7 +2984,7 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
             final start = lecture['start'] as TimeOfDay;
             final end = lecture['end'] as TimeOfDay;
             final lectureKey = 'lecture_${i + 1}';
-            
+
             lectures[lectureKey] = {
               'startTime': '${start.hour.toString().padLeft(2, '0')}:${start.minute.toString().padLeft(2, '0')}',
               'endTime': '${end.hour.toString().padLeft(2, '0')}:${end.minute.toString().padLeft(2, '0')}',
@@ -1629,20 +3001,22 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
         final lecture = lectureTimes[lectureIndex];
         final start = lecture['start'] as TimeOfDay;
         final end = lecture['end'] as TimeOfDay;
-        
+
         // Preserve existing data
         attendanceData['entryPhoto'] = existingData['entryPhoto'] ?? existingData['photoUrl'];
         attendanceData['entryTime'] = existingData['entryTime'] ?? existingData['timestamp'];
         attendanceData['entryPhotoPath'] = existingData['entryPhotoPath'] ?? existingData['storagePath'];
+        attendanceData['entryPhotoFileId'] = existingData['entryPhotoFileId'];
         attendanceData['photoUrl'] = existingData['photoUrl'] ?? existingData['entryPhoto'];
         attendanceData['timestamp'] = existingData['timestamp'] ?? existingData['entryTime'];
-        
+
         // Get existing lectures or create new
         final lectures = Map<String, dynamic>.from(existingData['lectures'] as Map? ?? {});
         lectures[lectureKey] = {
           'faceScanPhoto': url,
           'faceScanTime': serverTs,
           'faceScanPath': storagePath,
+          if (fileId != null && fileId.isNotEmpty) 'faceScanFileId': fileId,
           'startTime': '${start.hour.toString().padLeft(2, '0')}:${start.minute.toString().padLeft(2, '0')}',
           'endTime': '${end.hour.toString().padLeft(2, '0')}:${end.minute.toString().padLeft(2, '0')}',
           'marked': true,
@@ -1654,28 +3028,32 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
         attendanceData['entryPhoto'] = existingData['entryPhoto'] ?? existingData['photoUrl'];
         attendanceData['entryTime'] = existingData['entryTime'] ?? existingData['timestamp'];
         attendanceData['entryPhotoPath'] = existingData['entryPhotoPath'] ?? existingData['storagePath'];
+        attendanceData['entryPhotoFileId'] = existingData['entryPhotoFileId'];
         attendanceData['photoUrl'] = existingData['photoUrl'] ?? existingData['entryPhoto'];
         attendanceData['timestamp'] = existingData['timestamp'] ?? existingData['entryTime'];
-        
+
         // Mark exit
         attendanceData['exitPhoto'] = url;
         attendanceData['exitTime'] = serverTs;
         attendanceData['exitPhotoPath'] = storagePath;
-        
+        if (fileId != null && fileId.isNotEmpty) {
+          attendanceData['exitPhotoFileId'] = fileId;
+        }
+
         // Get existing lectures
         final lectures = Map<String, dynamic>.from(existingData['lectures'] as Map? ?? {});
         final entryTime = _asDateTime(existingData['entryTime']) ?? _asDateTime(existingData['timestamp']);
-        
+
         // Automatically mark attendance for all lectures between entry and exit
         if (entryTime != null && lectureTimes.isNotEmpty) {
           final entryDateTime = entryTime;
           final exitDateTime = currentTime;
-          
+
           for (int i = 0; i < lectureTimes.length; i++) {
             final lecture = lectureTimes[i];
             final start = lecture['start'] as TimeOfDay;
             final end = lecture['end'] as TimeOfDay;
-            
+
             // Create lecture start/end DateTime for today
             final lectureStart = DateTime(
               exitDateTime.year,
@@ -1691,7 +3069,7 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
               end.hour,
               end.minute,
             );
-            
+
             // If lecture is between entry and exit, mark it
             if (lectureStart.isAfter(entryDateTime.subtract(const Duration(minutes: 30))) &&
                 lectureEnd.isBefore(exitDateTime.add(const Duration(minutes: 30)))) {
@@ -1713,17 +3091,18 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
             }
           }
         }
-        
+
         attendanceData['lectures'] = lectures;
         attendanceData['status'] = 'present'; // Mark as present when exit photo taken
-        
-        // Calculate hours from entry and exit times
+
+        // Calculate hours from entry and exit times (raw seated vs credited max 2.5h/day).
         if (entryTime != null) {
           final entryDateTime = entryTime;
           final exitDateTime = currentTime;
           final duration = exitDateTime.difference(entryDateTime);
-          final hours = duration.inMinutes / 60.0; // Convert to hours with decimal
-          attendanceData['hours'] = double.parse(hours.toStringAsFixed(2)); // Store hours with 2 decimal places
+          final rawH = duration.inSeconds / 3600.0;
+          attendanceData['hoursRaw'] = double.parse(rawH.toStringAsFixed(6));
+          attendanceData['hours'] = attendanceCreditedHours(duration);
         }
       }
 
@@ -1741,23 +3120,131 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
         operationName: 'Save attendance record',
       );
 
-      final rollNumberForMessage = selectedRollNumber; // Store before clearing
-      
-      String successMessage;
+      final syncSubject = useSubjects ? activeAttendanceSubject : selectedSubject;
+
       if (isMarkingEntry) {
+        await _syncAttendanceInOut(
+          roll: selectedRollNumber!,
+          date: today,
+          type: 'entry',
+          photoUrl: url,
+          photoPath: storagePath,
+          photoFileId: fileId,
+          recordedAtUtc: serverTs,
+          subject: syncSubject,
+          sessionEntryUtc: serverTs,
+          status: 'pending',
+        );
+        if (instituteId != null) {
+          await InstituteNotificationService.scheduleAttendanceExitReminder(
+            instituteId: instituteId!,
+            rollKey: selectedRollNumber!,
+            dateKey: today,
+            subjectTag:
+                (useSubjects && activeAttendanceSubject != null) ? activeAttendanceSubject! : 'all',
+            entryAtUtc: DateTime.parse(serverTs.toString()).toUtc(),
+          );
+        }
+      } else if (isMarkingExit) {
+        if (useSubjects && activeAttendanceSubject != null) {
+          final sessions = _mapSubjectSessions(mergedPayload);
+          final sess = _sessionForSubject(sessions, activeAttendanceSubject!);
+          final entryUtc = sess['entryTime']?.toString() ?? sess['timestamp']?.toString();
+          final hrs = (sess['hours'] as num?)?.toDouble();
+          await _syncAttendanceInOut(
+            roll: selectedRollNumber!,
+            date: today,
+            type: 'exit',
+            photoUrl: url,
+            photoPath: storagePath,
+            photoFileId: fileId,
+            recordedAtUtc: serverTs,
+            subject: activeAttendanceSubject,
+            sessionEntryUtc: entryUtc,
+            sessionExitUtc: serverTs,
+            hours: hrs,
+            status: 'present',
+          );
+        } else {
+          final entryUtc =
+              mergedPayload['entryTime']?.toString() ?? mergedPayload['timestamp']?.toString();
+          final hrs = (mergedPayload['hours'] as num?)?.toDouble();
+          await _syncAttendanceInOut(
+            roll: selectedRollNumber!,
+            date: today,
+            type: 'exit',
+            photoUrl: url,
+            photoPath: storagePath,
+            photoFileId: fileId,
+            recordedAtUtc: serverTs,
+            subject: syncSubject,
+            sessionEntryUtc: entryUtc,
+            sessionExitUtc: serverTs,
+            hours: hrs,
+            status: 'present',
+          );
+        }
+        if (instituteId != null) {
+          await InstituteNotificationService.cancelAttendanceExitReminder(
+            instituteId: instituteId!,
+            rollKey: selectedRollNumber!,
+            dateKey: today,
+            subjectTag:
+                (useSubjects && activeAttendanceSubject != null) ? activeAttendanceSubject! : 'all',
+          );
+        }
+      }
+
+      if (!mounted) return;
+      final rollNumberForMessage = selectedRollNumber; // Store before clearing
+
+      String successMessage;
+      if (isMarkingEntry && useSubjects && activeAttendanceSubject != null) {
+        successMessage = '✅ Entry for "${activeAttendanceSubject!}" recorded ($rollNumberForMessage)\n'
+            '⚠️ Take exit photo for this subject to complete the session.\n'
+            'You can mark other subjects after this one is fully complete.';
+      } else if (isMarkingEntry) {
         successMessage = '✅ Entry photo recorded for $rollNumberForMessage\n'
             '⚠️ Attendance will be marked as present only after exit photo is taken!\n'
             '⚠️ Remember to take exit photo before leaving!';
       } else if (isMarkingExit) {
-        final hours = attendanceData['hours'] as double? ?? 0.0;
-        successMessage = '✅ Exit attendance marked for $rollNumberForMessage\n'
-            '⏰ Total hours: ${hours.toStringAsFixed(2)} hours';
+        if (useSubjects && activeAttendanceSubject != null) {
+          final sessions = _mapSubjectSessions(mergedPayload);
+          final sess = _sessionForSubject(sessions, activeAttendanceSubject!);
+          final credited = (sess['hours'] as num?)?.toDouble() ?? 0.0;
+          final sub = activeAttendanceSubject!;
+          final isAutoClosed = sess['autoClosedMissingExit'] == true;
+          final autoClosedNote = sess['autoClosedNote'] as String?;
+
+          if (isAutoClosed && autoClosedNote != null) {
+            successMessage = '✅ $sub — Auto-closed for $rollNumberForMessage\n'
+                '⚠️ ${autoClosedNote}\n'
+                '⏰ Credit: 1.0 h (no exit photo)';
+          } else {
+            successMessage = '✅ $sub — exit recorded for $rollNumberForMessage\n'
+                '⏰ Credit: ${credited.toStringAsFixed(2)} h';
+          }
+        } else {
+          final credited = attendanceData['hours'] as double? ?? 0.0;
+          final isAutoClosed = attendanceData['autoClosedMissingExit'] == true;
+          final autoClosedNote = attendanceData['autoClosedNote'] as String?;
+
+          if (isAutoClosed && autoClosedNote != null) {
+            successMessage = '✅ Auto-closed for $rollNumberForMessage\n'
+                '⚠️ ${autoClosedNote}\n'
+                '⏰ Credit: 1.0 h (no exit photo)';
+          } else {
+            successMessage = '✅ Exit attendance marked for $rollNumberForMessage\n'
+                '⏰ Credit: ${credited.toStringAsFixed(2)} h';
+          }
+        }
       } else if (isLectureScan && currentLectureIndex != null) {
         successMessage = '✅ Lecture ${currentLectureIndex! + 1} face scan marked for $rollNumberForMessage';
       } else {
         successMessage = '✅ Attendance marked for $rollNumberForMessage';
       }
 
+      ScaffoldMessenger.of(context).clearSnackBars();
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Row(
@@ -1774,19 +3261,42 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
         ),
       );
 
-      // QUEUE MODE: Keep batch/subject/timing selected, only clear roll number
-      // This allows continuous marking for students in line
-      setState(() {
-        selectedRollNumber = null; // Only clear roll number for next student
-      isAlreadyMarked = null;
-      existingMarkTime = null;
-        existingAttendanceData = null;
-        isEntryPhoto = true; // Reset to entry photo for next student (will be updated by _checkAttendanceStatus)
-      });
-      
+      // After legacy exit: clear roll. Per-subject: keep roll so more subjects can be marked today.
+      if (isMarkingExit) {
+        _entrySessionTicker?.cancel();
+        _entrySessionTicker = null;
+        if (useSubjects) {
+          await _checkAttendanceStatus();
+          if (mounted) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (mounted) _syncEntrySessionTicker();
+            });
+          }
+        } else {
+          setState(() {
+            selectedRollNumber = null;
+            isAlreadyMarked = null;
+            existingMarkTime = null;
+            existingAttendanceData = null;
+            isEntryPhoto = true;
+            attendanceMode = 'entry';
+            currentLectureIndex = null;
+            activeAttendanceSubject = null;
+            _legacyDayAttendance = false;
+          });
+        }
+      } else {
+        await _checkAttendanceStatus();
+        if (mounted) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted) _syncEntrySessionTicker();
+          });
+        }
+      }
+
       // Refresh student list to show updated status
-      if (selectedBatch != null) {
-        _loadStudentsForBatch();
+      if (selectedRollNumber != null) {
+        _loadAttendanceRoster();
       }
     } catch (e) {
       String errorMessage = 'Failed to mark attendance';
@@ -1808,29 +3318,32 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
                  errorString.contains('InvalidAccessKeyId') ||
                  errorString.contains('403') ||
                  errorString.contains('SignatureDoesNotMatch')) {
-        errorMessage = 'Storage service configuration error. Please contact technical support.';
+        errorMessage = 'Photos could not be saved. Please try again. If this continues, contact your institute administrator.';
       } else if (errorString.contains('B2B upload failed')) {
         errorMessage = 'Failed to upload photo. Please check your internet connection and try again.';
       } else if (errorString.contains('timeout') && errorString.contains('30 seconds')) {
-        errorMessage = 'Face recognition request timed out. The backend may be loading the AI model (first request). Please try again - subsequent requests will be faster.';
+        errorMessage =
+            'Verification took too long. Please try again. The first attempt after opening the app may take a little longer.';
       } else if (errorString.contains('500') || errorString.contains('Internal Server Error')) {
-        errorMessage = 'Backend processing error. This may happen if:\n• Face detection failed\n• Student face not registered\n• Backend memory issue\n\nPlease try again or ensure student face is registered first.';
+        errorMessage =
+            'Attendance could not be saved right now. Check the photo is clear, the student is registered with a profile photo, then try again.';
       } else if (errorString.contains('503') || errorString.contains('Service Unavailable')) {
-        errorMessage = 'Backend service is temporarily unavailable. The AI model may be loading (first request). Please wait 10-20 seconds and try again.';
+        errorMessage =
+            'Service is busy. Please wait a few seconds and try again.';
       } else if (errorString.contains('network') || errorString.contains('connection') || errorString.contains('timeout')) {
         errorMessage = 'Network connection issue. Please check your internet connection and try again.';
       } else if (errorString.contains('face') || errorString.contains('recognition') || errorString.contains('match')) {
         errorMessage = 'Face verification failed. Please ensure good lighting, face is clearly visible, and try again.';
       } else if (errorString.contains('location') || errorString.contains('GPS') || errorString.contains('geofence')) {
-        errorMessage = 'Location verification failed. Please enable location services and ensure you are within 30 meters of the institute.';
+        errorMessage = 'Location verification failed. Please enable location services and ensure you are within 15 meters of the institute.';
       } else if (errorString.contains('time') || errorString.contains('window') || errorString.contains('entry') || errorString.contains('exit')) {
-        errorMessage = 'Attendance can only be marked during the allowed time window. Please check the batch timing and try again.';
+        errorMessage = 'Attendance can only be marked during the allowed time window. Please check institute hours and try again.';
       } else if (errorString.contains('blur') || errorString.contains('quality')) {
         errorMessage = 'Photo quality is too low. Please ensure good lighting, keep the camera steady, and take a clear photo.';
       } else if (errorString.contains('photo') && errorString.contains('photo')) {
         errorMessage = 'Invalid photo detected. Please take a live photo of the student, not a photo of a photo.';
       } else if (errorString.contains('dotenv') || errorString.contains('not initialized')) {
-        errorMessage = 'System configuration error. Please contact technical support.';
+        errorMessage = 'Something is misconfigured on this device. Please contact your institute administrator.';
       } else {
         errorMessage = 'An error occurred while marking attendance. Please try again. If the problem persists, contact support.';
       }
@@ -1845,7 +3358,8 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
         );
       }
     } finally {
-      setState(() => isLoading = false);
+      SessionMonitor.endSuppressResumeLock();
+      if (mounted) setState(() => isLoading = false);
     }
   }
 
@@ -1869,28 +3383,39 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
               children: [
                 _buildModernAppBar(),
                 Expanded(
-                  child: SingleChildScrollView(
-                    physics: const BouncingScrollPhysics(),
+                  child: ResponsiveScrollBody(
                     padding: const EdgeInsets.all(20),
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
                         _buildHeader(),
                         const SizedBox(height: 24),
-                        
-                        // Queue Mode Instructions
-                        if (selectedBatch != null && selectedSubject != null)
-                          _buildQueueModeBanner(),
-                        if (selectedBatch != null)
-                          const SizedBox(height: 16),
 
-            // Step 1: Select Roll Number with Search (Batch auto-fetched)
+                        // Queue Mode Instructions
+                        Visibility(
+                          visible: selectedRollNumber != null &&
+                              (selectedSubject != null ||
+                                  studentEnrolledSubjects.isNotEmpty),
+                          maintainSize: true,
+                          maintainAnimation: true,
+                          maintainState: true,
+                          child: _buildQueueModeBanner(),
+                        ),
+                        Visibility(
+                          visible: selectedRollNumber != null,
+                          maintainSize: true,
+                          maintainAnimation: true,
+                          maintainState: true,
+                          child: const SizedBox(height: 16),
+                        ),
+
+            // Step 1: Select Roll Number with Search
             _buildStepCard(
               stepNumber: 1,
               title: 'Select Roll Number',
               icon: Icons.badge_outlined,
               iconColor: AppTheme.accentYellow,
-                child: isLoadingBatches
+                child: isLoadingRoster
                     ? const Center(
                         child: Padding(
                           padding: EdgeInsets.all(24.0),
@@ -1935,19 +3460,22 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
                                       color: isDark ? Colors.white : AppTheme.primaryBlue, 
                                       size: 22,
                                     ),
-                                    suffixIcon: _searchController.text.isNotEmpty
-                                        ? IconButton(
-                                            icon: Icon(
-                                              Icons.clear, 
-                                              color: isDark ? Colors.white : AppTheme.primaryBlue, 
-                                              size: 22,
-                                            ),
-                                            onPressed: () {
-                                              _searchController.clear();
-                                              _filterStudents();
-                                            },
-                                          )
-                                        : null,
+                                    suffixIcon: Visibility(
+                                      visible: _searchController.text.isNotEmpty,
+                                      maintainSize: true,
+                                      maintainAnimation: true,
+                                      maintainState: true,
+                                      child: IconButton(
+                                        icon: Icon(
+                                          Icons.clear,
+                                          color: isDark ? Colors.white : AppTheme.primaryBlue,
+                                          size: 22,
+                                        ),
+                                        onPressed: () {
+                                          _searchController.clear();
+                                        },
+                                      ),
+                                    ),
                                     border: InputBorder.none,
                                     contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
                                   ),
@@ -1986,13 +3514,14 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
                               existingMarkTime = null;
                               attendanceMode = null;
                               currentLectureIndex = null;
-                              selectedBatch = null;
                               selectedSubject = null;
                               selectedTiming = null;
+                              _selectedStudentYear = null;
                               studentEnrolledSubjects = [];
+                              activeAttendanceSubject = null;
+                              _legacyDayAttendance = false;
                             });
-                            // Fetch student data and auto-populate batch/subject/timing
-                            await _fetchStudentDataAndSetBatch(roll);
+                            await _fetchStudentDataForRoll(roll);
                             _checkAttendanceStatus();
                           }
                         },
@@ -2002,12 +3531,14 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
               ),
               const SizedBox(height: 16),
               
-              // Display Batch/Subject/Timing Info (auto-populated)
-              if (selectedRollNumber != null && selectedBatch != null) ...[
+              // Subject / schedule (auto-populated)
+              if (selectedRollNumber != null &&
+                  (studentEnrolledSubjects.isNotEmpty ||
+                      (selectedTiming != null && selectedTiming!.isNotEmpty))) ...[
                 _buildStepCard(
                   stepNumber: 2,
-                  title: 'Batch Information',
-                  icon: Icons.info_outline,
+                  title: 'Allotted subjects → then photos (strict)',
+                  icon: Icons.book_outlined,
                   iconColor: AppTheme.primaryBlue,
                   child: Builder(
                     builder: (context) {
@@ -2015,33 +3546,14 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
                       return Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          // Batch Name
-                          Row(
-                            children: [
-                              Icon(Icons.groups_outlined, size: 20, color: isDark ? Colors.white70 : AppTheme.textGray),
-                              const SizedBox(width: 8),
-                              Expanded(
-                                child: Text(
-                                  'Batch: ${selectedBatch!['name'] ?? 'N/A'}',
-                                  style: TextStyle(
-                                    fontSize: 14,
-                                    fontWeight: FontWeight.w500,
-                                    color: isDark ? Colors.white : AppTheme.textDark,
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-                          const SizedBox(height: 12),
-                          // Timing
-                          if (selectedTiming != null && selectedTiming!.isNotEmpty)
+                          if (selectedTiming != null && selectedTiming!.isNotEmpty) ...[
                             Row(
                               children: [
                                 Icon(Icons.access_time_outlined, size: 20, color: isDark ? Colors.white70 : AppTheme.textGray),
                                 const SizedBox(width: 8),
                                 Expanded(
                                   child: Text(
-                                    'Timing: $selectedTiming',
+                                    'Schedule: $selectedTiming',
                                     style: TextStyle(
                                       fontSize: 14,
                                       fontWeight: FontWeight.w500,
@@ -2051,8 +3563,11 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
                                 ),
                               ],
                             ),
-                          const SizedBox(height: 12),
-                          // Display Student's Enrolled Subjects (Read-only)
+                            const SizedBox(height: 12),
+                          ] else
+                            const SizedBox(height: 0),
+
+                          // Subjects allotted — tap one to mark attendance for that subject today.
                           if (studentEnrolledSubjects.isNotEmpty) ...[
                             Container(
                               padding: const EdgeInsets.all(16),
@@ -2079,7 +3594,7 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
                                       ),
                                       const SizedBox(width: 8),
                                       Text(
-                                        'Enrolled Subjects',
+                                        'Your subjects — finish pending exit before switching',
                                         style: TextStyle(
                                           fontSize: 14,
                                           fontWeight: FontWeight.w600,
@@ -2093,44 +3608,88 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
                                     spacing: 8,
                                     runSpacing: 8,
                                     children: studentEnrolledSubjects.map((subject) {
-                                      // All subjects are selected (shown for reference only)
-                                      return Container(
-                                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                                        decoration: BoxDecoration(
-                                          color: isDark 
-                                              ? AppTheme.primaryBlue.withValues(alpha: 0.2)
-                                              : AppTheme.primaryBlue.withValues(alpha: 0.15),
-                                          borderRadius: BorderRadius.circular(8),
-                                          border: Border.all(
-                                            color: AppTheme.primaryBlue.withValues(alpha: 0.5),
-                                            width: 1,
-                                          ),
-                                        ),
-                                        child: Row(
-                                          mainAxisSize: MainAxisSize.min,
-                                          children: [
-                                            Icon(
-                                              Icons.check_circle,
-                                              size: 16,
-                                              color: AppTheme.primaryBlue,
-                                            ),
-                                            const SizedBox(width: 6),
-                                            Text(
-                                              subject,
-                                              style: TextStyle(
-                                                fontSize: 13,
-                                                fontWeight: FontWeight.w500,
-                                                color: isDark ? Colors.white : AppTheme.textDark,
-                                              ),
-                                            ),
-                                          ],
+                                      final sessions =
+                                          _mapSubjectSessions(existingAttendanceData);
+                                      final sess = _sessionForSubject(sessions, subject);
+                                      final done = _sessionCompleteMap(sess);
+                                      final started = _sessionHasEntryMap(sess);
+                                      final pendingOther =
+                                          _pendingSubjectFromPayload(existingAttendanceData);
+                                      final locked =
+                                          pendingOther != null && pendingOther != subject;
+                                      final selected = activeAttendanceSubject == subject;
+                                      var suffix = '';
+                                      if (done) {
+                                        suffix = ' ✓';
+                                      } else if (started) {
+                                        suffix = ' …';
+                                      }
+
+                                      return FilterChip(
+                                        label: Text('$subject$suffix'),
+                                        selected: selected,
+                                        showCheckmark: false,
+                                        onSelected: isAlreadyMarked == true
+                                            ? (_) {}
+                                            : (_) {
+                                                if (done) {
+                                                  ScaffoldMessenger.of(context).showSnackBar(
+                                                    SnackBar(
+                                                      content: Text(
+                                                        '"$subject" is already complete for today. After midnight you can mark again.',
+                                                      ),
+                                                      backgroundColor: Colors.orange,
+                                                    ),
+                                                  );
+                                                  return;
+                                                }
+                                                if (locked) {
+                                                  ScaffoldMessenger.of(context).showSnackBar(
+                                                    SnackBar(
+                                                      content: Text(
+                                                        'Finish exit for "$pendingOther" first, then choose another subject.',
+                                                      ),
+                                                      backgroundColor: Colors.orange,
+                                                    ),
+                                                  );
+                                                  return;
+                                                }
+                                                final seqPrior = _sequentialPriorIncomplete(
+                                                  studentEnrolledSubjects,
+                                                  sessions,
+                                                  subject,
+                                                );
+                                                if (seqPrior != null && !started && !done) {
+                                                  ScaffoldMessenger.of(context).showSnackBar(
+                                                    SnackBar(
+                                                      content: Text(
+                                                        'Complete entry and exit for "$seqPrior" first. '
+                                                        'Then you can mark "$subject".',
+                                                      ),
+                                                      backgroundColor: Colors.orange,
+                                                      duration: const Duration(seconds: 5),
+                                                    ),
+                                                  );
+                                                  return;
+                                                }
+                                                setState(() => activeAttendanceSubject = subject);
+                                                _checkAttendanceStatus();
+                                              },
+                                        selectedColor:
+                                            AppTheme.primaryBlue.withValues(alpha: 0.35),
+                                        checkmarkColor: Colors.white,
+                                        labelStyle: TextStyle(
+                                          fontSize: 13,
+                                          fontWeight: FontWeight.w500,
+                                          color: isDark ? Colors.white : AppTheme.textDark,
                                         ),
                                       );
                                     }).toList(),
                                   ),
                                   const SizedBox(height: 8),
                                   Text(
-                                    'Note: All enrolled subjects shown for reference. Attendance is per-day, not per-subject. Hours are calculated based on entry/exit time.',
+                                    'Subjects are in strict list order after any pending exit is closed. '
+                                    '✓ = done · … = exit still needed.',
                                     style: TextStyle(
                                       fontSize: 11,
                                       color: isDark 
@@ -2209,6 +3768,40 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
                 const SizedBox(height: 16),
               ],
               
+              if (selectedRollNumber != null &&
+                  studentEnrolledSubjects.length > 1 &&
+                  !_legacyDayAttendance &&
+                  activeAttendanceSubject == null &&
+                  isAlreadyMarked != true) ...[
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                  decoration: BoxDecoration(
+                    color: Colors.orange.withValues(alpha: 0.15),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: Colors.orange.withValues(alpha: 0.5)),
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(Icons.touch_app, color: Colors.orange.shade800, size: 22),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          'Pick subjects in list order once no session is waiting for exit. '
+                          'Full entry + exit for each chip before advancing.',
+                          style: TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                            color: Colors.orange.shade900,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 16),
+              ],
+
               // Attendance Status Indicator
               if (selectedRollNumber != null) ...[
                 _buildAttendanceStatusIndicator(),
@@ -2219,13 +3812,13 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
               
               const SizedBox(height: 16),
 
-              // Action Buttons Row
-              Row(
+              // Mark absent (full width), then explicit Entry photo / Exit photo (+ lecture scan when required).
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  // Mark Absent Button (Quick)
-                  Expanded(
+                  SizedBox(
+                    height: 56.h,
                     child: Container(
-                      height: 60.h,
                       decoration: BoxDecoration(
                         color: Colors.orange.withValues(alpha: 0.2),
                         borderRadius: BorderRadius.circular(16.r),
@@ -2233,109 +3826,175 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
                       ),
                       child: ElevatedButton.icon(
                         icon: Icon(Icons.close, color: Colors.orange, size: 18.sp),
-                        label: Flexible(
-                          child: Text(
-                            'Mark Absent',
-                            style: TextStyle(
-                              fontSize: 13.sp,
-                              fontWeight: FontWeight.bold,
-                              color: Colors.orange,
-                            ),
-                            overflow: TextOverflow.ellipsis,
-                            maxLines: 1,
+                        label: Text(
+                          'Mark Absent',
+                          style: TextStyle(
+                            fontSize: 13.sp,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.orange,
                           ),
                         ),
                         style: ElevatedButton.styleFrom(
-                          padding: EdgeInsets.symmetric(vertical: 16.h),
+                          padding: EdgeInsets.symmetric(vertical: 14.h),
                           backgroundColor: Colors.transparent,
                           shadowColor: Colors.transparent,
                           shape: RoundedRectangleBorder(
                             borderRadius: BorderRadius.circular(16.r),
                           ),
                         ),
-                        onPressed: (selectedRollNumber != null && isAlreadyMarked != true) 
-                            ? _markAbsent 
-                            : null,
+                        onPressed: (selectedRollNumber != null && isAlreadyMarked != true) ? _markAbsent : null,
                       ),
                     ),
                   ),
-                  SizedBox(width: 12.w),
-                  // Mark Present Button (Photo Required) - Entry/Exit/Lecture Scan
-                  Expanded(
-                    flex: 2,
-                    child: Builder(
-                      builder: (context) {
-                        final isLectureScanMode = attendanceMode == 'lecture_scan';
-                        final buttonColor = isEntryPhoto 
-                            ? AppTheme.primaryGreen
-                            : isLectureScanMode
-                                ? AppTheme.primaryBlue
-                                : AppTheme.accentOrange;
-                        final buttonIcon = isEntryPhoto 
-                            ? Icons.login
-                            : isLectureScanMode
-                                ? Icons.face
-                                : Icons.logout;
-                        String buttonText;
-                        if (isEntryPhoto) {
-                          buttonText = 'Take Entry Photo';
-                        } else if (isLectureScanMode && currentLectureIndex != null) {
-                          buttonText = 'Scan Lecture ${currentLectureIndex! + 1}';
-                        } else {
-                          buttonText = 'Take Exit Photo';
-                        }
-                        
-                        return Container(
-                          height: 60.h,
+                  if (selectedRollNumber != null) ...[
+                    SizedBox(height: 10.h),
+                    if (attendanceMode == 'lecture_scan' && currentLectureIndex != null) ...[
+                      SizedBox(
+                        height: 52.h,
+                        child: Container(
                           decoration: BoxDecoration(
                             gradient: LinearGradient(
                               colors: [
-                                buttonColor,
-                                buttonColor.withValues(alpha: 0.8),
+                                AppTheme.primaryBlue,
+                                AppTheme.primaryBlue.withValues(alpha: 0.8),
                               ],
                             ),
                             borderRadius: BorderRadius.circular(16.r),
                             boxShadow: [
                               BoxShadow(
-                                color: buttonColor.withValues(alpha: 0.3),
+                                color: AppTheme.primaryBlue.withValues(alpha: 0.3),
                                 blurRadius: 10.r,
                                 spreadRadius: 1.w,
                               ),
                             ],
                           ),
                           child: ElevatedButton.icon(
-                            icon: Icon(
-                              buttonIcon,
-                              size: 18.sp,
-                              color: Colors.white,
-                            ),
-                            label: Flexible(
-                              child: Text(
-                                buttonText,
-                                style: TextStyle(
-                                  fontSize: 13.sp,
-                                  fontWeight: FontWeight.bold,
-                                  color: Colors.white,
-                                ),
-                                overflow: TextOverflow.ellipsis,
-                                maxLines: 1,
+                            icon: Icon(Icons.face, size: 18.sp, color: Colors.white),
+                            label: Text(
+                              'Lecture ${currentLectureIndex! + 1} face scan',
+                              style: TextStyle(
+                                fontSize: 13.sp,
+                                fontWeight: FontWeight.bold,
+                                color: Colors.white,
                               ),
                             ),
                             style: ElevatedButton.styleFrom(
-                              padding: const EdgeInsets.symmetric(vertical: 16),
+                              padding: EdgeInsets.symmetric(vertical: 12.h),
                               backgroundColor: Colors.transparent,
                               shadowColor: Colors.transparent,
                               disabledBackgroundColor: Colors.grey.shade300,
                               shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(16),
+                                borderRadius: BorderRadius.circular(16.r),
                               ),
                             ),
-                            onPressed: (canMark() && isAlreadyMarked != true) ? _markAttendance : null,
+                            onPressed: (canMark() && isAlreadyMarked != true) ? () => _markAttendance() : null,
                           ),
-                        );
-                      },
+                        ),
+                      ),
+                      SizedBox(height: 10.h),
+                    ],
+                    Row(
+                      children: [
+                        Expanded(
+                          child: SizedBox(
+                            height: 56.h,
+                            child: Container(
+                              decoration: BoxDecoration(
+                                gradient: LinearGradient(
+                                  colors: [
+                                    AppTheme.primaryGreen,
+                                    AppTheme.primaryGreen.withValues(alpha: 0.8),
+                                  ],
+                                ),
+                                borderRadius: BorderRadius.circular(16.r),
+                                boxShadow: [
+                                  BoxShadow(
+                                    color: AppTheme.primaryGreen.withValues(alpha: 0.3),
+                                    blurRadius: 10.r,
+                                    spreadRadius: 1.w,
+                                  ),
+                                ],
+                              ),
+                              child: ElevatedButton.icon(
+                                icon: Icon(Icons.photo_camera_rounded, size: 18.sp, color: Colors.white),
+                                label: Text(
+                                  'Entry (camera)',
+                                  style: TextStyle(
+                                    fontSize: 12.sp,
+                                    fontWeight: FontWeight.bold,
+                                    color: Colors.white,
+                                  ),
+                                ),
+                                style: ElevatedButton.styleFrom(
+                                  padding: EdgeInsets.symmetric(vertical: 12.h, horizontal: 4.w),
+                                  backgroundColor: Colors.transparent,
+                                  shadowColor: Colors.transparent,
+                                  disabledBackgroundColor: Colors.grey.shade400,
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(16.r),
+                                  ),
+                                ),
+                                onPressed: (canMark() && isAlreadyMarked != true && !_hasEntryPhoto())
+                                    ? () => _markAttendance(photoIntent: 'entry')
+                                    : null,
+                              ),
+                            ),
+                          ),
+                        ),
+                        SizedBox(width: 10.w),
+                        Expanded(
+                          child: SizedBox(
+                            height: 56.h,
+                            child: Container(
+                              decoration: BoxDecoration(
+                                gradient: LinearGradient(
+                                  colors: [
+                                    AppTheme.accentOrange,
+                                    AppTheme.accentOrange.withValues(alpha: 0.8),
+                                  ],
+                                ),
+                                borderRadius: BorderRadius.circular(16.r),
+                                boxShadow: [
+                                  BoxShadow(
+                                    color: AppTheme.accentOrange.withValues(alpha: 0.3),
+                                    blurRadius: 10.r,
+                                    spreadRadius: 1.w,
+                                  ),
+                                ],
+                              ),
+                              child: ElevatedButton.icon(
+                                icon: Icon(Icons.photo_camera_rounded, size: 18.sp, color: Colors.white),
+                                label: Text(
+                                  'Exit (camera)',
+                                  style: TextStyle(
+                                    fontSize: 12.sp,
+                                    fontWeight: FontWeight.bold,
+                                    color: Colors.white,
+                                  ),
+                                ),
+                                style: ElevatedButton.styleFrom(
+                                  padding: EdgeInsets.symmetric(vertical: 12.h, horizontal: 4.w),
+                                  backgroundColor: Colors.transparent,
+                                  shadowColor: Colors.transparent,
+                                  disabledBackgroundColor: Colors.grey.shade400,
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(16.r),
+                                  ),
+                                ),
+                                onPressed: (canMark() &&
+                                        isAlreadyMarked != true &&
+                                        _hasEntryPhoto() &&
+                                        !_hasExitPhoto() &&
+                                        !_lectureScanBlocksExit())
+                                    ? () => _markAttendance(photoIntent: 'exit')
+                                    : null,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
-                  ),
+                  ],
                 ],
               ),
               const SizedBox(height: 20),
@@ -2365,10 +4024,25 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
       child: Row(
         children: [
-          IconButton(
-            icon: const Icon(Icons.arrow_back, color: Colors.white),
-            onPressed: () => Navigator.pop(context),
-          ),
+          if (widget.restrictToAttendanceOnly)
+            IconButton(
+              icon: const Icon(Icons.logout, color: Colors.white),
+              tooltip: 'Sign out',
+              onPressed: () async {
+                await SessionManager.signOut();
+                if (context.mounted) {
+                  Navigator.of(context).pushNamedAndRemoveUntil(
+                    LoginScreen.routeName,
+                    (route) => false,
+                  );
+                }
+              },
+            )
+          else
+            IconButton(
+              icon: const Icon(Icons.arrow_back, color: Colors.white),
+              onPressed: () => Navigator.pop(context),
+            ),
           Container(
             padding: const EdgeInsets.all(8),
             decoration: BoxDecoration(
@@ -2436,7 +4110,8 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
               ),
               const SizedBox(height: 8),
               Text(
-                'Follow the steps below to mark attendance',
+                'Entry photo when they arrive, exit photo when they leave — both show for the day; next calendar day starts fresh.',
+                textAlign: TextAlign.center,
                 style: TextStyle(
                   fontSize: 14,
               color: isDark ? Colors.white70 : AppTheme.textGray,
@@ -2605,7 +4280,97 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
     }
 
     if (isAlreadyMarked == true) {
-      final hasEntry = existingAttendanceData?['entryPhoto'] != null || 
+      final isAbsent = existingAttendanceData?['status'] == 'absent';
+      if (isAbsent) {
+        final reason = existingAttendanceData?['absentReason']?.toString() ??
+            existingAttendanceData?['reason']?.toString() ??
+            'Already marked absent for today';
+        return Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: Colors.orange.withValues(alpha: 0.2),
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(
+              color: Colors.orange.withValues(alpha: 0.5),
+              width: 2,
+            ),
+          ),
+          child: Row(
+            children: [
+              const Icon(Icons.block_rounded, color: Colors.orange, size: 24),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Student Already Absent',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 15,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      reason,
+                      style: TextStyle(
+                        color: Colors.white.withValues(alpha: 0.9),
+                        fontSize: 12,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        );
+      }
+
+      if (!_legacyDayAttendance && studentEnrolledSubjects.isNotEmpty) {
+        return Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: Colors.orange.withValues(alpha: 0.2),
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(
+              color: Colors.orange.withValues(alpha: 0.5),
+              width: 2,
+            ),
+          ),
+          child: Row(
+            children: [
+              const Icon(Icons.check_circle_outline, color: Colors.orange, size: 24),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'All subjects complete for today',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 15,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      'After midnight (new calendar day) you can mark entry/exit for each subject again.',
+                      style: TextStyle(
+                        color: Colors.white.withValues(alpha: 0.85),
+                        fontSize: 12,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        );
+      }
+
+      final hasEntry = existingAttendanceData?['entryPhoto'] != null ||
                        existingAttendanceData?['photoUrl'] != null;
       final hasExit = existingAttendanceData?['exitPhoto'] != null;
       
@@ -2689,6 +4454,65 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
       );
     }
 
+    if (!_legacyDayAttendance &&
+        studentEnrolledSubjects.isNotEmpty &&
+        existingAttendanceData != null &&
+        isAlreadyMarked == false) {
+      final key = _displaySubjectSliceForSessions();
+      if (key != null) {
+        final sess = Map<String, dynamic>.from(
+          _mapSubjectSessions(existingAttendanceData)[key] ?? {},
+        );
+        if (_sessionHasEntryMap(sess) && !_sessionCompleteMap(sess)) {
+          final entryAt =
+              _asDateTime(sess['entryTime']) ?? _asDateTime(sess['timestamp']);
+          final tf =
+              entryAt != null ? DateFormat('HH:mm').format(entryAt.toLocal()) : '—';
+          return Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: Colors.blue.withValues(alpha: 0.22),
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(
+                color: Colors.blue.withValues(alpha: 0.55),
+                width: 2,
+              ),
+            ),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Icon(Icons.photo_camera_outlined, color: Colors.lightBlueAccent, size: 24),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Entry done for "$key" — exit pending',
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 15,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        'Entry time: $tf · Take exit photo to complete this subject.',
+                        style: TextStyle(
+                          color: Colors.white.withValues(alpha: 0.88),
+                          fontSize: 13,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          );
+        }
+      }
+    }
+
     // isAlreadyMarked == false - attendance not marked yet
     return Container(
       padding: const EdgeInsets.all(16),
@@ -2703,7 +4527,9 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
           const SizedBox(width: 12),
           Expanded(
             child: Text(
-              'Attendance not marked yet. You can proceed to mark attendance.',
+              (!_legacyDayAttendance && studentEnrolledSubjects.isNotEmpty)
+                  ? 'Choose a subject, then take entry and exit photos for that subject. Other subjects stay locked until the current one is finished. Everything resets after midnight.'
+                  : 'Attendance not marked yet. You can proceed to mark attendance.',
               style: TextStyle(
                 color: Colors.white,
                 fontSize: 14,
@@ -2717,14 +4543,77 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
   }
 
   Widget _buildEntryExitStatusCard() {
-    if (selectedRollNumber == null || selectedSubject == null) {
+    if (selectedRollNumber == null) {
+      return const SizedBox.shrink();
+    }
+    if (studentEnrolledSubjects.isEmpty && selectedSubject == null) {
       return const SizedBox.shrink();
     }
 
     final isDark = Theme.of(context).brightness == Brightness.dark;
-    final hasEntry = existingAttendanceData?['entryPhoto'] != null || 
-                     existingAttendanceData?['photoUrl'] != null;
-    final hasExit = existingAttendanceData?['exitPhoto'] != null;
+    late final bool hasEntry;
+    late final bool hasExit;
+    late final String? entryPhoto;
+    late final String? entryPath;
+    late final DateTime? entryTs;
+    late final String? exitPhoto;
+    late final String? exitPath;
+    late final DateTime? exitTs;
+    var titleSuffix = '';
+
+    if (!_legacyDayAttendance && studentEnrolledSubjects.isNotEmpty) {
+      final key = _displaySubjectSliceForSessions();
+      if (key != null && existingAttendanceData != null) {
+        final sess = Map<String, dynamic>.from(
+          _mapSubjectSessions(existingAttendanceData)[key] ?? {},
+        );
+        titleSuffix = ' — $key';
+        hasEntry = _sessionHasEntryMap(sess);
+        hasExit = _sessionCompleteMap(sess);
+        entryPhoto = _sessionEntryPhotoUrl(sess);
+        entryPath = _sessionEntryPhotoPath(sess);
+        entryTs = _asDateTime(sess['entryTime']) ??
+            _asDateTime(sess['timestamp']) ??
+            _asDateTime(sess['entry_time']);
+        exitPhoto = _sessionExitPhotoUrl(sess);
+        exitPath = _sessionExitPhotoPath(sess);
+        exitTs = _asDateTime(sess['exitTime']) ?? _asDateTime(sess['exit_time']);
+      } else {
+        titleSuffix = '';
+        hasEntry = false;
+        hasExit = false;
+        entryPhoto = null;
+        entryPath = null;
+        entryTs = null;
+        exitPhoto = null;
+        exitPath = null;
+        exitTs = null;
+      }
+    } else {
+      final d = existingAttendanceData;
+      if (d == null) {
+        hasEntry = false;
+        hasExit = false;
+        entryPhoto = null;
+        entryPath = null;
+        entryTs = null;
+        exitPhoto = null;
+        exitPath = null;
+        exitTs = null;
+      } else {
+        final m = Map<String, dynamic>.from(d);
+        hasEntry = _sessionHasEntryMap(m);
+        hasExit = _sessionCompleteMap(m);
+        entryPhoto = _sessionEntryPhotoUrl(m);
+        entryPath = _sessionEntryPhotoPath(m);
+        entryTs = _asDateTime(m['entryTime']) ??
+            _asDateTime(m['timestamp']) ??
+            _asDateTime(m['entry_time']);
+        exitPhoto = _sessionExitPhotoUrl(m);
+        exitPath = _sessionExitPhotoPath(m);
+        exitTs = _asDateTime(m['exitTime']) ?? _asDateTime(m['exit_time']);
+      }
+    }
 
     return Container(
       padding: EdgeInsets.all(16.w),
@@ -2732,8 +4621,8 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
         color: isDark ? Colors.white.withValues(alpha: 0.1) : Colors.white,
         borderRadius: BorderRadius.circular(16.r),
         border: Border.all(
-          color: isDark 
-              ? Colors.white.withValues(alpha: 0.3) 
+          color: isDark
+              ? Colors.white.withValues(alpha: 0.3)
               : AppTheme.primaryBlue.withValues(alpha: 0.3),
           width: 2.w,
         ),
@@ -2759,7 +4648,7 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
               SizedBox(width: 8.w),
               Flexible(
                 child: Text(
-                  'Entry/Exit Status',
+                  'Entry/Exit Status$titleSuffix',
                   style: TextStyle(
                     fontSize: 16.sp,
                     fontWeight: FontWeight.bold,
@@ -2774,28 +4663,22 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
           SizedBox(height: 12.h),
           Row(
             children: [
-              // Entry Photo with Timestamp
               Expanded(
                 child: _buildPhotoCard(
-                  photoUrl: hasEntry 
-                      ? (existingAttendanceData?['entryPhoto'] as String? ?? existingAttendanceData?['photoUrl'] as String? ?? '')
-                      : null,
-                  storagePath: existingAttendanceData?['entryPhotoPath'] as String?,
-                  timestamp: _asDateTime(existingAttendanceData?['entryTime']) ?? _asDateTime(existingAttendanceData?['timestamp']),
+                  photoUrl: hasEntry ? entryPhoto : null,
+                  storagePath: entryPath,
+                  timestamp: entryTs,
                   label: 'Entry',
                   isMarked: hasEntry,
                   color: AppTheme.primaryGreen,
                 ),
               ),
               SizedBox(width: 12.w),
-              // Exit Photo with Timestamp
               Expanded(
                 child: _buildPhotoCard(
-                  photoUrl: hasExit 
-                      ? (existingAttendanceData?['exitPhoto'] as String? ?? '')
-                      : null,
-                  storagePath: existingAttendanceData?['exitPhotoPath'] as String?,
-                  timestamp: _asDateTime(existingAttendanceData?['exitTime']),
+                  photoUrl: hasExit ? exitPhoto : null,
+                  storagePath: exitPath,
+                  timestamp: exitTs,
                   label: 'Exit',
                   isMarked: hasExit,
                   color: AppTheme.accentOrange,
@@ -2803,36 +4686,191 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
               ),
             ],
           ),
-          if (!hasEntry || !hasExit) ...[
-            const SizedBox(height: 12),
+          if (hasEntry && !hasExit) ...[
+            SizedBox(height: 12.h),
             Container(
-              padding: const EdgeInsets.all(12),
+              width: double.infinity,
+              padding: EdgeInsets.symmetric(horizontal: 12.w, vertical: 10.h),
               decoration: BoxDecoration(
-                color: isEntryPhoto 
-                    ? AppTheme.primaryGreen.withValues(alpha: 0.1)
-                    : AppTheme.accentOrange.withValues(alpha: 0.1),
-                borderRadius: BorderRadius.circular(12),
+                color: AppTheme.primaryBlue.withValues(alpha: isDark ? 0.2 : 0.1),
+                borderRadius: BorderRadius.circular(12.r),
+                border: Border.all(color: AppTheme.primaryBlue.withValues(alpha: 0.35)),
               ),
               child: Row(
                 children: [
-                  Icon(
-                    isEntryPhoto ? Icons.info_outline : Icons.info_outline,
-                    color: isEntryPhoto ? AppTheme.primaryGreen : AppTheme.accentOrange,
-                    size: 18,
+                  Icon(Icons.timer_outlined, color: AppTheme.primaryBlue, size: 22.sp),
+                  SizedBox(width: 10.w),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Time since entry',
+                          style: TextStyle(
+                            fontSize: 11.sp,
+                            fontWeight: FontWeight.w600,
+                            color: isDark ? Colors.white70 : AppTheme.textGray,
+                          ),
+                        ),
+                        Text(
+                          _elapsedSinceEntryLabel().isEmpty ? '—' : _elapsedSinceEntryLabel(),
+                          style: TextStyle(
+                            fontSize: 18.sp,
+                            fontWeight: FontWeight.bold,
+                            color: isDark ? Colors.white : AppTheme.primaryBlue,
+                            fontFeatures: const [FontFeature.tabularFigures()],
+                          ),
+                        ),
+                        Text(
+                          !_legacyDayAttendance
+                              ? 'Complete exit for this subject, then you can pick the next one.'
+                              : 'Attendance completes after exit photo. Same roll stays selected.',
+                          style: TextStyle(
+                            fontSize: 10.sp,
+                            color: isDark ? Colors.white60 : AppTheme.textGray,
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
-                  const SizedBox(width: 8),
+                ],
+              ),
+            ),
+          ],
+          if (hasEntry && hasExit) ...[
+            SizedBox(height: 12.h),
+            _buildEntryExitDurationBanner(isDark),
+          ],
+          if (!hasEntry && !hasExit) ...[
+            SizedBox(height: 12.h),
+            Container(
+              padding: EdgeInsets.all(12.w),
+              decoration: BoxDecoration(
+                color: AppTheme.primaryGreen.withValues(alpha: 0.1),
+                borderRadius: BorderRadius.circular(12.r),
+              ),
+              child: Row(
+                children: [
+                  Icon(Icons.info_outline, color: AppTheme.primaryGreen, size: 18.sp),
+                  SizedBox(width: 8.w),
                   Expanded(
                     child: Text(
-                      isEntryPhoto
-                          ? 'Ready to mark entry attendance'
-                          : 'Ready to mark exit attendance',
+                      !_legacyDayAttendance
+                          ? 'Use Entry photo for this subject, then Exit the same day. Other subjects unlock after this pair is done.'
+                          : 'Start with “Entry photo”, then “Exit photo” the same day. After midnight, records belong to the new calendar day.',
                       style: TextStyle(
-                        fontSize: 12,
+                        fontSize: 11.sp,
                         color: isDark ? Colors.white : AppTheme.textDark,
                       ),
                     ),
                   ),
                 ],
+              ),
+            ),
+          ],
+          SizedBox(height: 8.h),
+          Text(
+            DateFormat('yyyy-MM-dd').format(DateTime.now()),
+            style: TextStyle(
+              fontSize: 10.sp,
+              fontStyle: FontStyle.italic,
+              color: isDark ? Colors.white54 : AppTheme.textGray,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Time between entry and exit for today (and stored hours if present).
+  Widget _buildEntryExitDurationBanner(bool isDark) {
+    Map<String, dynamic>? slice = existingAttendanceData;
+    if (!_legacyDayAttendance && existingAttendanceData != null) {
+      final key = _displaySubjectSliceForSessions();
+      if (key != null) {
+        slice = Map<String, dynamic>.from(
+          _mapSubjectSessions(existingAttendanceData)[key] ?? {},
+        );
+      }
+    }
+    final entry =
+        _asDateTime(slice?['entryTime']) ?? _asDateTime(slice?['timestamp']);
+    final exit = _asDateTime(slice?['exitTime']);
+    final storedHours = slice?['hours'];
+    final storedRaw = slice?['hoursRaw'];
+    String line1;
+    if (entry != null && exit != null) {
+      final d = exit.difference(entry);
+      if (!d.isNegative) {
+        final totalMin = d.inMinutes;
+        final h = totalMin ~/ 60;
+        final m = totalMin % 60;
+        line1 = 'Time between entry & exit: ${h}h ${m}m';
+      } else {
+        line1 = 'Time between entry & exit: —';
+      }
+    } else {
+      line1 = 'Time between entry & exit: —';
+    }
+    String? line2;
+    String? line3;
+    if (storedHours is num) {
+      line2 = 'Credited (max 2.5h/day): ${storedHours.toStringAsFixed(2)} hours';
+    }
+    if (storedRaw is num) {
+      final r = storedRaw.toDouble();
+      final c = storedHours is num ? storedHours.toDouble() : null;
+      if (c == null || (r - c).abs() > 1e-6) {
+        line3 = 'Actual seated: ${r.toStringAsFixed(2)} hours';
+      }
+    }
+
+    return Container(
+      width: double.infinity,
+      padding: EdgeInsets.all(12.w),
+      decoration: BoxDecoration(
+        color: AppTheme.primaryBlue.withValues(alpha: isDark ? 0.15 : 0.08),
+        borderRadius: BorderRadius.circular(12.r),
+        border: Border.all(
+          color: AppTheme.primaryBlue.withValues(alpha: 0.35),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.timelapse, size: 20.sp, color: AppTheme.primaryBlue),
+              SizedBox(width: 8.w),
+              Expanded(
+                child: Text(
+                  line1,
+                  style: TextStyle(
+                    fontSize: 14.sp,
+                    fontWeight: FontWeight.w600,
+                    color: isDark ? Colors.white : AppTheme.textDark,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          if (line2 != null) ...[
+            SizedBox(height: 6.h),
+            Text(
+              line2,
+              style: TextStyle(
+                fontSize: 12.sp,
+                color: isDark ? Colors.white70 : AppTheme.textGray,
+              ),
+            ),
+          ],
+          if (line3 != null) ...[
+            SizedBox(height: 4.h),
+            Text(
+              line3,
+              style: TextStyle(
+                fontSize: 12.sp,
+                color: isDark ? Colors.white60 : AppTheme.textGray,
               ),
             ),
           ],
@@ -2846,7 +4884,7 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
     try {
       final dt = parseAnyTimestamp(timestamp);
       if (dt == null) return '-';
-      return DateFormat('hh:mm a').format(dt);
+      return DateFormat('HH:mm').format(dt.toLocal());
     } catch (e) {
       return '-';
     }
@@ -2898,7 +4936,7 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
                 ),
                 const SizedBox(height: 4),
                 Text(
-                  'Batch & Subject selected. Students can queue: Select Roll → Take Photo → Done. Next student ready!',
+                  'Subject selected. Students can queue: Select Roll → Take Photo → Done. Next student ready!',
                   style: TextStyle(
                     fontSize: 12,
                     color: isDark ? Colors.white70 : AppTheme.textGray,
@@ -2921,17 +4959,14 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
     required Color color,
   }) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
-    
+    final thumb = (photoUrl != null && photoUrl.trim().isNotEmpty) ? photoUrl.trim() : null;
+
     return GestureDetector(
-      onTap: photoUrl != null && photoUrl.isNotEmpty
-          ? () => _showPhotoDialog(photoUrl, storagePath, label, timestamp)
-          : null,
+      onTap: thumb != null ? () => _showPhotoDialog(thumb, storagePath, label, timestamp) : null,
       child: Container(
         padding: EdgeInsets.all(12.w),
         decoration: BoxDecoration(
-          color: isMarked 
-              ? color.withValues(alpha: 0.1)
-              : Colors.grey.withValues(alpha: 0.1),
+          color: isMarked ? color.withValues(alpha: 0.1) : Colors.grey.withValues(alpha: 0.1),
           borderRadius: BorderRadius.circular(12.r),
           border: Border.all(
             color: isMarked ? color : Colors.grey,
@@ -2942,8 +4977,9 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
           mainAxisSize: MainAxisSize.min,
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            // Photo or Icon
-            if (isMarked && photoUrl != null && photoUrl.isNotEmpty) ...[
+            // Show captured photo when we have a URL; otherwise placeholder icon when not marked /
+            // or check + camera hint when marked but URL still resolving.
+            if (thumb != null) ...[
               Flexible(
                 child: Container(
                   constraints: BoxConstraints(
@@ -2961,7 +4997,7 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
                   child: ClipRRect(
                     borderRadius: BorderRadius.circular(8.r),
                     child: SecureNetworkImage(
-                      imageUrl: photoUrl,
+                      imageUrl: thumb,
                       storagePath: storagePath,
                       fit: BoxFit.cover,
                       placeholder: Container(
@@ -2988,7 +5024,7 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
               SizedBox(height: 6.h),
             ] else ...[
               Icon(
-                isMarked ? Icons.check_circle : Icons.radio_button_unchecked,
+                isMarked ? Icons.check_circle : Icons.photo_camera_outlined,
                 color: isMarked ? color : Colors.grey,
                 size: 28.sp,
               ),
@@ -3006,7 +5042,7 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
               maxLines: 1,
             ),
             // Timestamp
-            if (isMarked && timestamp != null) ...[
+            if ((thumb != null || isMarked) && timestamp != null) ...[
               SizedBox(height: 2.h),
               Text(
                 _formatTime(timestamp),
@@ -3086,7 +5122,7 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
                     if (timestamp != null) ...[
                       const SizedBox(height: 4),
                       Text(
-                        DateFormat('MMM dd, yyyy • hh:mm a').format(timestamp),
+                        DateFormat('MMM dd, yyyy • hh:mm a').format(timestamp.toLocal()),
                         style: TextStyle(
                           color: Colors.white.withValues(alpha: 0.9),
                           fontSize: 14,
@@ -3140,6 +5176,7 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
         ],
       ),
       child: DropdownButtonFormField<String>(
+        isExpanded: true,
         value: value,
         style: TextStyle(
           color: isDark ? Colors.white : AppTheme.textDark,
@@ -3189,6 +5226,7 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Tick
                   fontWeight: FontWeight.w600,
                 ),
                 overflow: TextOverflow.ellipsis,
+                maxLines: 1,
               ),
             );
           }).toList();

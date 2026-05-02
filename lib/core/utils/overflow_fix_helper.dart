@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_screenutil/flutter_screenutil.dart';
 
+import 'adaptive_scroll.dart';
+
 /// Helper class to fix common overflow issues
 class OverflowFixHelper {
   /// Wrap text in Expanded to prevent overflow in Rows
@@ -13,10 +15,33 @@ class OverflowFixHelper {
     return Flexible(child: textWidget);
   }
 
-  /// Create a scrollable container
-  static Widget makeScrollable(Widget child, {bool shrinkWrap = false}) {
-    return SingleChildScrollView(
-      child: child,
+  /// Scrollable area with at least viewport height so **Column** children can use `mainAxisSize.min`
+  /// without bottom overflow (prefer [AdaptiveScrollColumn] for a list of children).
+  static Widget makeScrollable(Widget child, {EdgeInsetsGeometry? padding}) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        return SingleChildScrollView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          padding: padding,
+          child: ConstrainedBox(
+            constraints: BoxConstraints(minHeight: constraints.maxHeight),
+            child: child,
+          ),
+        );
+      },
+    );
+  }
+
+  /// Same as [AdaptiveScrollColumn] — flex-friendly, auto-sized children, scrolls when needed.
+  static Widget flexScrollColumn(
+    List<Widget> children, {
+    EdgeInsetsGeometry? padding,
+    CrossAxisAlignment crossAxisAlignment = CrossAxisAlignment.stretch,
+  }) {
+    return AdaptiveScrollColumn(
+      padding: padding,
+      crossAxisAlignment: crossAxisAlignment,
+      children: children,
     );
   }
 

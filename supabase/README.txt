@@ -9,7 +9,9 @@ Supabase migration (Firebase → Postgres + Supabase Auth)
 3) In Supabase Dashboard → SQL Editor, run IN ORDER:
    a) migrations/000_smoke_test.sql  → you should see table "smoke_test" in Table Editor
    b) migrations/001_initial_schema.sql → full app tables
-   c) migrations/003_students_extras.sql, 004_batches_institute_timing.sql (if present)
+   c) migrations/003_students_extras.sql, 004_batches_institute_timing.sql (if present).
+      On existing databases, also run migrations/037_remove_batches_and_rename_lecture_columns.sql
+      to drop `batches`, remove student batch columns, and rename institute timing fields to lecture_* .
    d) migrations/005_aux_firestore_parity.sql → GPS, teacher_attendance, coders, etc.
    e) migrations/006_rls_production.sql → production Row Level Security (replaces permissive policies)
    f) migrations/007_super_admin_access.sql → adds super_admin cross-institute access overlay

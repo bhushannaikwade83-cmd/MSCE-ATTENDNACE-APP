@@ -2,7 +2,7 @@ import 'package:flutter/foundation.dart' show kDebugMode, debugPrint, defaultTar
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'error_logger.dart';
 
-/// Centralized error handling (Supabase Auth + PostgREST).
+/// Centralized error handling for sign-in and app data — messages are end-user safe (no stack traces).
 class ErrorHandler {
   static String handleAuthException(AuthException e, {String? context, String? instituteId, String? appType}) {
     ErrorLogger.logError(
@@ -73,7 +73,7 @@ class ErrorHandler {
       return handlePostgrestError(error, context: context, instituteId: instituteId, appType: appType);
     }
     if (error is Exception) {
-      return 'An error occurred: ${error.toString()}';
+      return 'Something went wrong. Please try again. If it keeps happening, contact your institute administrator.';
     }
     return 'An unexpected error occurred. Please try again.';
   }

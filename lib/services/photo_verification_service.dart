@@ -74,11 +74,13 @@ class PhotoVerificationService {
         }
       }
 
-      // 6. Check photo age
+      // 6. Check file write time vs reference time (both should be immediate after capture)
       final fileTime = await file.lastModified();
       final ageDifference = markingTime.difference(fileTime).abs();
-      if (ageDifference.inHours > 1) {
-        verification['warnings'].add('Photo file is ${ageDifference.inHours} hours old');
+      if (ageDifference.inMinutes > 15) {
+        verification['warnings'].add(
+          'Photo file time differs from capture clock by ${ageDifference.inMinutes} min — verify device time is correct',
+        );
       }
 
       if (kDebugMode) {
@@ -180,20 +182,23 @@ class PhotoVerificationService {
     }
 
     if (photoTime != null) {
+      // EXIF DateTime is wall-clock with no timezone; [markingTime] must be taken right after capture
+      // (device `DateTime.now()`). Allow slack for camera processing / compression on slow devices.
       final timeDifference = markingTime.difference(photoTime).abs();
-      
-      // Allow 5 minutes tolerance
-      if (timeDifference.inMinutes > 5) {
+      const criticalAfter = Duration(minutes: 12);
+      const warnAfter = Duration(minutes: 3);
+
+      if (timeDifference > criticalAfter) {
         result['isValid'] = false;
         result['isCritical'] = true;
         result['warnings'].add(
           'Photo timestamp (${DateFormat('HH:mm:ss').format(photoTime)}) '
-          'does not match marking time (${DateFormat('HH:mm:ss').format(markingTime)}) '
-          '- difference: ${timeDifference.inMinutes} minutes'
+          'does not match capture time (${DateFormat('HH:mm:ss').format(markingTime)}) '
+          '— difference: ${timeDifference.inMinutes} min (check device date & time is set automatically)',
         );
-      } else if (timeDifference.inMinutes > 2) {
+      } else if (timeDifference > warnAfter) {
         result['warnings'].add(
-          'Photo timestamp differs by ${timeDifference.inMinutes} minutes'
+          'Photo timestamp differs from capture time by ${timeDifference.inMinutes} min',
         );
       }
     } else {
@@ -410,18 +415,16 @@ class PhotoVerificationService {
       if (reflectionCheck['hasReflections']) suspiciousIndicators++;
       if (sharpnessCheck['isTooBlurry']) suspiciousIndicators++;
       
-      // Require 3 or more indicators to be confident it's a photo-of-photo
-      // This reduces false positives for normal selfies
-      if (suspiciousIndicators >= 3) {
+      // Two or more weak signals is enough to block (printed photo / screen in frame).
+      if (suspiciousIndicators >= 2) {
         if (kDebugMode) {
-          debugPrint('⚠️ Photo-of-photo detected: Multiple indicators ($suspiciousIndicators)');
+          debugPrint('⚠️ Photo-of-photo detected: indicators=$suspiciousIndicators');
         }
         return true;
       }
 
-      // If only 1-2 indicators, it's likely a false positive (normal photo)
       if (kDebugMode && suspiciousIndicators > 0) {
-        debugPrint('ℹ️ Photo-of-photo check: Found $suspiciousIndicators indicator(s), but not enough to flag (need 3+)');
+        debugPrint('ℹ️ Photo-of-photo check: $suspiciousIndicators indicator(s), need 2+ to block');
       }
 
       return false;
@@ -486,7 +489,7 @@ class PhotoVerificationService {
     // Less strict - require higher edge ratio to reduce false positives
     // Normal photos may have some edges, but photo-of-photo has many more
     return {
-      'hasRectangularFrame': edgeRatio > 0.35, // Increased threshold (35% instead of 20%) to reduce false positives
+      'hasRectangularFrame': edgeRatio > 0.30,
     };
   }
 

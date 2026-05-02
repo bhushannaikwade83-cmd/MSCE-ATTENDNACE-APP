@@ -5,6 +5,8 @@ import 'package:intl/intl.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../core/app_db.dart';
+import '../core/attendance_presence_rules.dart';
+import 'security_ops_service.dart';
 
 /// Institute daily status in `institute_daily_status` (payload + date_key).
 /// Rows with [kInstituteStatusStudentId] hold institute-wide open/close/holiday.
@@ -12,6 +14,7 @@ class InstituteStatusService {
   static const String kInstituteStatusStudentId = '__institute__';
 
   SupabaseClient get _db => appDb;
+  final SecurityOpsService _securityOps = SecurityOpsService();
 
   Future<Map<String, dynamic>?> _rowPayload(String instituteId, String today) async {
     final row = await _db
@@ -32,7 +35,15 @@ class InstituteStatusService {
   Future<Map<String, dynamic>?> getTodayStatus(String instituteId) async {
     try {
       final today = DateFormat('yyyy-MM-dd').format(DateTime.now());
-      return await _rowPayload(instituteId, today);
+      final payload = await _rowPayload(instituteId, today);
+      // New day default: closed until admin explicitly chooses Open or Holiday.
+      return payload ??
+          <String, dynamic>{
+            'status': 'closed',
+            'date': today,
+            'autoDefaultClosed': true,
+            'dayDecisionLocked': false,
+          };
     } catch (e) {
       if (kDebugMode) debugPrint('❌ Error getting today status: $e');
       return null;
@@ -63,9 +74,20 @@ class InstituteStatusService {
       final now = DateTime.now().toUtc().toIso8601String();
 
       final prev = await _rowPayload(instituteId, today);
+      final currentStatus = prev?['status']?.toString();
+      final isDecisionLocked = prev?['dayDecisionLocked'] == true;
+      if (isDecisionLocked || currentStatus == 'open' || currentStatus == 'holiday') {
+        return {
+          'success': false,
+          'message': 'Today\'s status is already finalized. Open/Holiday cannot be changed now.'
+        };
+      }
       await _upsertStatus(instituteId, today, {
         ...?prev,
         'status': 'open',
+        'dayDecisionLocked': true,
+        'dayDecisionType': 'open',
+        'dayDecisionAt': now,
         'openedAt': now,
         'openedBy': user.id,
         'date': today,
@@ -101,6 +123,7 @@ class InstituteStatusService {
         'status': 'closed',
         'closedAt': now,
         'closedBy': user.id,
+        'dayFinalized': true,
         'date': today,
         'wasOpen': wasOpen,
         'updatedAt': now,
@@ -127,9 +150,20 @@ class InstituteStatusService {
       final now = DateTime.now().toUtc().toIso8601String();
 
       final prev = await _rowPayload(instituteId, today);
+      final currentStatus = prev?['status']?.toString();
+      final isDecisionLocked = prev?['dayDecisionLocked'] == true;
+      if (isDecisionLocked || currentStatus == 'open' || currentStatus == 'holiday') {
+        return {
+          'success': false,
+          'message': 'Today\'s status is already finalized. Open/Holiday cannot be changed now.'
+        };
+      }
       await _upsertStatus(instituteId, today, {
         ...?prev,
         'status': 'holiday',
+        'dayDecisionLocked': true,
+        'dayDecisionType': 'holiday',
+        'dayDecisionAt': now,
         'markedAt': now,
         'markedBy': user.id,
         'date': today,
@@ -166,6 +200,7 @@ class InstituteStatusService {
         'status': 'closed',
         'closedAt': now,
         'closedBy': 'system',
+        'dayFinalized': true,
         'autoClosed': true,
         'date': today,
         'updatedAt': now,
@@ -200,19 +235,164 @@ class InstituteStatusService {
     }
   }
 
-  /// Batch / institute timing from `institutes.batch_open_time` / `batch_close_time` (jsonb).
+  Future<String?> attendanceBlockMessage(String instituteId) async {
+    final status = (await getTodayStatus(instituteId))?['status']?.toString();
+    if (status == 'holiday') {
+      return 'Today is a holiday. Attendance cannot be marked.';
+    }
+    if (status == 'closed') {
+      return 'Institute is closed. Attendance cannot be marked.';
+    }
+    return null;
+  }
+
+  /// Mark students **absent** only when they have **no entry on any subject** today.
+  /// Entry without exit stays hours-based (handled elsewhere); not overwritten here.
+  /// Called automatically when the institute is closed for the day.
+  /// Returns { 'success', 'updated', 'inserted', 'total' }.
+  Future<Map<String, dynamic>> markAbsentAllUnmarkedStudents(
+      String instituteId) async {
+    try {
+      final today = DateFormat('yyyy-MM-dd').format(DateTime.now());
+      final now = DateTime.now().toUtc().toIso8601String();
+
+      // All students in the institute
+      final students = await _db
+          .from('students')
+          .select('user_id, sr_no, created_at')
+          .eq('institute_id', instituteId);
+
+      // Today's existing attendance rows
+      final attendanceRows = await _db
+          .from('teacher_attendance')
+          .select()
+          .eq('institute_id', instituteId)
+          .eq('date', today);
+
+      // student_id → {row, payload}
+      final attendanceMap = <String, Map<String, dynamic>>{};
+      for (final row in attendanceRows) {
+        final sid = row['student_id'] as String?;
+        if (sid == null) continue;
+        final data = row['payload'];
+        final Map<String, dynamic> payload;
+        if (data is Map<String, dynamic>) {
+          payload = Map<String, dynamic>.from(data);
+        } else if (data is Map) {
+          payload = data.map((k, v) => MapEntry(k.toString(), v));
+        } else {
+          payload = {};
+        }
+        attendanceMap[sid] = {'row': row, 'payload': payload};
+      }
+
+      int updated = 0;
+      int inserted = 0;
+
+      for (final student in students) {
+        final roll =
+            (student['user_id'] as String?)?.trim() ??
+            (student['sr_no'] as String?)?.trim();
+        if (roll == null || roll.isEmpty) continue;
+
+        final existing = attendanceMap[roll];
+
+        if (existing != null) {
+          final row = Map<String, dynamic>.from(existing['row'] as Map);
+          final map = existing['payload'] as Map<String, dynamic>;
+          final currentStatus = map['status'] as String?;
+
+          // Already finalised → skip
+          if (currentStatus == 'present' || currentStatus == 'absent') {
+            continue;
+          }
+
+          if (!teacherPayloadHasAnySubjectEntry(map)) {
+            map['status'] = 'absent';
+            map['absentReason'] =
+                'Auto-marked absent: no entry on any subject when institute closed';
+            map['markedAbsentAt'] = now;
+            map['autoMarkedOnInstituteClose'] = true;
+
+            await _db.from('teacher_attendance').update({
+              'payload': map,
+              'status': 'absent',
+              'updated_at': now,
+            }).eq('id', row['id'] as String);
+            updated++;
+          }
+        } else {
+          // Do not auto-mark a newly added student absent on day 1.
+          // If the student record was created today, skip absent insertion.
+          final createdAtRaw = student['created_at']?.toString();
+          final createdAt = createdAtRaw == null
+              ? null
+              : DateTime.tryParse(createdAtRaw)?.toLocal();
+          if (createdAt != null) {
+            final createdDate =
+                DateFormat('yyyy-MM-dd').format(createdAt);
+            if (createdDate == today) {
+              continue;
+            }
+          }
+
+          // No record at all for today → insert absent
+          final docId = '${instituteId}_${roll}_$today';
+          await _db.from('teacher_attendance').upsert(
+            {
+              'id': docId,
+              'institute_id': instituteId,
+              'student_id': roll,
+              'date': today,
+              'status': 'absent',
+              'payload': {
+                'status': 'absent',
+                'absentReason':
+                    'Auto-marked absent: no attendance recorded when institute closed',
+                'markedAbsentAt': now,
+                'autoMarkedOnInstituteClose': true,
+                'isManual': false,
+              },
+              'updated_at': now,
+            },
+            onConflict: 'id',
+          );
+          inserted++;
+        }
+      }
+
+      if (kDebugMode) {
+        debugPrint(
+            '✅ Auto-absent on close: updated=$updated, inserted=$inserted');
+      }
+      return {
+        'success': true,
+        'updated': updated,
+        'inserted': inserted,
+        'total': updated + inserted,
+      };
+    } catch (e) {
+      if (kDebugMode) {
+        debugPrint('❌ Error marking absent on institute close: $e');
+      }
+      return {'success': false, 'message': 'Error: ${e.toString()}'};
+    }
+  }
+
+  /// Institute daily open/close windows from `institutes.lecture_open_time` /
+  /// `lecture_close_time` (jsonb).
   Future<Map<String, dynamic>?> getInstituteTiming(String instituteId) async {
     try {
       final row = await _db
           .from('institutes')
-          .select('batch_open_time, batch_close_time')
+          .select('lecture_open_time, lecture_close_time')
           .eq('id', instituteId)
           .maybeSingle();
 
       if (row == null) return null;
 
-      final openTime = row['batch_open_time'];
-      final closeTime = row['batch_close_time'];
+      final openTime = row['lecture_open_time'];
+      final closeTime = row['lecture_close_time'];
 
       if (openTime == null || closeTime == null) {
         return null;
@@ -261,5 +441,103 @@ class InstituteStatusService {
       onCancel: () => timer?.cancel(),
     );
     return controller.stream;
+  }
+
+  /// Create a dual-approval request for sensitive override actions.
+  /// Example actions:
+  /// - `reopen_finalized_day`
+  /// - `attendance_status_override`
+  Future<Map<String, dynamic>> requestAdminOverride({
+    required String instituteId,
+    required String actionType,
+    required String targetTable,
+    required String targetId,
+    required String reason,
+  }) async {
+    try {
+      final result = await _db.rpc('request_admin_override', params: {
+        'p_institute_id': instituteId,
+        'p_action_type': actionType,
+        'p_target_table': targetTable,
+        'p_target_id': targetId,
+        'p_reason': reason,
+      });
+      return {
+        'success': true,
+        'requestId': result?.toString(),
+        'message': 'Override request submitted',
+      };
+    } catch (e) {
+      if (kDebugMode) {
+        debugPrint('❌ Error creating admin override request: $e');
+      }
+      return {'success': false, 'message': 'Error: ${e.toString()}'};
+    }
+  }
+
+  /// Approve a dual-approval request (requires MFA AAL2 session on backend).
+  Future<Map<String, dynamic>> approveAdminOverride({
+    required String requestId,
+    String? note,
+  }) async {
+    try {
+      final result = await _db.rpc('approve_admin_override', params: {
+        'p_request_id': requestId,
+        'p_note': note,
+      });
+      if (result is Map<String, dynamic>) {
+        await _securityOps.reportIncident(
+          instituteId: (result['institute_id'] ?? '').toString(),
+          category: 'admin_override_approved',
+          severity: 'high',
+          title: 'Sensitive admin override approved',
+          description: 'Dual-approval override has been approved.',
+          metadata: result,
+        );
+        return {'success': true, ...result};
+      }
+      if (result is Map) {
+        final mapped = result.map((k, v) => MapEntry(k.toString(), v));
+        await _securityOps.reportIncident(
+          instituteId: (mapped['institute_id'] ?? '').toString(),
+          category: 'admin_override_approved',
+          severity: 'high',
+          title: 'Sensitive admin override approved',
+          description: 'Dual-approval override has been approved.',
+          metadata: mapped,
+        );
+        return {
+          'success': true,
+          ...mapped,
+        };
+      }
+      return {'success': true, 'message': 'Approval processed'};
+    } catch (e) {
+      if (kDebugMode) {
+        debugPrint('❌ Error approving admin override request: $e');
+      }
+      return {'success': false, 'message': 'Error: ${e.toString()}'};
+    }
+  }
+
+  /// List pending override requests for the institute (newest first).
+  Future<List<Map<String, dynamic>>> getPendingOverrideRequests(
+      String instituteId) async {
+    try {
+      final rows = await _db
+          .from('admin_override_requests')
+          .select()
+          .eq('institute_id', instituteId)
+          .eq('status', 'pending')
+          .order('created_at', ascending: false);
+      return (rows as List)
+          .map((e) => (e as Map).map((k, v) => MapEntry(k.toString(), v)))
+          .toList();
+    } catch (e) {
+      if (kDebugMode) {
+        debugPrint('❌ Error loading pending override requests: $e');
+      }
+      return [];
+    }
   }
 }

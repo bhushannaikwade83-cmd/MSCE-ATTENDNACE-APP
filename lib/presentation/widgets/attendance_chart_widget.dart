@@ -9,13 +9,11 @@ import '../../core/theme/app_theme.dart';
 /// Basic Attendance Chart Widget - Shows attendance trends
 class AttendanceChartWidget extends StatefulWidget {
   final String instituteId;
-  final String? batchId;
   final int days; // Number of days to show
 
   const AttendanceChartWidget({
     super.key,
     required this.instituteId,
-    this.batchId,
     this.days = 7,
   });
 

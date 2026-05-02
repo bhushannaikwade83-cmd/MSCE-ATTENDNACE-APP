@@ -47,7 +47,7 @@ class ModernBottomNavBar extends StatelessWidget {
                   ),
                   _buildNavItem(
                     context,
-                    icon: Icons.groups_outlined,
+                    icon: Icons.person_add_alt_1_outlined,
                     isSelected: selectedIndex == 1,
                     onTap: () => onTap(1),
                   ),

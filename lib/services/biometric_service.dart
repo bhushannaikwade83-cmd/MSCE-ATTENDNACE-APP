@@ -1,16 +1,17 @@
+import 'dart:convert';
 import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
 import 'package:flutter/services.dart';
 import 'package:local_auth/local_auth.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 /// Biometric Authentication Service (IRCTC Style)
-/// 
-/// Provides fingerprint and face unlock functionality
-/// Similar to IRCTC's biometric authentication
+///
+/// Provides fingerprint and face unlock functionality (per-admin per-device)
+/// Each admin on this device has SEPARATE biometric login
 class BiometricService {
   static final LocalAuthentication _localAuth = LocalAuthentication();
-  static const String _biometricEnabledKey = 'biometric_enabled';
-  static const String _biometricEmailKey = 'biometric_email';
+  // CHANGED: Store list of biometric-enabled admins, not just one
+  static const String _biometricAdminsKey = 'biometric_enabled_admins_json';
   /// Cleared on uninstall; when true we already showed "enable biometric?" this install.
   static const String _biometricSetupPromptShownKey = 'biometric_setup_prompt_shown';
 
@@ -55,24 +56,58 @@ class BiometricService {
     }
   }
 
-  /// Check if biometric authentication is enabled for user
-  static Future<bool> isBiometricEnabled() async {
+  /// Get list of admins with biometric enabled on THIS device
+  static Future<List<String>> getBiometricEnabledAdmins() async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      return prefs.getBool(_biometricEnabledKey) ?? false;
+      final jsonStr = prefs.getString(_biometricAdminsKey);
+      if (jsonStr == null || jsonStr.isEmpty) return [];
+
+      final List<dynamic> decoded = jsonDecode(jsonStr);
+      return List<String>.from(decoded);
     } catch (e) {
-      if (kDebugMode) debugPrint('❌ Error checking biometric enabled: $e');
+      if (kDebugMode) debugPrint('❌ Error getting biometric admins: $e');
+      return [];
+    }
+  }
+
+  /// Check if biometric authentication is enabled for THIS admin (email)
+  static Future<bool> isBiometricEnabledForAdmin(String email) async {
+    try {
+      final admins = await getBiometricEnabledAdmins();
+      return admins.contains(email.toLowerCase());
+    } catch (e) {
+      if (kDebugMode) debugPrint('❌ Error checking biometric for admin: $e');
       return false;
     }
   }
 
-  /// Enable biometric authentication for user
+  /// Check if ANY admin has biometric enabled on this device
+  /// (For backward compatibility with old code that didn't need email)
+  static Future<bool> isBiometricEnabled() async {
+    try {
+      final admins = await getBiometricEnabledAdmins();
+      return admins.isNotEmpty;
+    } catch (e) {
+      if (kDebugMode) debugPrint('❌ Error checking if biometric is enabled: $e');
+      return false;
+    }
+  }
+
+  /// Enable biometric for THIS admin (add to list, don't overwrite others)
   static Future<bool> enableBiometric(String email) async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setBool(_biometricEnabledKey, true);
-      await prefs.setString(_biometricEmailKey, email);
-      if (kDebugMode) debugPrint('✅ Biometric authentication enabled for: $email');
+      final admins = await getBiometricEnabledAdmins();
+      final normalizedEmail = email.toLowerCase();
+
+      if (!admins.contains(normalizedEmail)) {
+        admins.add(normalizedEmail);
+        await prefs.setString(_biometricAdminsKey, jsonEncode(admins));
+        if (kDebugMode) {
+          debugPrint('✅ Biometric enabled for admin: $email (total: ${admins.length})');
+        }
+      }
       return true;
     } catch (e) {
       if (kDebugMode) debugPrint('❌ Error enabling biometric: $e');
@@ -80,13 +115,26 @@ class BiometricService {
     }
   }
 
-  /// Disable biometric authentication
-  static Future<bool> disableBiometric() async {
+  /// Disable biometric for THIS admin only (remove from list)
+  static Future<bool> disableBiometric(String email) async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setBool(_biometricEnabledKey, false);
-      await prefs.remove(_biometricEmailKey);
-      if (kDebugMode) debugPrint('✅ Biometric authentication disabled');
+      final admins = await getBiometricEnabledAdmins();
+      final normalizedEmail = email.toLowerCase();
+
+      admins.removeWhere((e) => e == normalizedEmail);
+
+      if (admins.isEmpty) {
+        // No admins left with biometric - remove the key
+        await prefs.remove(_biometricAdminsKey);
+        if (kDebugMode) debugPrint('✅ Biometric disabled for admin: $email (all removed)');
+      } else {
+        // Other admins still have biometric - keep the list
+        await prefs.setString(_biometricAdminsKey, jsonEncode(admins));
+        if (kDebugMode) {
+          debugPrint('✅ Biometric disabled for admin: $email (${admins.length} remaining)');
+        }
+      }
       return true;
     } catch (e) {
       if (kDebugMode) debugPrint('❌ Error disabling biometric: $e');
@@ -94,11 +142,13 @@ class BiometricService {
     }
   }
 
-  /// Get stored email for biometric login
+  /// Get the first admin with biometric enabled (for UI showing last logged in)
+  /// NOTE: Better approach is to show list of biometric-enabled admins for user to choose
+  @Deprecated('Use getBiometricEnabledAdmins() to show admin list instead')
   static Future<String?> getBiometricEmail() async {
     try {
-      final prefs = await SharedPreferences.getInstance();
-      return prefs.getString(_biometricEmailKey);
+      final admins = await getBiometricEnabledAdmins();
+      return admins.isNotEmpty ? admins.first : null;
     } catch (e) {
       if (kDebugMode) debugPrint('❌ Error getting biometric email: $e');
       return null;
@@ -127,9 +177,10 @@ class BiometricService {
       }
 
       if (requirePreferenceEnabled) {
-        final isEnabled = await isBiometricEnabled();
-        if (!isEnabled) {
-          if (kDebugMode) debugPrint('⚠️ Biometric login not enabled in app settings');
+        // Check if ANY admin has biometric enabled on this device
+        final adminsWithBiometric = await getBiometricEnabledAdmins();
+        if (adminsWithBiometric.isEmpty) {
+          if (kDebugMode) debugPrint('⚠️ No admin has biometric login enabled on this device');
           return false;
         }
       }

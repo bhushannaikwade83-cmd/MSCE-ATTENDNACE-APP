@@ -22,13 +22,14 @@ class AppLocalizationsMr extends AppLocalizations {
   String get footerOfficialUse => 'फक्त अधिकृत वापर';
 
   @override
-  String get footerCredit => 'Digitrix Media तर्फे';
+  String get footerCredit => 'MSCE - महाराष्ट्र शिक्षा परिषद तर्फे';
 
   @override
   String get mainNavSubtitleAdmin => 'प्रशासक डॅशबोर्ड  |  Admin dashboard';
 
   @override
-  String get mainNavSubtitleBatch => 'तुकडी व्यवस्थापन  |  Batch management';
+  String get mainNavSubtitleInstructor =>
+      'प्रशिक्षक वापरकर्ता  |  Instructor user';
 
   @override
   String get mainNavSubtitleStudent => 'विद्यार्थी नोंदी  |  Student records';
@@ -46,7 +47,7 @@ class AppLocalizationsMr extends AppLocalizations {
   String get splashSubtitle => 'एमएससीई स्मार्ट उपस्थिती व्यवस्थापन प्रणाली';
 
   @override
-  String get splashCredit => 'Digitrix Media तर्फे';
+  String get splashCredit => 'MSCE - महाराष्ट्र शिक्षा परिषद तर्फे';
 
   @override
   String get splashLoading => 'लोड होत आहे…';
@@ -79,13 +80,4 @@ class AppLocalizationsMr extends AppLocalizations {
 
   @override
   String get chipSecure => 'सुरक्षित';
-
-  @override
-  String get badgeGovtCertified => 'सरकारी प्रमाणित  |  Govt. Certified';
-
-  @override
-  String get badgeSslSecured => 'SSL सुरक्षित  |  SSL Secured';
-
-  @override
-  String get badgeCertInCompliant => 'CERT-In अनुपालन  |  CERT-In Compliant';
 }

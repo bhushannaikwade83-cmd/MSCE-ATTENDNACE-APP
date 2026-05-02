@@ -1,10 +1,12 @@
 import 'dart:async';
 
-import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
+import 'package:flutter/foundation.dart' show kDebugMode, kIsWeb, debugPrint;
 import 'package:geolocator/geolocator.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../core/app_db.dart';
+import '../core/gps_attendance_constants.dart';
+import 'gps_fence_sample.dart';
 
 /// Geofence / GPS settings (Supabase `gps_settings` + `institute_geofence`).
 class GeofenceService {
@@ -75,7 +77,7 @@ class GeofenceService {
         return {'success': false, 'message': 'Geofence is not locked'};
       }
 
-      const double radius = 30.0;
+      final double radius = kAttendanceFenceRadiusMeters;
       final latitude = (row['latitude'] as num?)?.toDouble();
       final longitude = (row['longitude'] as num?)?.toDouble();
 
@@ -189,9 +191,23 @@ class GeofenceService {
     }
   }
 
+  Future<Map<String, dynamic>?> fetchProfileForLocationGate(String userId) async {
+    try {
+      return await _db
+          .from('profiles')
+          .select('institute_id, role')
+          .eq('id', userId)
+          .maybeSingle();
+    } catch (e) {
+      if (kDebugMode) debugPrint('fetchProfileForLocationGate: $e');
+      return null;
+    }
+  }
+
   Future<Map<String, dynamic>> checkAdminLocationStatus({
     required String instituteId,
     required String adminId,
+    bool fastFenceSampleForLogin = false,
   }) async {
     try {
       final details = await getGeofenceDetails(
@@ -213,7 +229,7 @@ class GeofenceService {
       final latitude = (details['latitude'] as num?)?.toDouble();
       final longitude = (details['longitude'] as num?)?.toDouble();
 
-      const double radius = 30.0;
+      final double radius = kAttendanceFenceRadiusMeters;
 
       final hasLocation = latitude != null &&
           longitude != null &&
@@ -231,13 +247,20 @@ class GeofenceService {
       }
 
       try {
-        final position = await Geolocator.getCurrentPosition(
-          locationSettings: const LocationSettings(
-            accuracy: LocationAccuracy.high,
-          ),
+        final sample = await samplePositionAgainstFence(
+          fenceLat: latitude,
+          fenceLng: longitude,
+          radiusMeters: radius,
+          maxSamples: fastFenceSampleForLogin ? 4 : 7,
+          delayBetweenSamples: fastFenceSampleForLogin
+              ? const Duration(milliseconds: 500)
+              : const Duration(milliseconds: 1200),
+          firstSampleTimeoutSeconds: fastFenceSampleForLogin ? 10 : 16,
+          laterSampleTimeoutSeconds: fastFenceSampleForLogin ? 8 : 12,
+          tryRecentLastKnownFirst: fastFenceSampleForLogin,
         );
 
-        if (position.isMocked) {
+        if (sample.mockedDetected) {
           return {
             'isLocked': isLocked,
             'hasLocation': true,
@@ -247,16 +270,18 @@ class GeofenceService {
           };
         }
 
-        final distance = Geolocator.distanceBetween(
-          position.latitude,
-          position.longitude,
-          latitude!,
-          longitude!,
-        );
+        if (sample.errorMessage != null) {
+          return {
+            'isLocked': isLocked,
+            'hasLocation': true,
+            'isWithinRadius': null,
+            'distance': null,
+            'message': sample.errorMessage,
+          };
+        }
 
-        final gpsAccuracy = position.accuracy;
-        final effectiveRadius = radius + (gpsAccuracy > 0 ? gpsAccuracy : 0);
-        final isWithinRadius = distance <= effectiveRadius;
+        final isWithinRadius = sample.isWithinFence;
+        final distance = sample.bestDistanceMeters;
 
         return {
           'isLocked': isLocked,
@@ -287,19 +312,368 @@ class GeofenceService {
     }
   }
 
+  /// Locked [gps_settings] row admin for this institute (most recently locked first).
+  Future<String?> lockedFenceAdminIdForInstitute(String instituteId) async {
+    final id = instituteId.trim();
+    if (id.isEmpty) return null;
+    try {
+      final rows = await _db
+          .from('gps_settings')
+          .select('admin_id, latitude, longitude, locked_at')
+          .eq('institute_id', id)
+          .eq('is_locked', true);
+
+      final list = (rows as List)
+          .map((e) => Map<String, dynamic>.from(e as Map))
+          .where((map) {
+            final lat = (map['latitude'] as num?)?.toDouble();
+            final lng = (map['longitude'] as num?)?.toDouble();
+            return lat != null &&
+                lng != null &&
+                (lat.abs() > 1e-9 || lng.abs() > 1e-9);
+          })
+          .toList();
+
+      if (list.isEmpty) return null;
+
+      int lockedRank(Map<String, dynamic> m) {
+        final ts = m['locked_at'];
+        if (ts == null) return 0;
+        final t = DateTime.tryParse(ts.toString());
+        return t?.millisecondsSinceEpoch ?? 0;
+      }
+
+      list.sort((a, b) => lockedRank(b).compareTo(lockedRank(a)));
+      return list.first['admin_id']?.toString();
+    } catch (e) {
+      if (kDebugMode) debugPrint('❌ lockedFenceAdminIdForInstitute: $e');
+      return null;
+    }
+  }
+
+  /// [admin] and [attendance_user] must be inside the institute’s locked fence; staff uses the admin’s institute GPS row.
+  /// Skipped on web. Other roles bypass.
+  Future<Map<String, dynamic>> attendanceLocationGateForCurrentUser({
+    Map<String, dynamic>? preloadedProfile,
+    bool fastFenceSampleForLogin = false,
+  }) async {
+    if (kIsWeb) return {'allowed': true};
+
+    final user = _db.auth.currentUser;
+    if (user == null) return {'allowed': true};
+
+    Map<String, dynamic> deny({required String message, double? distance}) =>
+        {'allowed': false, 'message': message, 'distance': distance};
+
+    try {
+      final profile = preloadedProfile ??
+          await _db
+              .from('profiles')
+              .select('institute_id, role')
+              .eq('id', user.id)
+              .maybeSingle();
+
+      if (profile == null) return deny(message: 'Profile not found.');
+      final role = (profile['role'] ?? '').toString().trim().toLowerCase();
+      final instituteId = profile['institute_id']?.toString().trim();
+
+      if (instituteId == null || instituteId.isEmpty) {
+        return deny(message: 'No institute linked to this account.');
+      }
+
+      final isAdmin = role == 'admin';
+      final isInstructor = role == 'attendance_user';
+      if (!isAdmin && !isInstructor) return {'allowed': true};
+
+      late final String fenceAdminId;
+      if (isAdmin) {
+        fenceAdminId = user.id;
+      } else {
+        final fid = await lockedFenceAdminIdForInstitute(instituteId);
+        if (fid == null || fid.isEmpty) {
+          return deny(message: 'Institute attendance GPS is not locked yet. Ask your admin to complete GPS Settings.');
+        }
+        fenceAdminId = fid;
+      }
+
+      final status = await checkAdminLocationStatus(
+        instituteId: instituteId,
+        adminId: fenceAdminId,
+        fastFenceSampleForLogin: fastFenceSampleForLogin,
+      );
+
+      final isLocked = status['isLocked'] == true;
+      final hasLocation = status['hasLocation'] == true;
+      final within = status['isWithinRadius'] as bool?;
+      final distance = status['distance'] as double?;
+
+      if (!hasLocation || !isLocked) {
+        return deny(message: '${status['message'] ?? 'Attendance zone unavailable'}. Ask your institute admin.', distance: distance);
+      }
+
+      if (within == true) return {'allowed': true, 'distance': distance};
+
+      final rLabel = kAttendanceFenceRadiusMeters.toStringAsFixed(0);
+
+      if (within == false && distance != null) {
+        return deny(
+          distance: distance,
+          message:
+              'Out of radius: you are about ${distance.toStringAsFixed(0)} m from the institute’s locked attendance point. '
+              'Move within about $rLabel m at your institute premises. All features are blocked until you are inside the zone.'
+              '\n\nआपण संस्थेच्या उपस्थिती क्षेत्राबाहेर आहात — इमारतीवर स्थान पुन्हा तपासा.',
+        );
+      }
+
+      final msg = status['message']?.toString();
+      final detail = msg == null || msg.trim().isEmpty ? 'Unable to verify your location' : msg.trim();
+      return deny(
+        message:
+            '$detail. Turn on GPS, allow location, and tap Check again when you are at the institute.'
+            '\n\nजीपीएस सुरू करा आणि संस्थेत असताना पुन्हा तपासा.',
+        distance: distance,
+      );
+    } catch (e) {
+      if (kDebugMode) debugPrint('attendanceLocationGateForCurrentUser: $e');
+      return deny(message: 'Location check failed. Try again.');
+    }
+  }
+
+  /// Check if user is within attendance radius when marking attendance.
+  /// Returns: {'allowed': bool, 'message': String, 'distance': double}
+  /// Checks actual GPS location distance (must be within 15m).
+  Future<Map<String, dynamic>> checkAttendanceLocationForCurrentUser({
+    Map<String, dynamic>? preloadedProfile,
+  }) async {
+    if (kIsWeb) return {'allowed': true};
+
+    final user = _db.auth.currentUser;
+    if (user == null) return {'allowed': false, 'message': 'Not authenticated'};
+
+    try {
+      final profile = preloadedProfile ??
+          await _db
+              .from('profiles')
+              .select('institute_id, role')
+              .eq('id', user.id)
+              .maybeSingle();
+
+      if (profile == null) {
+        return {'allowed': false, 'message': 'Profile not found'};
+      }
+
+      final role = (profile['role'] ?? '').toString().trim().toLowerCase();
+      final instituteId = profile['institute_id']?.toString().trim();
+
+      if (instituteId == null || instituteId.isEmpty) {
+        return {'allowed': false, 'message': 'No institute linked'};
+      }
+
+      final isAdmin = role == 'admin';
+      final isInstructor = role == 'attendance_user';
+
+      if (!isAdmin && !isInstructor) {
+        return {'allowed': true}; // Non-staff roles not restricted
+      }
+
+      // Get the locked GPS point for this institute
+      late final String fenceAdminId;
+      if (isAdmin) {
+        fenceAdminId = user.id;
+      } else {
+        final fid = await lockedFenceAdminIdForInstitute(instituteId);
+        if (fid == null || fid.isEmpty) {
+          return {
+            'allowed': false,
+            'message': 'Institute attendance GPS is not locked yet'
+          };
+        }
+        fenceAdminId = fid;
+      }
+
+      // Get GPS settings
+      final gpsSettings = await _db
+          .from('gps_settings')
+          .select('latitude, longitude, is_locked, radius')
+          .eq('institute_id', instituteId)
+          .eq('admin_id', fenceAdminId)
+          .maybeSingle();
+
+      if (gpsSettings == null) {
+        return {'allowed': false, 'message': 'GPS settings not found'};
+      }
+
+      if (gpsSettings['is_locked'] != true) {
+        return {
+          'allowed': false,
+          'message': 'Attendance zone not locked'
+        };
+      }
+
+      final lockedLat = (gpsSettings['latitude'] as num?)?.toDouble();
+      final lockedLng = (gpsSettings['longitude'] as num?)?.toDouble();
+
+      if (lockedLat == null || lockedLng == null) {
+        return {
+          'allowed': false,
+          'message': 'GPS coordinates missing'
+        };
+      }
+
+      // Get current location
+      try {
+        final position = await Geolocator.getCurrentPosition(
+          locationSettings: const LocationSettings(
+            accuracy: LocationAccuracy.high,
+          ),
+        );
+
+        // Check for mock location
+        if (position.isMocked) {
+          return {
+            'allowed': false,
+            'message': 'Fake GPS detected. Please turn off Mock Location apps.',
+          };
+        }
+
+        // Calculate distance
+        final radius = kAttendanceFenceRadiusMeters;
+        final distance = Geolocator.distanceBetween(
+          position.latitude,
+          position.longitude,
+          lockedLat,
+          lockedLng,
+        );
+
+        if (distance <= radius) {
+          return {
+            'allowed': true,
+            'distance': distance,
+          };
+        } else {
+          return {
+            'allowed': false,
+            'message':
+                'You are about ${distance.toStringAsFixed(0)} m away from the institute. '
+                'Move within about ${radius.toStringAsFixed(0)} m to mark attendance.',
+            'distance': distance,
+          };
+        }
+      } catch (e) {
+        if (kDebugMode) debugPrint('⚠️ Error getting current position: $e');
+        return {
+          'allowed': false,
+          'message': 'Cannot verify location. Ensure GPS is enabled: $e',
+        };
+      }
+    } catch (e) {
+      if (kDebugMode) debugPrint('Error checking attendance location: $e');
+      return {
+        'allowed': false,
+        'message': 'Location check failed: $e',
+      };
+    }
+  }
+
+  /// Per-admin [gps_settings]: non-zero lat/lng and [is_locked] (same rule as post-login navigation).
+  /// Non-admin roles always return true so teachers are not blocked.
+  Future<bool> hasValidPersonalGpsForCurrentAdmin({
+    Map<String, dynamic>? preloadedProfile,
+  }) async {
+    final user = _db.auth.currentUser;
+    if (user == null) return true;
+
+    try {
+      final profile = preloadedProfile ??
+          await _db
+              .from('profiles')
+              .select('institute_id, role')
+              .eq('id', user.id)
+              .maybeSingle();
+
+      if (profile == null) return false;
+
+      final role = profile['role'] as String?;
+      final instituteId = profile['institute_id'] as String?;
+
+      if (role == 'attendance_user') {
+        if (instituteId == null || instituteId.isEmpty) return false;
+        final fenceAdminId = await lockedFenceAdminIdForInstitute(instituteId);
+        if (fenceAdminId == null || fenceAdminId.isEmpty) {
+          if (kDebugMode) {
+            debugPrint('🛰️ Attendance staff: institute has no valid locked GPS yet');
+          }
+          return false;
+        }
+        return true;
+      }
+
+      if (role != 'admin' || instituteId == null || instituteId.isEmpty) {
+        return true;
+      }
+
+      final gpsSettings = await _db
+          .from('gps_settings')
+          .select('latitude, longitude, is_locked')
+          .eq('institute_id', instituteId)
+          .eq('admin_id', user.id)
+          .maybeSingle();
+
+      if (gpsSettings == null) {
+        if (kDebugMode) debugPrint('🛰️ GPS settings not found for admin');
+        return false;
+      }
+
+      if (gpsSettings['is_locked'] != true) {
+        if (kDebugMode) debugPrint('🛰️ GPS not locked for admin');
+        return false;
+      }
+
+      final lat = gpsSettings['latitude'];
+      final lng = gpsSettings['longitude'];
+      final hasValidCoordinates = lat != null &&
+          lng != null &&
+          lat.toString().isNotEmpty &&
+          lng.toString().isNotEmpty &&
+          (lat as num) != 0.0 &&
+          (lng as num) != 0.0;
+
+      if (kDebugMode) {
+        if (hasValidCoordinates) {
+          debugPrint('✅ GPS is configured and locked: $lat, $lng');
+        } else {
+          debugPrint('❌ GPS coordinates are missing or invalid');
+        }
+      }
+
+      return hasValidCoordinates;
+    } catch (e) {
+      if (kDebugMode) debugPrint('Error checking GPS configuration: $e');
+      return false;
+    }
+  }
+
+  /// Bumps legacy 25m / 30m rows to [kAttendanceFenceRadiusMeters].
   Future<Map<String, dynamic>> migrateRadiusTo30Meters() async {
     try {
       int updatedCount = 0;
+      final target = kAttendanceFenceRadiusMeters;
       final institutes = await _db.from('institutes').select('id');
       for (final inst in institutes) {
         final iid = inst['id'] as String;
         final gpsRows = await _db.from('gps_settings').select().eq('institute_id', iid);
         for (final g in gpsRows) {
           final r = (g['radius'] as num?)?.toDouble() ?? 0.0;
-          if (r >= 24.9 && r <= 25.1) {
+          if ((r >= 24.9 && r <= 25.1) || (r >= 29.0 && r <= 31.0)) {
             await _db
                 .from('gps_settings')
-                .update({'radius': 30.0, 'extra': {'radiusMigratedFrom': 25.0}})
+                .update({
+                  'radius': target,
+                  'extra': {
+                    'radiusMigratedFrom': r,
+                    'radiusMigratedAt': DateTime.now().toUtc().toIso8601String(),
+                  },
+                })
                 .eq('institute_id', iid)
                 .eq('admin_id', g['admin_id']);
             updatedCount++;
@@ -308,9 +682,11 @@ class GeofenceService {
         final gf = await _db.from('institute_geofence').select().eq('institute_id', iid).maybeSingle();
         if (gf != null) {
           final data = gf['data'];
-          final r = data is Map && data['radius'] != null ? (data['radius'] as num).toDouble() : (gf['radius'] as num?)?.toDouble() ?? 0;
-          if (r >= 24.9 && r <= 25.1) {
-            await _db.from('institute_geofence').update({'radius': 30.0}).eq('institute_id', iid);
+          final r = data is Map && data['radius'] != null
+              ? (data['radius'] as num).toDouble()
+              : (gf['radius'] as num?)?.toDouble() ?? 0;
+          if ((r >= 24.9 && r <= 25.1) || (r >= 29.0 && r <= 31.0)) {
+            await _db.from('institute_geofence').update({'radius': target}).eq('institute_id', iid);
             updatedCount++;
           }
         }
@@ -321,10 +697,10 @@ class GeofenceService {
         final val = global['value'];
         if (val is Map && val['radius'] != null) {
           final r = (val['radius'] as num).toDouble();
-          if (r >= 24.9 && r <= 25.1) {
+          if ((r >= 24.9 && r <= 25.1) || (r >= 29.0 && r <= 31.0)) {
             await _db.from('system_settings').upsert({
               'key': 'gps_config',
-              'value': {...val, 'radius': 30.0},
+              'value': {...val, 'radius': target},
               'updated_at': DateTime.now().toUtc().toIso8601String(),
             });
             updatedCount++;
@@ -336,7 +712,7 @@ class GeofenceService {
         'success': true,
         'updatedCount': updatedCount,
         'errorCount': 0,
-        'message': 'Migration completed: Updated $updatedCount settings to 30 meters.',
+        'message': 'Migration completed: Updated $updatedCount settings to ${target.toStringAsFixed(0)} meters.',
         'errors': <String>[],
       };
     } catch (e) {

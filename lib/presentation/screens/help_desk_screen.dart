@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_screenutil/flutter_screenutil.dart';
 import '../../core/theme/app_theme.dart';
 import '../../core/utils/responsive.dart';
+import '../../core/utils/responsive_page.dart';
 
 class HelpDeskScreen extends StatelessWidget {
   static const routeName = '/help-desk';
@@ -20,29 +21,31 @@ class HelpDeskScreen extends StatelessWidget {
         foregroundColor: Colors.white,
         elevation: 0,
       ),
-      body: SingleChildScrollView(
-        padding: EdgeInsets.all(Responsive.pctWidth(context, 0.04).clamp(12.0, 24.0)),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
+      body: ResponsiveScrollBody(
+            physics: const AlwaysScrollableScrollPhysics(),
+            padding: EdgeInsets.all(Responsive.vw(context, 4).clamp(12.0, 24.0)),
+            child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
             _buildSection(
               context,
               'Getting Started',
               Icons.play_circle_outline,
               [
                 _buildInstruction(
-                  '1. Create Batches',
-                  'First, create batches for your classes. Go to Batch Management and add a new batch with name, year, timing (start and end time), and subjects.',
+                  '1. Institute hours',
+                  'Set open and close times for your institute (admin dashboard). These define the daily schedule used for attendance flow.',
                   isDark,
                 ),
                 _buildInstruction(
                   '2. Add Students',
-                  'Navigate to Student Management and add students. Select their batch - the batch timing will be automatically used for attendance. Take a clear photo of the student for face recognition.',
+                  'Open Student Management and add each student with subjects and a clear, recent photo — it is used to confirm identity when marking attendance.',
                   isDark,
                 ),
                 _buildInstruction(
                   '3. Set GPS Location',
-                  'Go to GPS Settings and set your institute location. Students must be within 30 meters of this location to mark attendance.',
+                  'Go to GPS Settings and set your institute location. Students must be within 15 meters of this location to mark attendance.',
                   isDark,
                 ),
               ],
@@ -70,8 +73,8 @@ class HelpDeskScreen extends StatelessWidget {
                   isDark,
                 ),
                 _buildInstruction(
-                  'Face Recognition',
-                  'The system uses face recognition to verify student identity. Students must take a live photo (not a photo of a photo). The system checks for face match, liveness, and prevents fraud.',
+                  'Photo at attendance',
+                  'Students should use the in-app camera at entry and exit. The photo should match the person present; use good lighting and a steady shot.',
                   isDark,
                 ),
               ],
@@ -89,8 +92,8 @@ class HelpDeskScreen extends StatelessWidget {
                   isDark,
                 ),
                 _buildInstruction(
-                  'Live Photo Only',
-                  'Students must take a live photo. Photos of photos, screenshots, or printed images will be rejected by the system.',
+                  'Use the live camera',
+                  'Take the picture directly in the app. Do not use a photo of another screen, a printout, or a gallery image when prompted for attendance.',
                   isDark,
                 ),
                 _buildInstruction(
@@ -142,47 +145,18 @@ class HelpDeskScreen extends StatelessWidget {
                   isDark,
                 ),
                 _buildInstruction(
-                  'Face Not Recognized',
-                  'The face recognition system requires a clear match. Ensure the student\'s photo during registration matches their current appearance. Good lighting and clear visibility are essential.',
+                  'Photo not accepted',
+                  'Make sure the student\'s registration photo still looks like them, use bright, even lighting, and face the camera directly. Try again after adjusting position or light.',
                   isDark,
                 ),
                 _buildInstruction(
                   'GPS Error',
-                  'Make sure location permissions are enabled and GPS is turned on. Students must be within 30 meters of the institute location.',
+                  'Make sure location permissions are enabled and GPS is turned on. Students must be within 15 meters of the institute location.',
                   isDark,
                 ),
                 _buildInstruction(
                   'No Internet Connection',
-                  'Attendance data is saved offline and will sync automatically when internet connection is restored. Check the sync status indicator in the top bar.',
-                  isDark,
-                ),
-              ],
-              isDark,
-            ),
-            SizedBox(height: 24.h),
-            _buildSection(
-              context,
-              'Security Features',
-              Icons.security,
-              [
-                _buildInstruction(
-                  'Face Recognition',
-                  'Advanced face recognition technology prevents students from using photos of other students or printed images.',
-                  isDark,
-                ),
-                _buildInstruction(
-                  'GPS Verification',
-                  'Location-based verification ensures attendance can only be marked from the institute premises.',
-                  isDark,
-                ),
-                _buildInstruction(
-                  'Time Windows',
-                  'Strict time windows for entry and exit prevent students from marking attendance outside of class hours.',
-                  isDark,
-                ),
-                _buildInstruction(
-                  'Liveness Detection',
-                  'The system detects if a live person is present, preventing use of photos, videos, or masks.',
+                  'When you are offline, your work is kept on the device and will update when you are back online. Reconnect when you can and open the app again to refresh.',
                   isDark,
                 ),
               ],
@@ -206,20 +180,20 @@ class HelpDeskScreen extends StatelessWidget {
                 ),
                 _buildInstruction(
                   'Clear Background',
-                  'A simple, uncluttered background helps the face recognition system work better.',
+                  'A plain background behind the student makes photos easier to capture and review.',
                   isDark,
                 ),
                 _buildInstruction(
                   'Regular Updates',
-                  'Keep the app updated to the latest version for best performance and security.',
+                  'Install app updates from your app store for the latest improvements and fixes.',
                   isDark,
                 ),
               ],
               isDark,
             ),
             SizedBox(height: 32.h),
-          ],
-        ),
+                ],
+              ),
       ),
     );
   }

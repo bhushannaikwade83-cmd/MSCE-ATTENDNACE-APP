@@ -78,6 +78,11 @@
 	<string>Photo library access lets you choose a profile or attendance image when you pick from gallery.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>Saved images may be stored to your library when you export or save from the app.</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<false/>
+	</dict>
 	<key>CFBundleLocalizations</key>
 	<array>
 		<string>en</string>

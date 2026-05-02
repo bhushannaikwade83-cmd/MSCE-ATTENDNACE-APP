@@ -1,22 +1,34 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:flutter_screenutil/flutter_screenutil.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../../core/app_db.dart';
+import '../../core/gps_attendance_constants.dart';
 import '../../core/utils/responsive.dart';
 import '../../core/theme/app_theme.dart';
 import '../../services/geofence_service.dart';
+import '../../services/institute_realtime_sync_service.dart';
+import 'main_navigation_screen.dart';
 
 class GpsSettingsScreen extends StatefulWidget {
   static const routeName = '/gps-settings';
-  const GpsSettingsScreen({super.key});
+  final bool isMandatory;
+  final bool fromLogin;
+
+  const GpsSettingsScreen({
+    super.key,
+    this.isMandatory = false,
+    this.fromLogin = false,
+  });
 
   @override
   State<GpsSettingsScreen> createState() => _GpsSettingsScreenState();
 }
 
-class _GpsSettingsScreenState extends State<GpsSettingsScreen> {
+class _GpsSettingsScreenState extends State<GpsSettingsScreen> with WidgetsBindingObserver {
   User? get _currentUser => appDb.auth.currentUser;
   bool _isAdmin = false;
   bool _isCheckingRole = true;
@@ -24,16 +36,73 @@ class _GpsSettingsScreenState extends State<GpsSettingsScreen> {
   final _formKey = GlobalKey<FormState>();
   final _latController = TextEditingController();
   final _lngController = TextEditingController();
-  final _radiusController = TextEditingController(text: "30"); // Fixed default 30m
+  final _radiusController = TextEditingController(
+        text: kAttendanceFenceRadiusMeters.toStringAsFixed(0),
+      );
   final GeofenceService _geofenceService = GeofenceService();
   bool _isLoading = false;
   bool _isLocked = false; // Track if location is locked (after lat/lng are set)
   bool _hasLocation = false; // Track if location coordinates exist
+  late bool _isMandatory; // Mandatory GPS setup (from first login)
+  late bool _fromLogin; // Coming from login flow
+
+  /// Poll server so web dashboard unlock / re-lock + new coordinates appear in the app.
+  Timer? _serverPollTimer;
+  String? _lastServerFingerprint;
+  StreamSubscription<InstituteSyncEvent>? _syncSubscription;
+  Timer? _syncDebounce;
+
+  static String _fingerprintForRow(Map<String, dynamic>? row) {
+    if (row == null) return '__none__';
+    final lat = row['latitude'];
+    final lng = row['longitude'];
+    final locked = row['is_locked'] == true;
+    return '$locked|${lat ?? ''}|${lng ?? ''}';
+  }
+
+  void _startServerPolling() {
+    _serverPollTimer?.cancel();
+    _serverPollTimer = Timer.periodic(const Duration(seconds: 6), (_) {
+      if (!mounted || !_isAdmin || _instituteId == null || _isLoading) return;
+      _loadCurrentSettings(silent: true);
+    });
+  }
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _isMandatory = widget.isMandatory;
+    _fromLogin = widget.fromLogin;
+
+    if (kDebugMode) {
+      debugPrint('🛰️ GPS Settings: mandatory=$_isMandatory, fromLogin=$_fromLogin');
+    }
+
     _loadUserInstituteId();
+  }
+
+  @override
+  void dispose() {
+    _serverPollTimer?.cancel();
+    _syncDebounce?.cancel();
+    _syncSubscription?.cancel();
+    final iid = _instituteId;
+    if (iid != null && iid.isNotEmpty) {
+      InstituteRealtimeSyncService.instance.release(iid);
+    }
+    WidgetsBinding.instance.removeObserver(this);
+    _latController.dispose();
+    _lngController.dispose();
+    _radiusController.dispose();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && mounted && _isAdmin && _instituteId != null) {
+      _loadCurrentSettings(silent: true);
+    }
   }
 
   Future<void> _loadUserInstituteId() async {
@@ -48,6 +117,7 @@ class _GpsSettingsScreenState extends State<GpsSettingsScreen> {
 
     try {
       final row = await appDb.from('profiles').select('institute_id,role').eq('id', u.id).maybeSingle();
+      if (!mounted) return;
       if (row == null) {
         setState(() {
           _isCheckingRole = false;
@@ -62,71 +132,113 @@ class _GpsSettingsScreenState extends State<GpsSettingsScreen> {
         _isCheckingRole = false;
       });
       if (_isAdmin && _instituteId != null) {
-        _loadCurrentSettings();
+        await InstituteRealtimeSyncService.instance.retain(_instituteId!);
+        _syncSubscription?.cancel();
+        _syncSubscription = InstituteRealtimeSyncService.instance
+            .watch(_instituteId!)
+            .listen((event) {
+          if (!mounted) return;
+          if (event.type == 'gps' || event.type == 'institute') {
+            _syncDebounce?.cancel();
+            _syncDebounce = Timer(const Duration(milliseconds: 500), () {
+              if (!mounted) return;
+              _loadCurrentSettings(silent: true);
+            });
+          }
+        });
+        await _loadCurrentSettings();
+        _startServerPolling();
       }
     } catch (e) {
       if (kDebugMode) debugPrint('Error checking role: $e');
-      setState(() {
+      if (mounted) setState(() {
         _isCheckingRole = false;
         _isAdmin = false;
       });
     }
   }
 
-  Future<void> _loadCurrentSettings() async {
-    setState(() => _isLoading = true);
+  Future<void> _loadCurrentSettings({bool silent = false}) async {
+    if (!silent && mounted) setState(() => _isLoading = true);
     try {
       final cu = _currentUser;
+      Map<String, dynamic>? row;
       if (_instituteId != null && cu != null) {
-        final row = await appDb
+        row = await appDb
             .from('gps_settings')
             .select()
             .eq('institute_id', _instituteId!)
             .eq('admin_id', cu.id)
             .maybeSingle();
+        if (!mounted) return;
+
+        final fp = _fingerprintForRow(row);
+        if (silent && fp == _lastServerFingerprint) {
+          return;
+        }
+        _lastServerFingerprint = fp;
 
         if (row != null) {
-          final lat = row['latitude'];
-          final lng = row['longitude'];
-          _hasLocation = lat != null &&
+          final r = row;
+          final lat = r['latitude'];
+          final lng = r['longitude'];
+          final hasLoc = lat != null &&
               lng != null &&
               lat.toString().isNotEmpty &&
               lng.toString().isNotEmpty &&
               (lat as num) != 0.0 &&
               (lng as num) != 0.0;
-          if (_hasLocation) {
-            _latController.text = lat.toString();
-            _lngController.text = lng.toString();
-            _isLocked = row['is_locked'] == true;
-          } else {
-            _isLocked = false;
+          if (mounted) {
+            setState(() {
+              _hasLocation = hasLoc;
+              if (hasLoc) {
+                _latController.text = lat.toString();
+                _lngController.text = lng.toString();
+                _isLocked = r['is_locked'] == true;
+              } else {
+                _isLocked = false;
+              }
+              _radiusController.text = kAttendanceFenceRadiusMeters.toStringAsFixed(0);
+            });
           }
-          _radiusController.text = '30';
-          final currentRadius = (row['radius'] as num?)?.toDouble() ?? 0.0;
-          if (currentRadius >= 24.9 && currentRadius <= 25.1) {
+          final currentRadius = (r['radius'] as num?)?.toDouble() ?? 0.0;
+          if ((currentRadius >= 24.9 && currentRadius <= 25.1) ||
+              (currentRadius >= 29.0 && currentRadius <= 31.0)) {
             await appDb
                 .from('gps_settings')
                 .update({
-                  'radius': 30.0,
-                  'extra': {'radiusMigrated_at': DateTime.now().toUtc().toIso8601String(), 'from': 25.0},
+                  'radius': kAttendanceFenceRadiusMeters,
+                  'extra': {
+                    'radiusMigrated_at': DateTime.now().toUtc().toIso8601String(),
+                    'from': currentRadius,
+                  },
                 })
                 .eq('institute_id', _instituteId!)
                 .eq('admin_id', cu.id);
           }
         } else {
-          _radiusController.text = '30';
-          _hasLocation = false;
-          _isLocked = false;
+          if (mounted) {
+            setState(() {
+              _radiusController.text = kAttendanceFenceRadiusMeters.toStringAsFixed(0);
+              _hasLocation = false;
+              _isLocked = false;
+            });
+          }
         }
       } else {
-        _radiusController.text = '30';
-        _hasLocation = false;
-        _isLocked = false;
+        if (mounted) {
+          setState(() {
+            _radiusController.text = kAttendanceFenceRadiusMeters.toStringAsFixed(0);
+            _hasLocation = false;
+            _isLocked = false;
+          });
+        }
+        _lastServerFingerprint = _fingerprintForRow(null);
       }
     } catch (e) {
       debugPrint("Error loading settings: $e");
     } finally {
-      if (mounted) setState(() => _isLoading = false);
+      if (!silent && mounted) setState(() => _isLoading = false);
     }
   }
 
@@ -138,6 +250,7 @@ class _GpsSettingsScreenState extends State<GpsSettingsScreen> {
       if (permission == LocationPermission.denied) {
         permission = await Geolocator.requestPermission();
       }
+      if (!mounted) return;
 
       if (permission == LocationPermission.whileInUse || permission == LocationPermission.always) {
         Position position = await Geolocator.getCurrentPosition(
@@ -145,21 +258,40 @@ class _GpsSettingsScreenState extends State<GpsSettingsScreen> {
             accuracy: LocationAccuracy.high,
           ),
         );
+        if (!mounted) return;
         _latController.text = position.latitude.toString();
         _lngController.text = position.longitude.toString();
         
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
-              content: const Row(
+              content: const Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
                 children: [
-                  Icon(Icons.check_circle, color: Colors.white),
-                  SizedBox(width: 12),
-                  Text("Location fetched successfully!"),
+                  Row(
+                    children: [
+                      Icon(Icons.check_circle, color: Colors.white),
+                      SizedBox(width: 12),
+                      Expanded(
+                          child: Text(
+                        'Location fetched!',
+                        style: TextStyle(fontWeight: FontWeight.w600),
+                      )),
+                    ],
+                  ),
+                  SizedBox(height: 8),
+                  Text(
+                    'Important: Capture your location only while physically at your institute premises. '
+                    'Do not set the attendance point from home or elsewhere.\n'
+                    '(महत्वाचे: ही जागा फक्त संस्थेच्या परिसरातून घ्या.)',
+                    style: TextStyle(fontSize: 13),
+                  ),
                 ],
               ),
               backgroundColor: AppTheme.accentGreen,
               behavior: SnackBarBehavior.floating,
+              duration: const Duration(seconds: 6),
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
             ),
           );
@@ -200,6 +332,34 @@ class _GpsSettingsScreenState extends State<GpsSettingsScreen> {
 
   // 3. Save Settings to Firestore
   Future<void> _saveSettings() async {
+    final latStr = _latController.text.trim();
+    final lngStr = _lngController.text.trim();
+    final latVal = double.tryParse(latStr);
+    final lngVal = double.tryParse(lngStr);
+    if (latStr.isEmpty || lngStr.isEmpty || latVal == null || lngVal == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Row(
+              children: [
+                Icon(Icons.location_off_outlined, color: Colors.white),
+                SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    'Tap “Use Current Location” to fetch coordinates before saving.',
+                  ),
+                ),
+              ],
+            ),
+            backgroundColor: AppTheme.accentRed,
+            behavior: SnackBarBehavior.floating,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+          ),
+        );
+      }
+      return;
+    }
+
     if (!_formKey.currentState!.validate()) return;
     
     if (_instituteId == null) {
@@ -237,6 +397,7 @@ class _GpsSettingsScreenState extends State<GpsSettingsScreen> {
           .eq('institute_id', _instituteId!)
           .eq('admin_id', cu.id)
           .maybeSingle();
+      if (!mounted) return;
 
       final existingData = existingRow;
       final existingLat = existingData?['latitude'];
@@ -252,17 +413,16 @@ class _GpsSettingsScreenState extends State<GpsSettingsScreen> {
         throw 'Location is locked. Contact super admin to unlock for changes.';
       }
 
-      // Radius is ALWAYS fixed at 30M - never changeable
-      // Force radius to 30M regardless of what user entered
-      final radiusToSave = 30.0;
+      // Radius is fixed at the system attendance fence distance
+      final radiusToSave = kAttendanceFenceRadiusMeters;
 
       final ts = DateTime.now().toUtc().toIso8601String();
       final cu2 = _currentUser!;
       await appDb.from('gps_settings').upsert({
         'institute_id': _instituteId,
         'admin_id': cu2.id,
-        'latitude': double.parse(_latController.text),
-        'longitude': double.parse(_lngController.text),
+        'latitude': latVal,
+        'longitude': lngVal,
         'radius': radiusToSave,
         'is_locked': true,
         'locked_at': ts,
@@ -285,12 +445,27 @@ class _GpsSettingsScreenState extends State<GpsSettingsScreen> {
             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
           ),
         );
-        // Keep user on this screen after save; auto-pop can exit to unrelated routes
-        // (e.g. institute search) when GPS settings is hosted inside navigation tabs.
+
         setState(() {
           _hasLocation = true;
           _isLocked = true; // Lock location after saving
         });
+        await _loadCurrentSettings(silent: true);
+
+        // If coming from login with mandatory GPS setup, navigate to home
+        if (_fromLogin && _isMandatory && mounted) {
+          if (kDebugMode) debugPrint('✅ GPS configured from login. Navigating to home...');
+
+          // Navigate to main app after short delay to show success message
+          await Future.delayed(const Duration(milliseconds: 500));
+          if (mounted) {
+            Navigator.pushNamedAndRemoveUntil(
+              context,
+              MainNavigationScreen.routeName,
+              (route) => false,
+            );
+          }
+        }
       }
     } catch (e) {
       if (mounted) {
@@ -322,11 +497,21 @@ class _GpsSettingsScreenState extends State<GpsSettingsScreen> {
       );
     }
 
+    final blockBackUntilGpsSaved = _isAdmin && !_hasLocation;
+
     return PopScope(
-      canPop: Navigator.of(context).canPop(),
+      canPop: !blockBackUntilGpsSaved && Navigator.of(context).canPop(),
       onPopInvokedWithResult: (didPop, result) {
-        // Pop already happened if didPop is true, no action needed
-        // If didPop is false, pop was prevented (no previous route), also no action needed
+        if (!didPop && blockBackUntilGpsSaved && mounted) {
+          if (kDebugMode) debugPrint('⚠️ Cannot exit until admin GPS is saved');
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Save your GPS zone before leaving this screen.'),
+              backgroundColor: Colors.orange,
+              duration: Duration(seconds: 2),
+            ),
+          );
+        }
       },
       child: Scaffold(
         backgroundColor: AppTheme.backgroundGrey,
@@ -366,7 +551,8 @@ class _GpsSettingsScreenState extends State<GpsSettingsScreen> {
                         const SizedBox(width: 16),
                         Expanded(
                           child: Text(
-                            "Set your personal attendance zone. Each admin has their own geo-fencing settings. You can only mark attendance within your configured radius.",
+                            "Set your personal attendance zone. Each admin has their own geo-fencing settings. You can only mark attendance within your configured radius.\n\n"
+                            "Unlock or save location on the website? This screen updates automatically every few seconds, and when you return to the app.",
                             style: Theme.of(context).textTheme.bodyLarge?.copyWith(
                               color: AppTheme.textGray,
                             ),
@@ -394,7 +580,7 @@ class _GpsSettingsScreenState extends State<GpsSettingsScreen> {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           const Text(
-                            "Radius Fixed at 30M",
+                            "Radius fixed at 15 m",
                             style: TextStyle(
                               fontWeight: FontWeight.bold,
                               color: Colors.blue,
@@ -403,7 +589,7 @@ class _GpsSettingsScreenState extends State<GpsSettingsScreen> {
                           ),
                           const SizedBox(height: 4),
                           Text(
-                            "Radius is permanently fixed at 30 meters for all institutes and cannot be changed.",
+                            "Attendance may only be marked within 15 meters of your locked point. This radius cannot be changed.",
                             style: TextStyle(
                               color: Colors.blue.withValues(alpha: 0.8),
                               fontSize: 12,
@@ -418,45 +604,54 @@ class _GpsSettingsScreenState extends State<GpsSettingsScreen> {
               const SizedBox(height: 24),
 
               // Location Lock Banner (Only shown if location is set and locked)
-              if (_isLocked)
-                Container(
-                  padding: const EdgeInsets.all(16),
-                  decoration: BoxDecoration(
-                    color: Colors.orange.withValues(alpha: 0.1),
-                    border: Border.all(color: Colors.orange, width: 2),
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: Row(
-                    children: [
-                      const Icon(Icons.lock, color: Colors.orange, size: 24),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            const Text(
-                              "Location Locked",
-                              style: TextStyle(
-                                fontWeight: FontWeight.bold,
-                                color: Colors.orange,
-                                fontSize: 16,
-                              ),
-                            ),
-                            const SizedBox(height: 4),
-                            Text(
-                              "Location coordinates are locked after being set. Contact super admin to unlock for changes.",
-                              style: TextStyle(
-                                color: Colors.orange.withValues(alpha: 0.8),
-                                fontSize: 12,
-                              ),
-                            ),
-                          ],
-                        ),
+              Visibility(
+                visible: _isLocked,
+                maintainSize: true,
+                maintainAnimation: true,
+                maintainState: true,
+                child: Column(
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: Colors.orange.withValues(alpha: 0.1),
+                        border: Border.all(color: Colors.orange, width: 2),
+                        borderRadius: BorderRadius.circular(12),
                       ),
-                    ],
-                  ),
+                      child: Row(
+                        children: [
+                          const Icon(Icons.lock, color: Colors.orange, size: 24),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const Text(
+                                  "Location Locked",
+                                  style: TextStyle(
+                                    fontWeight: FontWeight.bold,
+                                    color: Colors.orange,
+                                    fontSize: 16,
+                                  ),
+                                ),
+                                const SizedBox(height: 4),
+                                Text(
+                                  "Location coordinates are locked after being set. Contact super admin to unlock for changes.",
+                                  style: TextStyle(
+                                    color: Colors.orange.withValues(alpha: 0.8),
+                                    fontSize: 12,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 24),
+                  ],
                 ),
-              if (_isLocked) const SizedBox(height: 24),
+              ),
 
               Text(
                 "School Coordinates",
@@ -476,9 +671,10 @@ class _GpsSettingsScreenState extends State<GpsSettingsScreen> {
                       decoration: const InputDecoration(
                         labelText: "Latitude",
                         prefixIcon: Icon(Icons.map_outlined),
+                        helperText: "Auto-filled — use current location",
+                        helperMaxLines: 2,
                       ),
-                      validator: (v) => v!.isEmpty ? "Required" : null,
-                      enabled: !_isLocked,
+                      enabled: false,
                     ),
                   ),
                   const SizedBox(width: 12),
@@ -489,9 +685,10 @@ class _GpsSettingsScreenState extends State<GpsSettingsScreen> {
                       decoration: const InputDecoration(
                         labelText: "Longitude",
                         prefixIcon: Icon(Icons.map_outlined),
+                        helperText: "Auto-filled — use current location",
+                        helperMaxLines: 2,
                       ),
-                      validator: (v) => v!.isEmpty ? "Required" : null,
-                      enabled: !_isLocked,
+                      enabled: false,
                     ),
                   ),
                 ],
@@ -528,21 +725,21 @@ class _GpsSettingsScreenState extends State<GpsSettingsScreen> {
                 decoration: InputDecoration(
                   labelText: "Radius in Meters",
                   prefixIcon: const Icon(Icons.radar_outlined),
-                  helperText: "Radius is ALWAYS fixed at 30M for all admins. Cannot be changed, even by super admin.",
+                  helperText:
+                      "Radius is fixed at 15 m for all admins. It cannot be changed, even by super admin.",
                   helperMaxLines: 2,
                 ),
                 validator: (v) {
-                  // Always validate as 30.0 - no other value allowed
                   if (v!.isEmpty) return "Required";
                   final radius = double.tryParse(v);
                   if (radius == null) return "Invalid number";
-                  if (radius != 30.0) {
-                    return "Radius must be exactly 30M. This is a system-wide constant.";
+                  if (radius != kAttendanceFenceRadiusMeters) {
+                    return "Radius must be exactly ${kAttendanceFenceRadiusMeters.toStringAsFixed(0)} m.";
                   }
                   return null;
                 },
-                enabled: false, // ALWAYS disabled - radius never changes
-                readOnly: true, // ALWAYS read-only - radius is fixed at 30m
+                enabled: false,
+                readOnly: true,
               ),
 
               const SizedBox(height: 40),

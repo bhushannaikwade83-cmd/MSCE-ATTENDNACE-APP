@@ -1,48 +1,58 @@
 import 'package:flutter/material.dart';
+import '../core/root_navigator.dart';
 import '../presentation/widgets/institute_status_dialog.dart';
 import '../presentation/screens/admin_home_screen.dart';
+import '../presentation/screens/student_management_screen.dart';
 import 'institute_status_service.dart';
 
-/// Global notification handler for processing notification taps
+/// Global notification handler for processing notification taps (uses [rootNavigatorKey]).
 class NotificationHandler {
-  static BuildContext? _context;
-  static String? _currentInstituteId;
-
-  /// Set the current context and institute ID
-  static void setContext(BuildContext? context, String? instituteId) {
-    _context = context;
-    _currentInstituteId = instituteId;
-  }
-
-  /// Handle notification tap based on payload
+  /// Handle notification tap based on payload (expects `action|...` segments).
   static Future<void> handleNotificationTap(String? payload) async {
-    if (payload == null || _context == null) return;
+    if (payload == null) return;
 
     final parts = payload.split('|');
     if (parts.length < 2) return;
 
     final action = parts[0];
+
+    if (action == 'pending_exit' && parts.length >= 5) {
+      final rollKey = parts[2];
+      final subjectTag = parts[4];
+      final subjectHint = subjectTag == 'all' ? '' : ' — $subjectTag';
+      rootNavigatorKey.currentState?.pushNamed(StudentManagementScreen.routeName);
+      await Future.delayed(const Duration(milliseconds: 450));
+      final ctxSnack = rootNavigatorKey.currentContext;
+      if (ctxSnack != null && ctxSnack.mounted) {
+        ScaffoldMessenger.of(ctxSnack).showSnackBar(
+          SnackBar(
+            content: Text('Finish exit attendance for roll $rollKey$subjectHint'),
+            duration: const Duration(seconds: 6),
+          ),
+        );
+      }
+      return;
+    }
+
     final instituteId = parts[1];
 
-    // Navigate to admin home if not already there
-    if (_context != null && _context!.mounted) {
-      // Navigate to admin home screen
-      Navigator.of(_context!).pushNamedAndRemoveUntil(
+    final nav = rootNavigatorKey.currentState;
+    if (nav != null) {
+      nav.pushNamedAndRemoveUntil(
         AdminHomeScreen.routeName,
         (route) => false,
       );
 
-      // Wait a bit for navigation to complete
       await Future.delayed(const Duration(milliseconds: 500));
 
-      // Show institute status dialog
-      if (_context != null && _context!.mounted) {
-        final statusService = InstituteStatusService();
-        final status = await statusService.getTodayStatus(instituteId);
-        final currentStatus = status?['status'] as String?;
+      final statusService = InstituteStatusService();
+      final status = await statusService.getTodayStatus(instituteId);
+      final currentStatus = status?['status'] as String?;
 
+      final ctxDialog = rootNavigatorKey.currentContext;
+      if (ctxDialog != null && ctxDialog.mounted) {
         showDialog(
-          context: _context!,
+          context: ctxDialog,
           builder: (context) => InstituteStatusDialog(
             instituteId: instituteId,
             currentStatus: currentStatus,

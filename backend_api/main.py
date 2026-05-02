@@ -20,10 +20,27 @@ import os
 import tempfile
 import traceback
 
-# Import face recognition modules
-from face_service import FaceRecognitionService
-from vector_db import VectorDatabase
-from anti_spoof_service import AntiSpoofService
+_face_service_import_error: Optional[Exception] = None
+_vector_db_import_error: Optional[Exception] = None
+_anti_spoof_import_error: Optional[Exception] = None
+
+try:
+    from face_service import FaceRecognitionService
+except Exception as exc:
+    FaceRecognitionService = None
+    _face_service_import_error = exc
+
+try:
+    from vector_db import VectorDatabase
+except Exception as exc:
+    VectorDatabase = None
+    _vector_db_import_error = exc
+
+try:
+    from anti_spoof_service import AntiSpoofService
+except Exception as exc:
+    AntiSpoofService = None
+    _anti_spoof_import_error = exc
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -96,48 +113,6 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
         content={"detail": exc.detail}
     )
 
-# Validation error handler for 422 errors
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    """Handle validation errors (422) with detailed messages"""
-    errors = exc.errors()
-    error_messages = []
-    
-    for error in errors:
-        loc = " -> ".join(str(loc) for loc in error.get("loc", []))
-        msg = error.get("msg", "Validation error")
-        error_type = error.get("type", "unknown")
-        input_value = error.get("input", "N/A")
-        
-        # Create user-friendly error message
-        if "missing" in error_type:
-            error_messages.append(f"Missing required field: {loc}")
-        elif "type_error" in error_type or "float_parsing" in error_type:
-            error_messages.append(f"Invalid type for {loc}: expected {error_type}, got {type(input_value).__name__} (value: {input_value})")
-        else:
-            error_messages.append(f"{loc}: {msg}")
-    
-    error_detail = "; ".join(error_messages) if error_messages else "Validation error"
-    
-    # Log validation error
-    logger.warning(f"⚠️ Validation error (422): {error_detail}")
-    logger.warning(f"   Path: {request.url.path}")
-    logger.warning(f"   Method: {request.method}")
-    logger.warning(f"   Errors: {errors}")
-    
-    return JSONResponse(
-        status_code=422,
-        content={
-            "detail": error_detail,
-            "errors": errors,
-            "help": "Please check that all required fields are provided with correct types. "
-                   "For multipart/form-data: file (required), institute_id (string, required), "
-                   "threshold (float, optional), student_id (string, required for register), "
-                   "roll_number (string, required for register/verify), name (string, required for register)."
-        },
-        headers={"Access-Control-Allow-Origin": "*"}
-    )
-
 # Global exception handler to catch any unhandled exceptions
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
@@ -188,10 +163,53 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def _build_dependency_status() -> dict:
+    return {
+        "face_service": {
+            "available": FaceRecognitionService is not None,
+            "error": str(_face_service_import_error) if _face_service_import_error else None,
+        },
+        "vector_db": {
+            "available": VectorDatabase is not None,
+            "error": str(_vector_db_import_error) if _vector_db_import_error else None,
+        },
+        "anti_spoof_service": {
+            "available": AntiSpoofService is not None,
+            "error": str(_anti_spoof_import_error) if _anti_spoof_import_error else None,
+        },
+    }
+
+def _raise_missing_dependency(service_name: str, import_error: Optional[Exception]) -> None:
+    detail = f"{service_name} is unavailable"
+    if import_error:
+        detail += f": {import_error}"
+    raise HTTPException(status_code=503, detail=detail)
+
+def _ensure_face_service() -> "FaceRecognitionService":
+    if FaceRecognitionService is None or _face_service_import_error is not None:
+        _raise_missing_dependency("Face recognition service", _face_service_import_error)
+    if face_service is None:
+        _raise_missing_dependency("Face recognition service", _face_service_import_error)
+    return face_service
+
+def _ensure_vector_db() -> "VectorDatabase":
+    if VectorDatabase is None or _vector_db_import_error is not None:
+        _raise_missing_dependency("Vector database", _vector_db_import_error)
+    if vector_db is None:
+        _raise_missing_dependency("Vector database", _vector_db_import_error)
+    return vector_db
+
+def _ensure_anti_spoof_service() -> "AntiSpoofService":
+    if AntiSpoofService is None or _anti_spoof_import_error is not None:
+        _raise_missing_dependency("Anti-spoof service", _anti_spoof_import_error)
+    if anti_spoof_service is None:
+        _raise_missing_dependency("Anti-spoof service", _anti_spoof_import_error)
+    return anti_spoof_service
+
 # Initialize services
-face_service = FaceRecognitionService()
-vector_db = VectorDatabase()
-anti_spoof_service = AntiSpoofService()
+face_service = FaceRecognitionService() if FaceRecognitionService else None
+vector_db = VectorDatabase() if VectorDatabase else None
+anti_spoof_service = AntiSpoofService() if AntiSpoofService else None
 
 # Helper function to clean base64 strings
 def clean_base64_string(base64_str: str) -> str:
@@ -299,11 +317,14 @@ async def startup_event():
     logger.info("🚀 Starting Face Recognition API...")
     # Lazy load model on first request to avoid startup timeout
     # Only initialize vector_db (lightweight)
-    try:
-        await vector_db.load_index()
-        logger.info("✅ Vector database ready!")
-    except Exception as e:
-        logger.warning(f"⚠️ Vector DB initialization failed (will retry): {e}")
+    if vector_db is not None:
+        try:
+            await vector_db.load_index()
+            logger.info("✅ Vector database ready!")
+        except Exception as e:
+            logger.warning(f"⚠️ Vector DB initialization failed (will retry): {e}")
+    else:
+        logger.warning("⚠️ Vector DB dependency unavailable at startup")
     logger.info("✅ API ready! Model will load on first request.")
 
 @app.get("/")
@@ -325,10 +346,13 @@ async def root():
 @app.get("/api/v1/health")
 async def health_check():
     """Health check endpoint"""
+    dependencies = _build_dependency_status()
+    overall_status = "healthy" if all(dep["available"] for dep in dependencies.values()) else "degraded"
     return {
-        "status": "healthy",
+        "status": overall_status,
         "service": "face-recognition-api",
-        "version": "1.0.0"
+        "version": "1.0.0",
+        "dependencies": dependencies,
     }
 
 @app.options("/api/v1/{path:path}")
@@ -385,14 +409,18 @@ async def recognize_face(
     start_time = time.time()
     
     try:
+        face_service_instance = _ensure_face_service()
+        anti_spoof_service_instance = _ensure_anti_spoof_service()
+        vector_db_instance = _ensure_vector_db()
+
         # Ensure models are initialized (lazy load)
-        if not face_service.initialized:
+        if not face_service_instance.initialized:
             logger.info("🔄 Initializing RetinaFace + ArcFace models (first request)...")
-            await face_service.initialize()
+            await face_service_instance.initialize()
         
-        if not anti_spoof_service.initialized:
+        if not anti_spoof_service_instance.initialized:
             logger.info("🔄 Initializing Anti-Spoof Service (first request)...")
-            await anti_spoof_service.initialize()
+            await anti_spoof_service_instance.initialize()
         
         # Read image file data
         try:
@@ -421,7 +449,7 @@ async def recognize_face(
             )
         
         # Anti-spoof detection (bank-grade security)
-        spoof_result = anti_spoof_service.detect_spoof(image_data)
+        spoof_result = anti_spoof_service_instance.detect_spoof(image_data)
         
         # Only reject if confidence is very high (> 0.9) to reduce false positives
         if spoof_result['is_spoof'] and spoof_result['confidence'] > 0.9:
@@ -444,7 +472,7 @@ async def recognize_face(
             )
         
         # Generate face embedding using RetinaFace (detection) + ArcFace (embedding)
-        embedding = await face_service.generate_embedding(image_data)
+        embedding = await face_service_instance.generate_embedding(image_data)
         if embedding is None:
             raise HTTPException(
                 status_code=400, 
@@ -457,19 +485,19 @@ async def recognize_face(
             )
         
         # Ensure vector_db is initialized
-        if vector_db.index is None:
+        if vector_db_instance.index is None:
             logger.info("🔄 Initializing vector database (first request)...")
-            await vector_db.load_index()
+            await vector_db_instance.load_index()
         
         # Use default threshold if not provided
         threshold_value = threshold if threshold is not None else 0.85
         
         # Log search parameters
         logger.info(f"🔍 Searching for face match (Institute: {institute_id}, Threshold: {threshold_value})")
-        logger.info(f"📊 Vector database contains {vector_db.index.ntotal} total embeddings")
+        logger.info(f"📊 Vector database contains {vector_db_instance.index.ntotal} total embeddings")
         
         # Search vector database for similar faces
-        matches = await vector_db.search(
+        matches = await vector_db_instance.search(
             embedding=embedding,
             institute_id=institute_id,
             top_k=5,
@@ -625,14 +653,18 @@ async def register_face(
     Uses multipart/form-data for efficient file upload (no base64 overhead).
     """
     try:
+        face_service_instance = _ensure_face_service()
+        anti_spoof_service_instance = _ensure_anti_spoof_service()
+        vector_db_instance = _ensure_vector_db()
+
         # Ensure models are initialized (lazy load)
-        if not face_service.initialized:
+        if not face_service_instance.initialized:
             logger.info("🔄 Initializing InsightFace model (first request)...")
-            await face_service.initialize()
+            await face_service_instance.initialize()
         
-        if not anti_spoof_service.initialized:
+        if not anti_spoof_service_instance.initialized:
             logger.info("🔄 Initializing Anti-Spoof Service (first request)...")
-            await anti_spoof_service.initialize()
+            await anti_spoof_service_instance.initialize()
         
         # Read image file data
         try:
@@ -660,7 +692,7 @@ async def register_face(
             )
         
         # Anti-spoof detection (bank-grade security)
-        spoof_result = anti_spoof_service.detect_spoof(image_data)
+        spoof_result = anti_spoof_service_instance.detect_spoof(image_data)
         
         # Only reject if confidence is very high (> 0.9) to reduce false positives
         if spoof_result['is_spoof'] and spoof_result['confidence'] > 0.9:
@@ -686,7 +718,7 @@ async def register_face(
         # Generate embedding only if not a clear spoof
         embedding = None
         if spoof_result['confidence'] < 0.8:  # Allow borderline cases
-            embedding = await face_service.generate_embedding(image_data)
+            embedding = await face_service_instance.generate_embedding(image_data)
         else:
             logger.warning(f"⚠️ Skipped embedding generation due to high spoof confidence")
         
@@ -705,12 +737,12 @@ async def register_face(
         logger.info("✅ Generated embedding successfully")
         
         # Ensure vector_db is initialized
-        if vector_db.index is None:
+        if vector_db_instance.index is None:
             logger.info("🔄 Initializing vector database (first request)...")
-            await vector_db.load_index()
+            await vector_db_instance.load_index()
         
         # Add embedding to vector database
-        await vector_db.add_embedding(
+        await vector_db_instance.add_embedding(
             embedding=embedding,
             institute_id=institute_id,
             student_id=student_id,
@@ -720,7 +752,7 @@ async def register_face(
         
         # Verify registration by checking if embedding exists
         logger.info(f"✅ Face registered for {roll_number} (Student ID: {student_id})")
-        logger.info(f"📊 Vector database now contains {vector_db.index.ntotal} total embeddings")
+        logger.info(f"📊 Vector database now contains {vector_db_instance.index.ntotal} total embeddings")
         
         return RegisterResponse(
             success=True,

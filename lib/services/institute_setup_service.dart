@@ -1,6 +1,7 @@
 import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
 
 import '../core/app_db.dart';
+import '../core/gps_attendance_constants.dart';
 import '../core/supabase_maps.dart';
 import 'auth_service.dart';
 import 'database_init_service.dart';
@@ -81,7 +82,7 @@ class InstituteSetupService {
       await appDb.from('institute_geofence').upsert(
         {
           'institute_id': instituteId,
-          'radius': 30.0,
+          'radius': kAttendanceFenceRadiusMeters,
           'data': {
             'enabled': false,
             'latitude': 0.0,

@@ -12,7 +12,7 @@ class ProfessionalMessaging {
     required String message,
     String? actionLabel,
     VoidCallback? onAction,
-    int durationSeconds = 4,
+    int durationSeconds = 5,
   }) {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
@@ -108,6 +108,58 @@ class ProfessionalMessaging {
             : null,
       ),
     );
+  }
+
+  /// Short, safe text for face capture / on-device processing failures (never raw stack or HTTP bodies).
+  static String messageForFaceProcessingError(Object error) {
+    final raw = error.toString().trim();
+    if (raw.isEmpty) {
+      return 'We could not use this photo. Face the camera, use good lighting, and try again.';
+    }
+
+    String? inner;
+    final m = RegExp(r'^Exception:\s*(.+)$', caseSensitive: false, multiLine: false).firstMatch(raw);
+    if (m != null) inner = m.group(1)?.trim();
+
+    final candidate = (inner != null && inner.isNotEmpty) ? inner : raw.replaceAll('Exception: ', '').trim();
+
+    if (_isPlainUserFaceMessage(candidate)) {
+      return candidate;
+    }
+
+    final lower = raw.toLowerCase();
+    if (lower.contains('postgrest') ||
+        lower.contains('pgrst') ||
+        lower.contains('socketexception') ||
+        lower.contains('failed host lookup') ||
+        lower.contains('connection refused') ||
+        lower.contains('network')) {
+      return 'Connection problem. Check your internet and try again.';
+    }
+    if (lower.contains('timeout') || lower.contains('timed out')) {
+      return 'This took too long. Try again with better lighting or restart the camera.';
+    }
+    if (lower.contains('tflite') ||
+        lower.contains('interpreter') ||
+        lower.contains('failed to load model') ||
+        lower.contains('model') && lower.contains('not found')) {
+      return 'Face model did not load. Close and reopen the app, then try again.';
+    }
+    if (lower.contains('spoof')) {
+      return 'Live face required. Do not use a photo, screen, or mask — face the camera directly.';
+    }
+
+    return 'We could not use this photo. Face the camera, one person only, bright light, no mask — then try again.';
+  }
+
+  static bool _isPlainUserFaceMessage(String s) {
+    if (s.isEmpty || s.length > 400) return false;
+    if (RegExp(r'https?://').hasMatch(s)) return false;
+    if (RegExp(r'stacktrace|stack trace|#[0-9]+\s+', caseSensitive: false).hasMatch(s)) return false;
+    if (s.contains('Instance of')) return false;
+    if (RegExp(r'\b(500|502|503|504)\b').hasMatch(s)) return false;
+    if (RegExp(r'Postgrest|ClientException|Xml|JSON', caseSensitive: false).hasMatch(s)) return false;
+    return true;
   }
 
   /// Show professional warning message
@@ -209,8 +261,11 @@ class ProfessionalMessaging {
       return 'Network connection error. Please check your internet connection and try again.';
     } else if (errorLower.contains('timeout')) {
       return 'Request timed out. Please check your connection and try again.';
-    } else if (errorLower.contains('index') || errorLower.contains('firestore')) {
-      return 'Database configuration required. Please contact technical support for assistance.';
+    } else if (errorLower.contains('index') ||
+        errorLower.contains('firestore') ||
+        errorLower.contains('postgres') ||
+        errorLower.contains('supabase')) {
+      return 'This action could not be completed. Please try again later or contact your institute administrator.';
     } else if (errorLower.contains('invalid') || errorLower.contains('validation')) {
       return 'Invalid input detected. Please check your entries and try again.';
     } else if (errorLower.contains('not found') || errorLower.contains('missing')) {
@@ -222,16 +277,9 @@ class ProfessionalMessaging {
     } else if (errorLower.contains('camera') || errorLower.contains('photo')) {
       return 'Camera access is required. Please enable camera permissions in settings.';
     } else if (errorLower.contains('face') || errorLower.contains('recognition')) {
-      return 'Face recognition failed. Please ensure good lighting and clear visibility.';
-    } else {
-      // Return the actual error message if it doesn't match any pattern
-      // This helps with debugging while still being user-friendly
-      // But truncate if too long
-      if (error.length > 150) {
-        return '${error.substring(0, 150)}...';
-      }
-      return error;
+      return 'Photo verification did not succeed. Try again with good lighting and your face clearly visible.';
     }
+    return 'Something went wrong. Please try again. If the problem continues, contact your institute administrator.';
   }
 
   /// Build instruction card widget

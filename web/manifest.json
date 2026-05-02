@@ -1,11 +1,11 @@
 {
-    "name": "EduSetu By Digitrix Media",
+    "name": "MSCE Attendance",
     "short_name": "EduSetu",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0F9D58",
     "theme_color": "#0F9D58",
-    "description": "Powered Attendance for Smart Institutes",
+    "description": "Attendance and student management for institutes — simple daily tools for admins and staff.",
     "orientation": "portrait-primary",
     "prefer_related_applications": false,
     "icons": [
