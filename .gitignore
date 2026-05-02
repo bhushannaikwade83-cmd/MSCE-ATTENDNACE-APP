@@ -19,6 +19,7 @@
 
 # Visual Studio Code
 .vscode/
+.claude/
 
 # Flutter/Dart/Pub
 .dart_tool/
